@@ -15,10 +15,13 @@ import {
   Check,
   Clock,
   Loader2,
+  Undo2,
+  ImageIcon,
 } from 'lucide-react';
 import type { ApprovalDecision, ChatMessage, ToolCallRecord } from '../types/agent';
 import type { Translation } from '../utils/i18n';
 import { buildMessageSegments } from '../utils/messageSegments';
+import { imageSrc } from '../utils/images';
 import { DiffViewer } from './DiffViewer';
 
 interface ChatMessageItemProps {
@@ -27,7 +30,38 @@ interface ChatMessageItemProps {
   isStreaming?: boolean;
   onApproveTool?: (toolId: string, decision: Exclude<ApprovalDecision, 'reject'>) => void;
   onRejectTool?: (toolId: string) => void;
+  /** มี checkpoint ในหน่วยความจำให้ย้อน */
+  canUndo?: boolean;
+  onUndo?: (messageId: string) => void;
 }
+
+/** ปุ่มย้อนไฟล์แบบกดสองครั้ง (กันพลาด) — เหมือนปุ่มลบแชท */
+const UndoButton: React.FC<{ count: number; t: Translation; onConfirm: () => void }> = ({ count, t, onConfirm }) => {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    if (!armed) return;
+    const id = setTimeout(() => setArmed(false), 3000);
+    return () => clearTimeout(id);
+  }, [armed]);
+  return (
+    <button
+      type="button"
+      className={`undo-btn ${armed ? 'is-armed' : ''}`}
+      title={t.undoTurnHint(count)}
+      onClick={() => {
+        if (armed) {
+          setArmed(false);
+          onConfirm();
+        } else {
+          setArmed(true);
+        }
+      }}
+    >
+      <Undo2 size={13} aria-hidden="true" />
+      {armed ? t.undoTurnConfirm : t.undoTurn}
+    </button>
+  );
+};
 
 function useCopy(): [boolean, (text: string) => void] {
   const [copied, setCopied] = useState(false);
@@ -286,13 +320,31 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
   isStreaming = false,
   onApproveTool,
   onRejectTool,
+  canUndo = false,
+  onUndo,
 }) => {
   const [copied, copy] = useCopy();
 
   if (message.role === 'user') {
+    const images = message.images ?? [];
     return (
       <div className="msg msg-user">
-        <div className="user-bubble">{message.content}</div>
+        {images.length > 0 && (
+          <div className="user-images">
+            {images.map((img) => {
+              const src = imageSrc(img);
+              return src ? (
+                <img key={img.id} className="user-image" src={src} alt={img.name} title={img.name} />
+              ) : (
+                <span key={img.id} className="user-image-missing" title={img.name}>
+                  <ImageIcon size={14} aria-hidden="true" />
+                  {t.imageNotSaved}
+                </span>
+              );
+            })}
+          </div>
+        )}
+        {message.content && <div className="user-bubble">{message.content}</div>}
       </div>
     );
   }
@@ -304,6 +356,7 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
   const thinkingNow = isStreaming && lastSegment?.kind === 'thought';
   const working = isStreaming && !thinkingNow ? workingLabel(message, t, lastSegment?.kind === 'text') : null;
   const components = markdownComponents(t);
+  const checkpoint = message.checkpoint;
 
   return (
     <div className={`msg msg-assistant ${message.isError ? 'is-error' : ''}`}>
@@ -345,11 +398,28 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
 
       {working && <WorkingIndicator label={working.label} paused={working.paused} startedAt={message.timestamp} />}
 
-      {!isStreaming && message.content && (
+      {!isStreaming && (message.content || checkpoint) && (
         <div className="msg-footer">
-          <button type="button" className="icon-btn icon-btn-sm" onClick={() => copy(message.content)} aria-label={t.copyMessage} title={t.copyMessage}>
-            {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
-          </button>
+          {message.content && (
+            <button type="button" className="icon-btn icon-btn-sm" onClick={() => copy(message.content)} aria-label={t.copyMessage} title={t.copyMessage}>
+              {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+            </button>
+          )}
+          {checkpoint && checkpoint.files.length > 0 && (
+            <span className={`checkpoint-chip ${checkpoint.revertedAt ? 'is-reverted' : ''}`} title={checkpoint.files.join('\n')}>
+              <FilePen size={13} aria-hidden="true" />
+              <span className="checkpoint-count">{t.filesChanged(checkpoint.files.length)}</span>
+              {checkpoint.revertedAt ? ` · ${t.filesReverted}` : ''}
+            </span>
+          )}
+          {checkpoint && !!checkpoint.skipped?.length && (
+            <span className="checkpoint-chip is-warning" title={checkpoint.skipped.join('\n')}>
+              {t.checkpointSkipped(checkpoint.skipped.length)}
+            </span>
+          )}
+          {canUndo && !checkpoint?.revertedAt && onUndo && (
+            <UndoButton count={checkpoint?.files.length ?? 0} t={t} onConfirm={() => onUndo(message.id)} />
+          )}
           {message.modelUsed && <span>{message.modelUsed}</span>}
           {message.tokenUsage && (
             <span

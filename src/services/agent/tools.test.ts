@@ -8,6 +8,7 @@ const bridge = vi.hoisted(() => ({
   replaceFileContent: vi.fn(async () => ({ success: true, message: 'ok' })),
   readFile: vi.fn(async () => 'file body'),
   writeFile: vi.fn(async () => 'saved'),
+  snapshotFile: vi.fn(async (): Promise<string | null> => 'before'),
   executeCommand: vi.fn(async () => ({ success: true, exit_code: 0, stdout: 'ok', stderr: '' })),
   checkSecurity: vi.fn(async () => ({ safe: true, high_risk: false, is_read_only: false, has_chaining: false })),
 }));
@@ -236,5 +237,53 @@ describe('executeTool permissions', () => {
     await run('write_file', { path: 'README.md', content: 'x' }, supervised);
     expect(approvals).toHaveLength(1);
     expect(approvals[0].suggestedRule).toEqual({ tool: 'edit', pattern: 'README.md' });
+  });
+});
+
+describe('executeTool file checkpoints', () => {
+  const settings = { cwd: 'D:\proj', autoPilot: true, permissionRules: [] } as unknown as AppSettings;
+
+  function setup() {
+    const checkpoints: [string, string | null | undefined][] = [];
+    const callbacks: AgentCallbacks = {
+      onTextChunk: () => {},
+      onToolStart: () => {},
+      onToolUpdate: () => {},
+      onRequestApproval: async () => 'once',
+      onFileCheckpoint: (path, original) => checkpoints.push([path, original]),
+    };
+    return { checkpoints, run: (name: string, args: Record<string, any>) => executeTool(name, args, settings, callbacks) };
+  }
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it('snapshots the file before writing it', async () => {
+    const { checkpoints, run } = setup();
+    bridge.snapshotFile.mockResolvedValueOnce(null);
+    await run('write_file', { path: 'new.ts', content: 'x' });
+    expect(checkpoints).toEqual([['D:\proj/new.ts', null]]);
+    expect(bridge.snapshotFile.mock.invocationCallOrder[0]).toBeLessThan(bridge.writeFile.mock.invocationCallOrder[0]);
+  });
+
+  it('snapshots before replace_file_content', async () => {
+    const { checkpoints, run } = setup();
+    await run('replace_file_content', { path: 'a.ts', target_content: 'a', replacement_content: 'b' });
+    expect(checkpoints).toEqual([['D:\proj/a.ts', 'before']]);
+  });
+
+  it('still writes when the snapshot fails, but reports it as skipped', async () => {
+    const { checkpoints, run } = setup();
+    bridge.snapshotFile.mockRejectedValueOnce('not UTF-8');
+    expect(await run('write_file', { path: 'bin.dat', content: 'x' })).toEqual({ message: 'saved' });
+    expect(checkpoints).toEqual([['D:\proj/bin.dat', undefined]]);
+  });
+
+  it('asks for sensitive-file approval before snapshotting it', async () => {
+    const { checkpoints, run } = setup();
+    bridge.snapshotFile.mockRejectedValueOnce('SENSITIVE_FILE: secret');
+    await run('write_file', { path: '.env', content: 'x' });
+    expect(bridge.snapshotFile).toHaveBeenLastCalledWith('D:\proj/.env', 'D:\proj', true);
+    expect(checkpoints).toEqual([['D:\proj/.env', 'before']]);
+    expect(bridge.writeFile).toHaveBeenCalledTimes(1);
   });
 });

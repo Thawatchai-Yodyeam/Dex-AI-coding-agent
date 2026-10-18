@@ -33,7 +33,8 @@ export function toNeutral(history: any[], format: HistoryFormat): NeutralMessage
       text = textOfAnthropicContent(m.content);
     } else {
       if (m.role === 'user' || m.role === 'assistant') role = m.role;
-      text = typeof m.content === 'string' ? m.content : '';
+      // ข้อความที่มีรูปเป็น content parts — เก็บเฉพาะส่วน text
+      text = typeof m.content === 'string' ? m.content : textOfAnthropicContent(m.content);
     }
     if (role && text.trim()) out.push({ role, text });
   }

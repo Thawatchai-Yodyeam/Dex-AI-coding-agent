@@ -2182,3 +2182,143 @@ pre,
     display: none;
   }
 }
+
+/* ============================================================
+   Image attachments
+   ============================================================ */
+.composer.is-drag-over {
+  border-color: var(--accent);
+  border-style: dashed;
+}
+
+.composer-attachments {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.attachment-thumb {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  overflow: hidden;
+  background: var(--surface-muted);
+}
+
+.attachment-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.attachment-remove {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--primary) 78%, transparent);
+  color: var(--on-primary);
+  display: grid;
+  place-items: center;
+  opacity: 0.85;
+}
+
+.attachment-remove:hover,
+.attachment-remove:focus-visible {
+  opacity: 1;
+}
+
+.composer-attach {
+  margin-left: -4px;
+}
+
+.composer-error {
+  margin: 6px 0 0;
+  font-size: 12.5px;
+  color: var(--danger);
+}
+
+.msg-user {
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.user-images {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 85%;
+}
+
+.user-image {
+  max-width: 220px;
+  max-height: 180px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  object-fit: cover;
+  display: block;
+}
+
+.user-image-missing {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px dashed var(--border-strong);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ============================================================
+   Checkpoint / undo
+   ============================================================ */
+.checkpoint-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.checkpoint-chip.is-reverted .checkpoint-count {
+  text-decoration: line-through;
+}
+
+.checkpoint-chip.is-warning {
+  color: var(--warning);
+}
+
+.undo-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+
+.undo-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.undo-btn.is-armed {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}

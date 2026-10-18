@@ -705,6 +705,56 @@ fn replace_file_content(
     })
 }
 
+const MAX_SNAPSHOT_BYTES: u64 = 5 * 1024 * 1024;
+
+// 6.1.1 จำเนื้อหาไฟล์ก่อน agent แก้ (checkpoint) — None = ไฟล์ยังไม่มี (undo = ลบทิ้ง)
+#[tauri::command]
+fn snapshot_file(
+    path: String,
+    workspace: Option<String>,
+    allow_sensitive: Option<bool>,
+) -> Result<Option<String>, String> {
+    let valid_path = validate_workspace_path(&path, workspace.as_deref())?;
+    ensure_not_sensitive(&valid_path, allow_sensitive)?;
+    if !valid_path.exists() {
+        return Ok(None);
+    }
+    let meta = fs::metadata(&valid_path).map_err(|e| format!("อ่านข้อมูลไฟล์ไม่สำเร็จ: {}", e))?;
+    if !meta.is_file() {
+        return Err(format!("ไม่ใช่ไฟล์: {}", valid_path.display()));
+    }
+    if meta.len() > MAX_SNAPSHOT_BYTES {
+        return Err("ไฟล์ใหญ่เกินกว่าจะเก็บ checkpoint".to_string());
+    }
+    let bytes = fs::read(&valid_path).map_err(|e| format!("อ่านไฟล์ไม่สำเร็จ: {}", e))?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| "ไฟล์ไม่ใช่ข้อความ UTF-8 จึงเก็บ checkpoint ไม่ได้".to_string())
+}
+
+// 6.1.2 ย้อนไฟล์กลับไปตาม checkpoint — content = None หมายถึงไฟล์นี้ agent สร้างใหม่ จึงลบทิ้ง
+#[tauri::command]
+fn restore_file(path: String, content: Option<String>, workspace: Option<String>) -> Result<String, String> {
+    let valid_path = validate_workspace_path(&path, workspace.as_deref())?;
+    match content {
+        Some(text) => {
+            if let Some(parent) = valid_path.parent() {
+                if !parent.exists() {
+                    fs::create_dir_all(parent).map_err(|e| format!("สร้างโฟลเดอร์ไม่สำเร็จ: {}", e))?;
+                }
+            }
+            write_atomic(&valid_path, text.as_bytes()).map_err(|e| format!("เขียนไฟล์ไม่สำเร็จ: {}", e))?;
+            Ok(format!("ย้อนไฟล์ {} แล้ว", valid_path.display()))
+        }
+        None => {
+            if valid_path.is_file() {
+                fs::remove_file(&valid_path).map_err(|e| format!("ลบไฟล์ไม่สำเร็จ: {}", e))?;
+            }
+            Ok(format!("ลบไฟล์ {} ที่ agent สร้างแล้ว", valid_path.display()))
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct GrepMatch {
     pub file: String,
@@ -948,6 +998,8 @@ pub fn run() {
             get_initial_env,
             select_folder,
             replace_file_content,
+            snapshot_file,
+            restore_file,
             grep_search,
             find_files,
         ])
@@ -1048,5 +1100,36 @@ mod tests {
         assert!(!sec("shutdown /s /t 0").safe);
         assert!(sec("git log --grep=shutdown-handler").safe);
         assert!(sec("npm run format").safe);
+    }
+
+    #[test]
+    fn snapshot_and_restore_round_trip() {
+        let ws = std::env::temp_dir().join(format!("dex_ckpt_{}", std::process::id()));
+        fs::create_dir_all(&ws).unwrap();
+        let ws_str = Some(ws.to_string_lossy().to_string());
+        let existing = ws.join("a.txt");
+        fs::write(&existing, "original").unwrap();
+        let path = existing.to_string_lossy().to_string();
+        let created = ws.join("sub").join("new.txt").to_string_lossy().to_string();
+
+        // ไฟล์ที่มีอยู่ → ได้เนื้อหาเดิม, ไฟล์ที่ยังไม่มี → None
+        assert_eq!(snapshot_file(path.clone(), ws_str.clone(), None).unwrap().as_deref(), Some("original"));
+        assert_eq!(snapshot_file(created.clone(), ws_str.clone(), None).unwrap(), None);
+
+        fs::write(&existing, "changed by agent").unwrap();
+        write_file(created.clone(), "brand new".into(), ws_str.clone(), None).unwrap();
+
+        restore_file(path.clone(), Some("original".into()), ws_str.clone()).unwrap();
+        restore_file(created.clone(), None, ws_str.clone()).unwrap();
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "original");
+        assert!(!Path::new(&created).exists());
+
+        // นอก workspace ห้าม restore
+        let outside = std::env::temp_dir().join("dex_outside.txt").to_string_lossy().to_string();
+        assert!(restore_file(outside, None, ws_str.clone()).is_err());
+        // ไฟล์ลับต้องขอสิทธิ์ก่อน snapshot
+        assert!(snapshot_file(ws.join(".env").to_string_lossy().to_string(), ws_str, None).is_err());
+
+        let _ = fs::remove_dir_all(&ws);
     }
 }

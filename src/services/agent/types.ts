@@ -1,4 +1,11 @@
-import type { AppSettings, ApprovalDecision, PermissionRule, ToolCallRecord, TokenUsage } from '../../types/agent';
+import type {
+  AppSettings,
+  ApprovalDecision,
+  ImageAttachment,
+  PermissionRule,
+  ToolCallRecord,
+  TokenUsage,
+} from '../../types/agent';
 
 export interface AgentCallbacks {
   onTextChunk: (chunk: string, fullText: string) => void;
@@ -8,6 +15,11 @@ export interface AgentCallbacks {
   onRequestApproval: (tool: ToolCallRecord) => Promise<ApprovalDecision>;
   /** ผู้ใช้กด "อนุญาตเสมอ" — UI บันทึกกฎลง settings */
   onAddPermissionRule?: (rule: PermissionRule) => void;
+  /**
+   * ก่อน agent เขียน/แก้ไฟล์ — `original` = เนื้อหาเดิม (null = ไฟล์ใหม่)
+   * `undefined` = เก็บ checkpoint ไม่ได้ (ไฟล์ใหญ่/ไม่ใช่ข้อความ)
+   */
+  onFileCheckpoint?: (path: string, original: string | null | undefined) => void;
 }
 
 /** ที่มาของกฎสิทธิ์ระหว่างรัน tool — กฎถาวรใน settings + กฎ "ตลอดแชทนี้" ที่อยู่ในหน่วยความจำ */
@@ -20,6 +32,17 @@ export interface AgentResponseResult {
   text: string;
   tokenUsage: TokenUsage;
   durationMs: number;
+}
+
+/** สิ่งที่ผู้ใช้ส่งในหนึ่งเทิร์น */
+export interface UserInput {
+  text: string;
+  images?: ImageAttachment[];
+}
+
+/** รูปที่มี data จริง (ข้อความที่โหลดจาก localStorage จะไม่มี data) */
+export function imagesWithData(input: UserInput): Required<ImageAttachment>[] {
+  return (input.images ?? []).filter((i): i is Required<ImageAttachment> => !!i.data);
 }
 
 /** ผลลัพธ์ของ provider driver หนึ่งเทิร์น (อาจมีหลาย tool step) */

@@ -5,9 +5,11 @@ import {
   addUsage,
   appendStepText,
   emptyUsage,
+  imagesWithData,
   throwIfAborted,
   type TurnContext,
   type TurnResult,
+  type UserInput,
 } from '../types';
 
 /**
@@ -36,7 +38,19 @@ function keepsReasoningContent(provider: AIProvider): boolean {
   return provider === 'deepseek' || provider === 'qwen';
 }
 
-export async function runOpenAITurn(ctx: TurnContext, userInput: string): Promise<TurnResult> {
+/** Chat Completions: string ล้วนถ้าไม่มีรูป ไม่งั้นเป็น content parts (text + image_url แบบ data URL) */
+export function openaiUserContent(input: UserInput): string | any[] {
+  const images = imagesWithData(input);
+  if (images.length === 0) return input.text;
+  const parts: any[] = [];
+  if (input.text.trim()) parts.push({ type: 'text', text: input.text });
+  for (const img of images) {
+    parts.push({ type: 'image_url', image_url: { url: `data:${img.mediaType};base64,${img.data}` } });
+  }
+  return parts;
+}
+
+export async function runOpenAITurn(ctx: TurnContext, input: UserInput): Promise<TurnResult> {
   const { settings, callbacks, signal, history } = ctx;
   const provider = settings.provider;
   const info = PROVIDERS_CATALOG.find((p) => p.id === provider);
@@ -53,7 +67,7 @@ export async function runOpenAITurn(ctx: TurnContext, userInput: string): Promis
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (ctx.apiKey) headers.Authorization = `Bearer ${ctx.apiKey}`;
 
-  history.push({ role: 'user', content: userInput });
+  history.push({ role: 'user', content: openaiUserContent(input) });
 
   let fullText = '';
   let fullThought = '';

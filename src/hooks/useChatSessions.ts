@@ -44,6 +44,20 @@ function loadInitialState(lang: string): InitialState {
   return { sessions: [fresh], activeId: fresh.id };
 }
 
+/** รูป base64 ใหญ่เกิน localStorage (~5 MB) — บันทึกแค่ชื่อ/ชนิด */
+export function stripImageData(sessions: ChatSession[]): ChatSession[] {
+  return sessions.map((s) =>
+    s.messages.some((m) => m.images?.some((i) => i.data))
+      ? {
+          ...s,
+          messages: s.messages.map((m) =>
+            m.images ? { ...m, images: m.images.map(({ data: _data, ...rest }) => rest) } : m
+          ),
+        }
+      : s
+  );
+}
+
 function toHistoryPayload(messages: ChatMessage[]) {
   return messages.map((m) => ({ role: m.role, content: m.content }));
 }
@@ -95,7 +109,7 @@ export function useChatSessions(
   useEffect(() => {
     const persist = () => {
       try {
-        localStorage.setItem(SESSIONS_STORAGE_KEY, JSON.stringify(latestSessionsRef.current));
+        localStorage.setItem(SESSIONS_STORAGE_KEY, JSON.stringify(stripImageData(latestSessionsRef.current)));
       } catch (e) {
         console.error('Failed to save sessions (storage quota?):', e);
       }

@@ -33,6 +33,8 @@ export interface ProviderInfo {
   badge: string;
   defaultBaseUrl?: string;
   models: ProviderModel[];
+  /** false = API ของค่ายนี้รับรูปภาพไม่ได้ */
+  vision?: boolean;
 }
 
 const CLAUDE_EFFORTS: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -82,6 +84,7 @@ export const PROVIDERS_CATALOG: ProviderInfo[] = [
     name: 'DeepSeek',
     badge: 'DeepSeek',
     defaultBaseUrl: 'https://api.deepseek.com',
+    vision: false,
     models: [
       { id: 'deepseek-flash', name: 'DeepSeek V4.1 Flash', efforts: DEEPSEEK_EFFORTS, defaultEffort: 'high', isDefault: true },
       { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', efforts: DEEPSEEK_EFFORTS, defaultEffort: 'high' },
@@ -99,6 +102,10 @@ export const PROVIDERS_CATALOG: ProviderInfo[] = [
     ],
   },
 ];
+
+export function supportsImages(provider: AIProvider): boolean {
+  return PROVIDERS_CATALOG.find((p) => p.id === provider)?.vision !== false;
+}
 
 export function findModel(provider: AIProvider, modelId: string): ProviderModel | undefined {
   return PROVIDERS_CATALOG.find((p) => p.id === provider)?.models.find((m) => m.id === modelId);
@@ -141,6 +148,26 @@ export interface ChatMessage {
   tokenUsage?: TokenUsage;
   durationMs?: number;
   isError?: boolean;
+  /** ไฟล์ที่ agent แก้ในเทิร์นนี้ (เนื้อหาเดิมเก็บในหน่วยความจำ — undo ได้เฉพาะระหว่างที่แอปยังเปิดอยู่) */
+  checkpoint?: TurnCheckpointInfo;
+  /** รูปที่แนบมากับข้อความผู้ใช้ — `data` ไม่ถูกบันทึกลงเครื่อง (ใหญ่เกิน localStorage) */
+  images?: ImageAttachment[];
+}
+
+export interface TurnCheckpointInfo {
+  files: string[];
+  /** ไฟล์ที่เก็บ checkpoint ไม่ได้ (ไฟล์ใหญ่/ไม่ใช่ข้อความ) */
+  skipped?: string[];
+  revertedAt?: number;
+}
+
+export interface ImageAttachment {
+  id: string;
+  name: string;
+  /** image/png, image/jpeg, image/webp, image/gif */
+  mediaType: string;
+  /** base64 ไม่มี prefix `data:` */
+  data?: string;
 }
 
 export interface ChatSession {

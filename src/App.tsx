@@ -61,6 +61,7 @@ function AppShell() {
 
   const chat = useAgentChat({
     settings,
+    messages: sessions.messages,
     agentServiceRef,
     setMessages: sessions.setMessages,
     setSessionTokens: sessions.setSessionTokens,
@@ -128,6 +129,8 @@ function AppShell() {
       t={t}
       autoFocus
       showTokens={!empty}
+      images={chat.attachedImages}
+      onImagesChange={chat.setAttachedImages}
     />
   );
 
@@ -199,6 +202,8 @@ function AppShell() {
                     isStreaming={chat.isRunning && message.id === lastMessageId}
                     onApproveTool={chat.handleApproveTool}
                     onRejectTool={chat.handleRejectTool}
+                    canUndo={!chat.isRunning && chat.canUndoTurn(message.id)}
+                    onUndo={chat.handleUndoTurn}
                   />
                 ))}
               </div>

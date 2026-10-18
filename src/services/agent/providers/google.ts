@@ -5,9 +5,11 @@ import {
   addUsage,
   appendStepText,
   emptyUsage,
+  imagesWithData,
   throwIfAborted,
   type TurnContext,
   type TurnResult,
+  type UserInput,
 } from '../types';
 
 const DEFAULT_MODEL = 'gemini-3.8-flash';
@@ -42,7 +44,13 @@ function appendPart(parts: any[], part: any) {
   }
 }
 
-export async function runGoogleTurn(ctx: TurnContext, userInput: string): Promise<TurnResult> {
+export function googleUserParts(input: UserInput): any[] {
+  const parts: any[] = imagesWithData(input).map((img) => ({ inlineData: { mimeType: img.mediaType, data: img.data } }));
+  if (input.text.trim() || parts.length === 0) parts.push({ text: input.text });
+  return parts;
+}
+
+export async function runGoogleTurn(ctx: TurnContext, input: UserInput): Promise<TurnResult> {
   const { settings, callbacks, signal, history } = ctx;
   const ai = new GoogleGenAI({ apiKey: ctx.apiKey });
   const model = settings.model || DEFAULT_MODEL;
@@ -57,7 +65,7 @@ export async function runGoogleTurn(ctx: TurnContext, userInput: string): Promis
     },
   ];
 
-  history.push({ role: 'user', parts: [{ text: userInput }] });
+  history.push({ role: 'user', parts: googleUserParts(input) });
 
   let fullText = '';
   let fullThought = '';

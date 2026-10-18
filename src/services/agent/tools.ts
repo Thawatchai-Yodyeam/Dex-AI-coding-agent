@@ -228,6 +228,20 @@ async function withSensitiveRetry<T>(
   }
 }
 
+/** จำเนื้อหาเดิมก่อนเขียนทับ ให้ UI ย้อนกลับได้ — เก็บไม่ได้ก็ยังเขียนต่อ (แค่ undo ไฟล์นั้นไม่ได้) */
+async function checkpointBeforeWrite(env: ToolEnv, path: string, allowSensitive: boolean) {
+  if (!env.callbacks.onFileCheckpoint) return;
+  let original: string | null | undefined;
+  try {
+    original = await tauriBridge.snapshotFile(path, env.settings.cwd, allowSensitive);
+  } catch (err) {
+    // ไฟล์ลับที่ยังไม่ได้อนุญาต → ปล่อยให้ op จริงโยน SENSITIVE_FILE เพื่อเข้าขั้นขออนุมัติ
+    if (isSensitiveFileError(err)) throw err;
+    original = undefined;
+  }
+  env.callbacks.onFileCheckpoint(path, original);
+}
+
 type ToolHandler = (args: Record<string, any>, env: ToolEnv) => Promise<unknown>;
 
 const HANDLERS: Record<ToolName, ToolHandler> = {
@@ -296,7 +310,10 @@ const HANDLERS: Record<ToolName, ToolHandler> = {
     markRunning(env);
     const res = await withSensitiveRetry(
       env,
-      (ok) => tauriBridge.writeFile(path, str(args.content), env.settings.cwd, ok),
+      async (ok) => {
+        await checkpointBeforeWrite(env, path, ok);
+        return tauriBridge.writeFile(path, str(args.content), env.settings.cwd, ok);
+      },
       guard.trustSensitive,
       suggestion,
       'User rejected writing a sensitive file'
@@ -332,7 +349,10 @@ const HANDLERS: Record<ToolName, ToolHandler> = {
     markRunning(env);
     const guarded = await withSensitiveRetry(
       env,
-      (ok) => tauriBridge.replaceFileContent(path, target, replacement, env.settings.cwd, ok),
+      async (ok) => {
+        await checkpointBeforeWrite(env, path, ok);
+        return tauriBridge.replaceFileContent(path, target, replacement, env.settings.cwd, ok);
+      },
       guard.trustSensitive,
       suggestion,
       'User rejected modifying a sensitive file'

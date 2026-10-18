@@ -71,6 +71,16 @@ export const tauriBridge = {
     });
   },
 
+  /** เนื้อหาไฟล์ก่อนถูกแก้ (null = ไฟล์ยังไม่มี) — ใช้ทำ checkpoint สำหรับ undo */
+  async snapshotFile(path: string, workspace?: string, allowSensitive = false): Promise<string | null> {
+    return await invoke('snapshot_file', { path, workspace, allowSensitive });
+  },
+
+  /** ย้อนไฟล์ตาม checkpoint — content = null คือลบไฟล์ที่ agent สร้างใหม่ */
+  async restoreFile(path: string, content: string | null, workspace?: string): Promise<string> {
+    return await invoke('restore_file', { path, content, workspace });
+  },
+
   async grepSearch(
     query: string,
     caseInsensitive?: boolean,

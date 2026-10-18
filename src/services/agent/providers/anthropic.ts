@@ -5,9 +5,11 @@ import {
   addUsage,
   appendStepText,
   emptyUsage,
+  imagesWithData,
   throwIfAborted,
   type TurnContext,
   type TurnResult,
+  type UserInput,
 } from '../types';
 
 const API_URL = 'https://api.anthropic.com/v1/messages';
@@ -46,7 +48,20 @@ function buildThinkingParams(model: string, effort: string): Record<string, unkn
 /** content block ระหว่างสตรีม — เก็บ field ดิบไว้ทั้งหมดเพื่อส่งคืน API แบบไม่แก้ไข */
 type StreamBlock = Record<string, any> & { type: string; _json?: string };
 
-export async function runAnthropicTurn(ctx: TurnContext, userInput: string): Promise<TurnResult> {
+/** ข้อความผู้ใช้: string ล้วนถ้าไม่มีรูป (ประวัติเดิมเป็นแบบนี้) ไม่งั้นเป็น image block ตามด้วย text */
+export function anthropicUserContent(input: UserInput): string | any[] {
+  const images = imagesWithData(input);
+  if (images.length === 0) return input.text;
+  const blocks: any[] = images.map((img) => ({
+    type: 'image',
+    source: { type: 'base64', media_type: img.mediaType, data: img.data },
+  }));
+  // Anthropic ไม่รับ text block ว่าง
+  if (input.text.trim()) blocks.push({ type: 'text', text: input.text });
+  return blocks;
+}
+
+export async function runAnthropicTurn(ctx: TurnContext, input: UserInput): Promise<TurnResult> {
   const { settings, callbacks, signal, history } = ctx;
   const model = settings.model || DEFAULT_MODEL;
 
@@ -67,7 +82,7 @@ export async function runAnthropicTurn(ctx: TurnContext, userInput: string): Pro
   const useFallback = supportsDefaultFallback(model);
   if (useFallback) headers['anthropic-beta'] = 'server-side-fallback-2026-07-01';
 
-  history.push({ role: 'user', content: userInput });
+  history.push({ role: 'user', content: anthropicUserContent(input) });
 
   let fullText = '';
   let fullThought = '';
