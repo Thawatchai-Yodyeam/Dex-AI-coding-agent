@@ -1,7 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { X, KeyRound, SlidersHorizontal, ShieldCheck } from 'lucide-react';
+import { X, KeyRound, SlidersHorizontal, ShieldCheck, Puzzle } from 'lucide-react';
+import { McpSettings } from './McpSettings';
+import { SkillsSettings } from './SkillsSettings';
 import type { AppSettings, AIProvider, PokemonTheme, ThemePreference } from '../types/agent';
-import { PROVIDERS_CATALOG, findModel } from '../types/agent';
+import { PROVIDERS_CATALOG, customModelIds, findModel } from '../types/agent';
+import { ModelOptions, modelOptionValue, parseModelOptionValue } from './ModelOptions';
 import { tauriBridge } from '../services/tauriBridge';
 import { translations } from '../utils/i18n';
 import { PermissionRulesEditor } from './PermissionRulesEditor';
@@ -13,7 +16,7 @@ interface SettingsModalProps {
   onSave: (newSettings: AppSettings) => void;
 }
 
-type Tab = 'general' | 'keys' | 'permissions';
+type Tab = 'general' | 'keys' | 'permissions' | 'extensions';
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, settings, onSave }) => {
   const [draft, setDraft] = useState<AppSettings>(settings);
@@ -27,6 +30,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
       setDraft(settings);
       setSaved(false);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
   useEffect(() => {
@@ -46,9 +50,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
   const activeKeys = Object.values(draft.apiKeys).filter((k) => k.trim()).length;
 
   const handleSave = () => {
+    // แก้รายชื่อโมเดลของ custom endpoint จนโมเดลที่เลือกอยู่หายไป → ใช้ตัวแรกของรายการใหม่
+    const customIds = customModelIds(draft);
+    const model = draft.provider === 'custom' && !customIds.includes(draft.model) ? (customIds[0] ?? '') : draft.model;
     onSave({
       ...draft,
+      model,
       cwd: draft.cwd.trim(),
+      customBaseUrl: draft.customBaseUrl?.trim(),
     });
     setSaved(true);
     setTimeout(onClose, 500);
@@ -71,6 +80,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
     { id: 'general', label: t.tabGeneral, icon: <SlidersHorizontal size={16} aria-hidden="true" /> },
     { id: 'keys', label: `${t.tabApiKeys} (${t.keysActive(activeKeys)})`, icon: <KeyRound size={16} aria-hidden="true" /> },
     { id: 'permissions', label: t.tabPermissions, icon: <ShieldCheck size={16} aria-hidden="true" /> },
+    { id: 'extensions', label: t.tabExtensions, icon: <Puzzle size={16} aria-hidden="true" /> },
   ];
 
   return (
@@ -164,6 +174,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
                   </select>
                 </div>
 
+                <div className="toggle-card">
+                  <div>
+                    <div className="field-label" id="notify-label">
+                      {t.notificationsLabel}
+                    </div>
+                    <p className="field-hint">{t.notificationsDesc}</p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={draft.notifications !== false}
+                    aria-labelledby="notify-label"
+                    className={`switch ${draft.notifications !== false ? 'is-on' : ''}`}
+                    onClick={() => patch({ notifications: draft.notifications === false })}
+                  >
+                    <span className="switch-thumb" />
+                  </button>
+                </div>
+
                 <div className="field">
                   <label htmlFor="set-ws" className="field-label">
                     {t.workspaceLabel}
@@ -196,21 +225,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
                   <select
                     id="set-model"
                     className="input"
-                    value={`${draft.provider}::${draft.model}`}
+                    value={modelOptionValue(draft.provider, draft.model)}
                     onChange={(e) => {
-                      const [provider, model] = e.target.value.split('::') as [AIProvider, string];
+                      const { provider, model } = parseModelOptionValue(e.target.value);
                       patch({ provider, model, reasoningEffort: findModel(provider, model)?.defaultEffort ?? 'medium' });
                     }}
                   >
-                    {PROVIDERS_CATALOG.map((p) => (
-                      <optgroup key={p.id} label={p.name}>
-                        {p.models.map((m) => (
-                          <option key={m.id} value={`${p.id}::${m.id}`}>
-                            {m.name}
-                          </option>
-                        ))}
-                      </optgroup>
-                    ))}
+                    <ModelOptions settings={draft} />
                   </select>
                 </div>
               </>
@@ -219,7 +240,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
             {tab === 'keys' && (
               <>
                 <p className="field-hint">{t.apiKeysIntro}</p>
-                {PROVIDERS_CATALOG.map((p) => (
+                {PROVIDERS_CATALOG.filter((p) => p.id !== 'custom').map((p) => (
                   <div key={p.id} className="field">
                     <label htmlFor={`key-${p.id}`} className="field-label">
                       {p.name}
@@ -236,6 +257,45 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
                     />
                   </div>
                 ))}
+
+                <fieldset className="field custom-endpoint">
+                  <legend className="field-label">{t.customEndpointTitle}</legend>
+                  <p className="field-hint">{t.customEndpointHint}</p>
+                  <label htmlFor="custom-url" className="field-sublabel">
+                    Base URL
+                  </label>
+                  <input
+                    id="custom-url"
+                    className="input input-mono"
+                    spellCheck={false}
+                    placeholder="http://localhost:11434/v1"
+                    value={draft.customBaseUrl ?? ''}
+                    onChange={(e) => patch({ customBaseUrl: e.target.value })}
+                  />
+                  <label htmlFor="custom-models" className="field-sublabel">
+                    {t.customModelsLabel}
+                  </label>
+                  <input
+                    id="custom-models"
+                    className="input input-mono"
+                    spellCheck={false}
+                    placeholder="llama3.3, qwen3:32b"
+                    value={draft.customModels ?? ''}
+                    onChange={(e) => patch({ customModels: e.target.value })}
+                  />
+                  <label htmlFor="key-custom" className="field-sublabel">
+                    {t.customKeyLabel}
+                  </label>
+                  <input
+                    id="key-custom"
+                    type="password"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="input input-mono"
+                    value={draft.apiKeys.custom ?? ''}
+                    onChange={(e) => setKey('custom', e.target.value)}
+                  />
+                </fieldset>
               </>
             )}
 
@@ -266,6 +326,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
                   onChange={(permissionRules) => patch({ permissionRules })}
                   t={t}
                 />
+              </>
+            )}
+
+            {tab === 'extensions' && (
+              <>
+                <SkillsSettings
+                  cwd={draft.cwd}
+                  disabled={draft.disabledSkills ?? []}
+                  onChangeDisabled={(disabledSkills) => patch({ disabledSkills })}
+                  t={t}
+                />
+                <McpSettings value={draft.mcpConfig ?? ''} onChange={(mcpConfig) => patch({ mcpConfig })} t={t} />
               </>
             )}
           </div>

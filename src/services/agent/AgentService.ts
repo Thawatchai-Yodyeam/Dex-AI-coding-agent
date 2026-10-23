@@ -1,7 +1,7 @@
-import type { AIProvider, AppSettings, PermissionRule } from '../../types/agent';
-import { PROVIDERS_CATALOG, supportsImages } from '../../types/agent';
+import type { AIProvider, AppSettings, PermissionRule, ToolCallRecord } from '../../types/agent';
+import { PROVIDERS_CATALOG, requiresApiKey, supportsImages } from '../../types/agent';
 import { tauriBridge } from '../tauriBridge';
-import { fromNeutral, pruneHistory, toNeutral } from './history';
+import { fromNeutral, isUserTextTurn, pruneHistory, pruneHistoryToBudget, toNeutral } from './history';
 import { newRuleId } from './permissions';
 import {
   MAX_PROJECT_INSTRUCTION_CHARS,
@@ -12,7 +12,16 @@ import {
 import { runAnthropicTurn } from './providers/anthropic';
 import { runGoogleTurn } from './providers/google';
 import { runOpenAITurn } from './providers/openai';
-import { compactToolResult, executeTool, resolveWorkspacePath } from './tools';
+import { loadSkills, USE_SKILL_TOOL } from './skills';
+import {
+  TOOL_DEFINITIONS,
+  compactToolResult,
+  executeTool,
+  resolveWorkspacePath,
+  type McpToolRunner,
+  type ToolContext,
+} from './tools';
+import type { SkillInfo } from '../tauriBridge';
 import {
   AgentAbortError,
   imagesWithData,
@@ -22,12 +31,14 @@ import {
   type HistoryFormat,
   type NeutralMessage,
   type PermissionStore,
+  type ToolDefinition,
   type TurnContext,
   type TurnResult,
   type UserInput,
 } from './types';
 
-const MAX_HISTORY_MESSAGES = 60;
+/** เพดานจำนวนข้อความกันประวัติโตไม่จำกัด — ตัวคุมหลักคือขนาด (pruneHistoryToBudget / trimToolResults) */
+const MAX_HISTORY_MESSAGES = 400;
 
 function formatFor(provider: AIProvider): HistoryFormat {
   if (provider === 'google') return 'google';
@@ -35,11 +46,48 @@ function formatFor(provider: AIProvider): HistoryFormat {
   return 'openai';
 }
 
+/** สิ่งที่ AgentService ต้องการจาก MCP manager */
+export interface McpProvider extends McpToolRunner {
+  /** tool ของทุก server ที่เชื่อมต่ออยู่ ชื่อขึ้นต้นด้วย mcp__<server>__ */
+  toolDefinitions(): ToolDefinition[];
+}
+
+/** เทิร์นเดียววนเกินกี่ step แล้วถามผู้ใช้ว่าจะให้ทำต่อไหม (กันวนเผา token ไม่จบ) */
+export const STEPS_PER_CONFIRM = 50;
+
+interface HistorySnapshot {
+  v: 1;
+  format: HistoryFormat;
+  history: any[];
+  sessionRules?: PermissionRule[];
+}
+
 const DRIVERS: Record<HistoryFormat, (ctx: TurnContext, input: UserInput) => Promise<TurnResult>> = {
   google: runGoogleTurn,
   anthropic: runAnthropicTurn,
   openai: runOpenAITurn,
 };
+
+/**
+ * ทุก STEPS_PER_CONFIRM step ถามผู้ใช้ผ่านแถบอนุมัติแบบเดียวกับ tool (การ์ด "ทำงานต่อ")
+ * คืน false = ผู้ใช้ให้หยุด driver จะปิดเทิร์นอย่างเรียบร้อย (ประวัติยังใช้ต่อได้)
+ */
+async function confirmContinue(step: number, callbacks: AgentCallbacks): Promise<boolean> {
+  if (step === 0 || step % STEPS_PER_CONFIRM !== 0) return true;
+  const record: ToolCallRecord = {
+    id: `continue-${Date.now()}-${step}`,
+    name: 'continue_turn',
+    args: { steps: step },
+    status: 'pending_approval',
+    approvalReason: 'step_limit',
+  };
+  callbacks.onToolStart({ ...record });
+  const decision = await callbacks.onRequestApproval({ ...record });
+  record.approvalReason = undefined;
+  record.status = decision === 'reject' ? 'rejected' : 'completed';
+  callbacks.onToolUpdate({ ...record });
+  return decision !== 'reject';
+}
 
 /**
  * ตัวกลางระหว่าง UI กับ provider driver
@@ -52,8 +100,12 @@ export class MultiProviderAgentService {
   private history: any[] = [];
   private historyFormat: HistoryFormat | null = null;
   private pendingNeutral: NeutralMessage[] = [];
-  /** กฎจากปุ่ม "อนุญาตตลอดแชทนี้" — หายเมื่อเริ่มแชทใหม่หรือสลับแชท */
+  /** กฎจากปุ่ม "อนุญาตตลอดแชทนี้" — บันทึกไปกับประวัติของแชทนั้น */
   private sessionRules: PermissionRule[] = [];
+  /** เพิ่มทุกครั้งที่ประวัติถูกแทนที่หรือเริ่มเทิร์นใหม่ — กันประวัติที่โหลดจากไฟล์มาช้าเขียนทับของใหม่ */
+  private version = 0;
+  private turnVersion = -1;
+  private mcp: McpProvider | null = null;
 
   constructor(settings: AppSettings) {
     this.settings = settings;
@@ -63,11 +115,21 @@ export class MultiProviderAgentService {
     this.settings = settings;
   }
 
+  get historyVersion(): number {
+    return this.version;
+  }
+
+  /** version ตอนเริ่มเทิร์นล่าสุด — เท่ากับ historyVersion = ประวัติยังเป็นของเทิร์นนั้น (ไม่ถูกสลับ/ล้าง) */
+  get lastTurnVersion(): number {
+    return this.turnVersion;
+  }
+
   clearHistory() {
     this.history = [];
     this.historyFormat = null;
     this.pendingNeutral = [];
     this.sessionRules = [];
+    this.version++;
   }
 
   /** โหลดประวัติจาก session ที่บันทึกไว้ (text-only) */
@@ -78,6 +140,41 @@ export class MultiProviderAgentService {
       .map((m) => ({ role: m.role as NeutralMessage['role'], text: m.content }));
   }
 
+  /** ประวัติแบบ native (รวม tool call/result) ไว้บันทึกลงไฟล์ — null = ยังไม่มีอะไรให้บันทึก */
+  exportHistory(): string | null {
+    if (this.historyFormat === null || this.history.length === 0) return null;
+    const snapshot: HistorySnapshot = {
+      v: 1,
+      format: this.historyFormat,
+      history: this.history,
+      sessionRules: this.sessionRules,
+    };
+    return JSON.stringify(snapshot);
+  }
+
+  /**
+   * แทนประวัติ text-only ด้วยประวัติ native ที่บันทึกไว้ — ใช้ได้เฉพาะเมื่อยังไม่มีอะไรเปลี่ยนตั้งแต่
+   * `expectedVersion` (ผู้ใช้อาจส่งข้อความไปก่อนที่ไฟล์จะโหลดเสร็จ) คืน true ถ้าใช้ได้
+   */
+  restoreHistory(json: string, expectedVersion: number): boolean {
+    if (this.version !== expectedVersion) return false;
+    let snapshot: HistorySnapshot;
+    try {
+      snapshot = JSON.parse(json);
+    } catch {
+      return false;
+    }
+    if (snapshot?.v !== 1 || !Array.isArray(snapshot.history) || !['google', 'anthropic', 'openai'].includes(snapshot.format)) {
+      return false;
+    }
+    this.history = snapshot.history;
+    this.historyFormat = snapshot.format;
+    this.pendingNeutral = [];
+    this.sessionRules = Array.isArray(snapshot.sessionRules) ? snapshot.sessionRules : [];
+    this.version++;
+    return true;
+  }
+
   private historyFor(format: HistoryFormat): any[] {
     if (this.historyFormat === format) return this.history;
     const neutral =
@@ -86,6 +183,37 @@ export class MultiProviderAgentService {
     this.historyFormat = format;
     this.history = fromNeutral(neutral, format);
     return this.history;
+  }
+
+  /**
+   * ย้อนประวัติ native ไปก่อนข้อความผู้ใช้ที่ `turnsFromEnd` นับจากท้าย (1 = ข้อความล่าสุด) — ใช้กับ
+   * regenerate / แก้ข้อความแล้วส่งใหม่ จะเก็บ tool call/result ของเทิร์นก่อนหน้าไว้ครบ
+   * นับจากท้ายเพราะหัวประวัติอาจถูกตัดไปแล้ว และเทียบข้อความเพื่อยืนยันว่าตรงเทิร์นจริง
+   * คืน false ถ้าหาไม่เจอหรือไม่ตรง — ผู้เรียกควร fallback เป็น setHistory แบบ text-only
+   */
+  rewindBeforeUserTurn(userText: string, turnsFromEnd: number): boolean {
+    const format = this.historyFormat;
+    if (format === null || turnsFromEnd < 1) return false;
+    const starts = this.history.flatMap((m, i) => (isUserTextTurn(m, format) ? [i] : []));
+    const idx = starts[starts.length - turnsFromEnd];
+    if (idx === undefined) return false;
+    const text = toNeutral([this.history[idx]], format)[0]?.text ?? '';
+    // ข้อความใน native อาจมีโน้ตจากแอปนำหน้า (เช่น แจ้งว่าย้อนไฟล์) จึงเทียบแบบ "ลงท้ายด้วย"
+    if (!text.trimEnd().endsWith(userText.trim())) return false;
+    this.history = this.history.slice(0, idx);
+    this.version++;
+    return true;
+  }
+
+  /** skill ที่ใช้ได้ใน workspace นี้ (อ่านใหม่ทุกครั้ง — เพิ่ม/แก้ skill แล้วมีผลเทิร์นถัดไป) ตัดตัวที่ผู้ใช้ปิดไว้ */
+  async listSkills(): Promise<SkillInfo[]> {
+    const disabled = new Set((this.settings.disabledSkills ?? []).map((s) => s.toLowerCase()));
+    return (await loadSkills(this.settings.cwd)).filter((s) => !disabled.has(s.name.toLowerCase()));
+  }
+
+  /** MCP manager ต่อ tool ของ server เข้ามาให้ทุกเทิร์น (null = ไม่มี) */
+  setMcpProvider(provider: McpProvider | null) {
+    this.mcp = provider;
   }
 
   /** อ่าน DEX.md / AGENTS.md / CLAUDE.md จากราก workspace (ไม่มี = null) — อ่านใหม่ทุกเทิร์นเพื่อให้แก้แล้วมีผลทันที */
@@ -117,7 +245,7 @@ export class MultiProviderAgentService {
     const settings = this.settings;
     const provider = settings.provider;
     const apiKey = settings.apiKeys[provider]?.trim() || '';
-    if (!apiKey) {
+    if (!apiKey && requiresApiKey(provider)) {
       const name = PROVIDERS_CATALOG.find((p) => p.id === provider)?.name || provider;
       throw new Error(
         settings.language === 'en'
@@ -135,13 +263,23 @@ export class MultiProviderAgentService {
       );
     }
 
-    // อ่านก่อนแตะ history — ถ้าอ่านพลาดก็แค่ไม่มีคำสั่งประจำโปรเจกต์
-    const project = await this.loadProjectInstructions();
+    // อ่านก่อนแตะ history — ถ้าอ่านพลาดก็แค่ไม่มีคำสั่งประจำโปรเจกต์/skill
+    const [project, skills] = await Promise.all([this.loadProjectInstructions(), this.listSkills()]);
     throwIfAborted(signal);
+    const mcp = this.mcp;
+    const tools: ToolDefinition[] = [
+      ...TOOL_DEFINITIONS,
+      ...(skills.length > 0 ? [USE_SKILL_TOOL] : []),
+      ...(mcp?.toolDefinitions() ?? []),
+    ];
+    const toolContext: ToolContext = { skills, ...(mcp ? { mcp } : {}) };
 
     const format = formatFor(provider);
-    this.history = pruneHistory(this.historyFor(format), format, MAX_HISTORY_MESSAGES);
-    const snapshotLength = this.history.length;
+    const turnVersion = ++this.version;
+    this.turnVersion = turnVersion;
+    this.history = pruneHistoryToBudget(pruneHistory(this.historyFor(format), format, MAX_HISTORY_MESSAGES), format);
+    const turnHistory = this.history;
+    const snapshotLength = turnHistory.length;
     const startTime = Date.now();
 
     let partialText = '';
@@ -169,8 +307,11 @@ export class MultiProviderAgentService {
       history: this.history,
       callbacks: trackedCallbacks,
       signal,
-      systemPrompt: buildSystemPrompt(settings, project),
-      runTool: async (name, args) => compactToolResult(await executeTool(name, args, settings, trackedCallbacks, permissions)),
+      systemPrompt: buildSystemPrompt(settings, project, skills),
+      tools,
+      runTool: async (name, args) =>
+        compactToolResult(await executeTool(name, args, settings, trackedCallbacks, permissions, toolContext), name),
+      shouldContinue: (step) => confirmContinue(step, trackedCallbacks),
     };
 
     try {
@@ -178,11 +319,14 @@ export class MultiProviderAgentService {
       return { text: result.text, tokenUsage: result.usage, durationMs: Date.now() - startTime };
     } catch (err) {
       // ย้อนประวัติให้สะอาด แล้วจำสิ่งที่ผู้ใช้ถามและที่ตอบไปแล้วแบบ text-only
-      this.history.length = snapshotLength;
-      const recovered: NeutralMessage[] = [{ role: 'user', text: userInput }];
-      // ใส่ assistant เสมอ เพื่อให้ role สลับกัน (Gemini ไม่รับ user ติดกัน)
-      recovered.push({ role: 'assistant', text: partialText.trim() ? partialText : '(interrupted before answering)' });
-      this.history.push(...fromNeutral(recovered, format));
+      // — เฉพาะเมื่อประวัติยังเป็นของเทิร์นนี้ (ผู้ใช้อาจสลับ/ล้างแชทระหว่างทาง ซึ่งแทนที่ประวัติไปแล้ว)
+      if (this.version === turnVersion && this.history === turnHistory) {
+        turnHistory.length = snapshotLength;
+        const recovered: NeutralMessage[] = [{ role: 'user', text: userInput }];
+        // ใส่ assistant เสมอ เพื่อให้ role สลับกัน (Gemini ไม่รับ user ติดกัน)
+        recovered.push({ role: 'assistant', text: partialText.trim() ? partialText : '(interrupted before answering)' });
+        turnHistory.push(...fromNeutral(recovered, format));
+      }
 
       const aborted = signal?.aborted || (err as any)?.name === 'AbortError' || err instanceof AgentAbortError;
       throw aborted ? new AgentAbortError() : err;

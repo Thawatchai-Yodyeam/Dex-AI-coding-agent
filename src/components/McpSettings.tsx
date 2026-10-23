@@ -1,0 +1,83 @@
+import React, { useMemo, useSyncExternalStore } from 'react';
+import { Plug, RotateCcw } from 'lucide-react';
+import { MCP_CONFIG_EXAMPLE, parseMcpConfig } from '../services/mcp/config';
+import { mcpManager } from '../services/mcp/manager';
+import type { Translation } from '../utils/i18n';
+
+interface McpSettingsProps {
+  /** JSON ในฟอร์ม (ยังไม่บันทึก) */
+  value: string;
+  onChange: (value: string) => void;
+  t: Translation;
+}
+
+const subscribe = (cb: () => void) => mcpManager.subscribe(cb);
+// statuses() สร้าง array ใหม่ทุกครั้ง — เก็บ snapshot ไว้ให้ useSyncExternalStore เทียบได้
+let snapshot = mcpManager.statuses();
+mcpManager.subscribe(() => {
+  snapshot = mcpManager.statuses();
+});
+const getSnapshot = () => snapshot;
+
+/** แก้ config ของ MCP server (JSON แบบ Claude Desktop) และดูสถานะการเชื่อมต่อจริง */
+export const McpSettings: React.FC<McpSettingsProps> = ({ value, onChange, t }) => {
+  const statuses = useSyncExternalStore(subscribe, getSnapshot);
+  const parsed = useMemo(() => parseMcpConfig(value), [value]);
+
+  return (
+    <section className="field">
+      <h3 className="field-label">MCP servers</h3>
+      <p className="field-hint">{t.mcpIntro}</p>
+      <label htmlFor="mcp-config" className="sr-only">
+        MCP config (JSON)
+      </label>
+      <textarea
+        id="mcp-config"
+        className="input mcp-config"
+        spellCheck={false}
+        placeholder={MCP_CONFIG_EXAMPLE}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      {parsed.errors.length > 0 ? (
+        <ul className="field-hint mcp-errors" role="alert">
+          {parsed.errors.map((err) => (
+            <li key={err}>{err}</li>
+          ))}
+        </ul>
+      ) : (
+        parsed.servers.length > 0 && <p className="field-hint">{t.mcpSaveHint(parsed.servers.length)}</p>
+      )}
+
+      {statuses.length > 0 && (
+        <ul className="ext-list">
+          {statuses.map((s) => (
+            <li key={s.key} className="ext-item">
+              <Plug size={15} aria-hidden="true" />
+              <div className="ext-item-text">
+                <div className="ext-item-name">
+                  <code>{s.name}</code>
+                  <span className="tool-tag">{s.transport}</span>
+                  <span className={`ext-status is-${s.state}`}>
+                    {s.state === 'ready' ? t.mcpReady(s.tools.length) : s.state === 'starting' ? t.mcpStarting : t.mcpError}
+                  </span>
+                </div>
+                {s.state === 'ready' && s.tools.length > 0 && <p className="field-hint">{s.tools.join(', ')}</p>}
+                {s.error && <pre className="tool-error mcp-error">{s.error}</pre>}
+              </div>
+              <button
+                type="button"
+                className="icon-btn icon-btn-sm"
+                onClick={() => mcpManager.restart(s.key)}
+                aria-label={`${t.mcpRestart}: ${s.name}`}
+                title={t.mcpRestart}
+              >
+                <RotateCcw size={14} aria-hidden="true" />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+};

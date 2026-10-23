@@ -61,6 +61,7 @@ function AppShell() {
 
   const chat = useAgentChat({
     settings,
+    sessionId: sessions.currentSessionId,
     messages: sessions.messages,
     agentServiceRef,
     setMessages: sessions.setMessages,
@@ -73,7 +74,7 @@ function AppShell() {
   });
   chatRef.current = chat;
 
-  const { setActiveCommandId } = chat;
+  const { setActiveCommandId, removeBackgroundCommand } = chat;
 
   // สตรีม output ของ PowerShell (เก็บไม่เกิน MAX_TERMINAL_LINES บรรทัด)
   useEffect(() => {
@@ -86,7 +87,11 @@ function AppShell() {
         next.push(line);
         return next;
       });
-      if (payload.stream === 'exit') setActiveCommandId(null);
+      if (payload.stream === 'exit') {
+        // คำสั่งเบื้องหลังจบระหว่างที่คำสั่งอื่นรันอยู่ — อย่าล้างสถานะของคำสั่งนั้น
+        setActiveCommandId((prev) => (prev === payload.id ? null : prev));
+        removeBackgroundCommand(payload.id);
+      }
       })
       .catch((err) => {
         console.warn('shell-output listener unavailable:', err);
@@ -95,7 +100,7 @@ function AppShell() {
     return () => {
       unlistenPromise.then((unlisten) => unlisten?.());
     };
-  }, [setActiveCommandId]);
+  }, [setActiveCommandId, removeBackgroundCommand]);
 
   // เลื่อนลงล่างอัตโนมัติ เฉพาะเมื่อผู้ใช้อยู่ใกล้ล่างอยู่แล้ว (ไม่แย่ง scroll ตอนกำลังอ่านข้อความเก่า)
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -109,6 +114,13 @@ function AppShell() {
   const updateSettings = (patch: Partial<AppSettings>) => setSettings((prev) => ({ ...prev, ...patch }));
   const currentSession = sessions.sessions.find((s) => s.id === sessions.currentSessionId);
   const lastMessageId = messages[messages.length - 1]?.id;
+  // regenerate ได้เฉพาะคำตอบล่าสุดที่ตามหลังข้อความผู้ใช้ตรง ๆ (ไม่ใช่โน้ตของแอป เช่น /help หรือผลการย้อนไฟล์)
+  const regenerableId =
+    !chat.isRunning &&
+    messages[messages.length - 1]?.role === 'assistant' &&
+    messages[messages.length - 2]?.role === 'user'
+      ? lastMessageId
+      : undefined;
 
   const composer = (empty: boolean) => (
     <Composer
@@ -204,6 +216,8 @@ function AppShell() {
                     onRejectTool={chat.handleRejectTool}
                     canUndo={!chat.isRunning && chat.canUndoTurn(message.id)}
                     onUndo={chat.handleUndoTurn}
+                    onRegenerate={message.id === regenerableId ? chat.handleRegenerate : undefined}
+                    onEditUser={chat.isRunning ? undefined : chat.handleEditUser}
                   />
                 ))}
               </div>
@@ -221,6 +235,7 @@ function AppShell() {
           logs={terminalLogs}
           onClearLogs={clearTerminal}
           activeCommandId={chat.activeCommandId}
+          backgroundCommands={chat.backgroundCommands}
           onKillCommand={(id) => tauriBridge.killCommand(id)}
           t={t}
           height={layout.terminalHeight}

@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef } from 'react';
 import type { AppSettings, AIProvider, PermissionRule, ReasoningEffort } from '../types/agent';
-import { PERMISSION_TOOLS, PROVIDERS_CATALOG, REASONING_EFFORTS, defaultModelFor } from '../types/agent';
+import { PERMISSION_TOOLS, PROVIDERS_CATALOG, REASONING_EFFORTS, defaultModelFor, modelsFor } from '../types/agent';
 import { MultiProviderAgentService } from '../services/agent';
 import { tauriBridge } from '../services/tauriBridge';
+import { parseMcpConfig } from '../services/mcp/config';
+import { mcpManager } from '../services/mcp/manager';
 
 const LOCAL_STORAGE_KEY = 'dex_agent_settings_v2';
 
@@ -12,6 +14,7 @@ const EMPTY_KEYS: Record<AIProvider, string> = {
   openai: '',
   deepseek: '',
   qwen: '',
+  custom: '',
 };
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -48,19 +51,23 @@ function loadSettings(): AppSettings {
     const provider: AIProvider = PROVIDERS_CATALOG.some((p) => p.id === parsed.provider)
       ? (parsed.provider as AIProvider)
       : 'google';
-    const info = PROVIDERS_CATALOG.find((p) => p.id === provider)!;
+    // ฟิลด์ customModelName ของเวอร์ชันเก่าย้ายมาเป็นรายการ customModels
+    const { customModelName, ...rest } = parsed as Partial<AppSettings> & { customModelName?: string };
+    const customModels =
+      typeof parsed.customModels === 'string' ? parsed.customModels : typeof customModelName === 'string' ? customModelName : '';
+    const custom = { customModels, customBaseUrl: typeof parsed.customBaseUrl === 'string' ? parsed.customBaseUrl : '' };
     // โมเดลที่ไม่อยู่ใน catalog แล้ว (เช่น ID รุ่นเก่าที่ปลดระวาง) → กลับไปใช้ตัว default ของค่าย
+    const models = modelsFor(provider, custom);
     const model =
-      parsed.model && info.models.some((m) => m.id === parsed.model) ? parsed.model : defaultModelFor(provider);
+      parsed.model && models.some((m) => m.id === parsed.model)
+        ? parsed.model
+        : provider === 'custom'
+          ? (models[0]?.id ?? '')
+          : defaultModelFor(provider);
 
     const reasoningEffort = REASONING_EFFORTS.includes(parsed.reasoningEffort as ReasoningEffort)
       ? (parsed.reasoningEffort as ReasoningEffort)
       : DEFAULT_SETTINGS.reasoningEffort;
-    // ตัดคีย์ของค่ายที่เลิกรองรับ และฟิลด์ custom provider เดิมทิ้ง
-    const { customBaseUrl: _u, customModelName: _m, ...rest } = parsed as Partial<AppSettings> & {
-      customBaseUrl?: string;
-      customModelName?: string;
-    };
     const apiKeys = { ...EMPTY_KEYS };
     for (const id of Object.keys(EMPTY_KEYS) as AIProvider[]) {
       const key = parsed.apiKeys?.[id];
@@ -70,6 +77,7 @@ function loadSettings(): AppSettings {
     return {
       ...DEFAULT_SETTINGS,
       ...rest,
+      ...custom,
       provider,
       model,
       reasoningEffort,
@@ -94,28 +102,58 @@ export function useAppSettings(): {
   const agentServiceRef = useRef<MultiProviderAgentService | null>(null);
   if (agentServiceRef.current === null) {
     agentServiceRef.current = new MultiProviderAgentService(settings);
+    agentServiceRef.current.setMcpProvider(mcpManager);
   }
+  // โหลด cwd/คีย์จากเครื่องเสร็จแล้ว — ก่อนหน้านั้นยังไม่เปิด MCP server (cwd อาจยังไม่ใช่ค่าจริง)
+  const [envReady, setEnvReady] = useState(false);
 
-  // คีย์ที่มาจาก .env — ใช้งานได้แต่จะไม่ถูกเขียนลง localStorage
+  // คีย์ที่มาจาก .env — ใช้งานได้แต่จะไม่ถูกบันทึกที่ไหนเลย
   const envKeysRef = useRef<Partial<Record<AIProvider, string>>>({});
+  // ที่เก็บคีย์: Credential Manager ของ Windows — ใช้ localStorage แบบเดิมเฉพาะเมื่อ keyring ใช้ไม่ได้
+  // 'pending' = ยังโหลดไม่เสร็จ (ห้ามเขียนทับ keyring ด้วยค่าว่างตอนเปิดแอป)
+  const keyStoreRef = useRef<'pending' | 'keyring' | 'local'>('pending');
+  // ค่าที่อยู่ใน keyring ตอนนี้ — เขียนเฉพาะคีย์ที่เปลี่ยน
+  const storedKeysRef = useRef<Partial<Record<AIProvider, string>>>({});
 
-  // 1. โหลด CWD และ API Keys จาก .env
+  // 1. โหลด CWD, คีย์จาก Credential Manager และคีย์จาก .env
   useEffect(() => {
-    tauriBridge.getInitialEnv().then((env) => {
+    const providers = Object.keys(EMPTY_KEYS);
+    Promise.all([
+      tauriBridge.getInitialEnv(),
+      tauriBridge.loadApiKeys(providers).catch((e) => {
+        console.warn('Credential Manager unavailable, keeping API keys in localStorage:', e);
+        return null;
+      }),
+    ]).then(([env, stored]) => {
       const envKeys: Partial<Record<AIProvider, string>> = { ...(env.keys as Record<AIProvider, string>) };
       if (env.apiKey && !envKeys.google) envKeys.google = env.apiKey;
+      // ค่ายที่มีคีย์ใน keyring แล้วใช้คีย์นั้น — ไม่นับเป็นคีย์จาก .env (ไม่งั้นคีย์ที่ซ้ำกับ .env จะถูกลบจาก keyring)
+      for (const provider of Object.keys(stored ?? {}) as AIProvider[]) delete envKeys[provider];
       envKeysRef.current = envKeys;
+      keyStoreRef.current = stored ? 'keyring' : 'local';
+      storedKeysRef.current = { ...(stored ?? {}) };
 
       setSettings((prev) => {
+        // prev.apiKeys = คีย์เดิมใน localStorage (ก่อนย้ายไป keyring) — keyring ชนะถ้ามีทั้งคู่
         const apiKeys = { ...prev.apiKeys };
+        for (const provider of providers as AIProvider[]) {
+          if (stored?.[provider]) apiKeys[provider] = stored[provider];
+        }
         for (const [provider, key] of Object.entries(envKeys) as [AIProvider, string][]) {
           // .env อาจมีคีย์ของค่ายที่ไม่รองรับแล้ว (XAI_API_KEY ฯลฯ) — ข้าม
           if (key && provider in EMPTY_KEYS && !apiKeys[provider]) apiKeys[provider] = key;
         }
         return { ...prev, cwd: prev.cwd || env.cwd, apiKeys };
       });
+      setEnvReady(true);
     });
   }, []);
+
+  // MCP server ตาม settings — server ที่ config ไม่เปลี่ยนจะไม่ถูกเปิดใหม่
+  useEffect(() => {
+    if (!envReady) return;
+    mcpManager.sync(parseMcpConfig(settings.mcpConfig).servers, settings.cwd);
+  }, [envReady, settings.mcpConfig, settings.cwd]);
 
   // 2. ซิงก์ settings เข้า agent และบันทึก (ไม่บันทึกคีย์ที่มาจาก .env)
   useEffect(() => {
@@ -124,8 +162,19 @@ export function useAppSettings(): {
     for (const [provider, key] of Object.entries(envKeysRef.current) as [AIProvider, string][]) {
       if (apiKeys[provider] === key) apiKeys[provider] = '';
     }
+    const store = keyStoreRef.current;
+    if (store === 'keyring') {
+      for (const [provider, key] of Object.entries(apiKeys) as [AIProvider, string][]) {
+        if ((storedKeysRef.current[provider] ?? '') === key) continue;
+        storedKeysRef.current[provider] = key;
+        tauriBridge.saveApiKey(provider, key).catch((e) => console.error('Failed to save API key:', e));
+      }
+    }
     try {
-      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify({ ...settings, apiKeys }));
+      // keyring พร้อมแล้ว → ไม่มีคีย์ใน localStorage อีก (ครั้งแรกคือการย้ายคีย์เดิมออก)
+      // ระหว่าง pending ยังเก็บคีย์เดิมไว้ เผื่อ keyring ใช้ไม่ได้
+      const persisted = store === 'keyring' ? { ...EMPTY_KEYS } : apiKeys;
+      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify({ ...settings, apiKeys: persisted }));
     } catch (e) {
       console.error('Failed to save settings:', e);
     }

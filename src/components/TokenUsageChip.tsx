@@ -57,6 +57,12 @@ export const TokenUsageChip: React.FC<TokenUsageChipProps> = ({ sessionTokens, l
               <dd>{lastTokenUsage.totalTokens.toLocaleString()}</dd>
               <dt>{t.inputTokens}</dt>
               <dd>{lastTokenUsage.promptTokens.toLocaleString()}</dd>
+              {!!lastTokenUsage.cachedTokens && (
+                <>
+                  <dt>{t.cachedTokens}</dt>
+                  <dd>{lastTokenUsage.cachedTokens.toLocaleString()}</dd>
+                </>
+              )}
               <dt>{t.outputTokens}</dt>
               <dd>{lastTokenUsage.completionTokens.toLocaleString()}</dd>
             </dl>

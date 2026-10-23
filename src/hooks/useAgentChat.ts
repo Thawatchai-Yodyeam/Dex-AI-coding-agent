@@ -10,10 +10,16 @@ import type {
   TokenUsage,
   ToolCallRecord,
 } from '../types/agent';
-import { PROVIDERS_CATALOG, effectiveEffort } from '../types/agent';
+import { PROVIDERS_CATALOG, effectiveEffort, requiresApiKey } from '../types/agent';
+import { SKILL_ROOTS_HINT, matchSkillCommand, readSkill, skillInvocationBlock } from '../services/agent/skills';
+import type { SkillInfo } from '../services/tauriBridge';
+import { translations } from '../utils/i18n';
+import { notificationBody, notifyIfAway } from '../utils/notify';
 
 export interface UseAgentChatProps {
   settings: AppSettings;
+  /** แชทที่เปิดอยู่ — ประวัติแบบ native ของเทิร์นถูกบันทึกลงไฟล์ของแชทนี้ */
+  sessionId: string;
   messages: ChatMessage[];
   agentServiceRef: React.RefObject<MultiProviderAgentService | null>;
   setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
@@ -43,20 +49,41 @@ export interface UseAgentChatReturn {
   canUndoTurn: (messageId: string) => boolean;
   /** ย้อนไฟล์ทั้งหมดที่ agent แก้ ตั้งแต่เทิร์นนี้ถึงเทิร์นล่าสุด */
   handleUndoTurn: (messageId: string) => Promise<void>;
+  /** ส่งข้อความผู้ใช้ก่อนหน้าคำตอบนี้ใหม่ (ทิ้งคำตอบเดิมและทุกอย่างหลังจากนั้น) */
+  handleRegenerate: (assistantMessageId: string) => void;
+  /** แก้ข้อความผู้ใช้แล้วส่งใหม่จากจุดนั้น */
+  handleEditUser: (userMessageId: string, text: string) => void;
+  /** คำสั่งเบื้องหลังที่ agent เปิดไว้และยังไม่จบ (แสดงใน Terminal ให้กดหยุดได้) */
+  backgroundCommands: BackgroundCommand[];
+  removeBackgroundCommand: (id: string) => void;
+}
+
+export interface BackgroundCommand {
+  id: string;
+  command: string;
 }
 
 /** เนื้อหาเดิมของไฟล์ก่อนเทิร์นหนึ่งแก้ (null = ไฟล์ใหม่) */
 interface TurnCheckpoint {
   cwd: string;
   originals: Map<string, string | null>;
+  /**
+   * git snapshot ก่อนคำสั่ง shell ตัวแรกของเทิร์น — ย้อนแล้วได้สภาพก่อน shell ทั้ง workspace
+   * `pathsBefore` = ไฟล์ที่ tool แก้ไปก่อน snapshot (ต้องย้อนต่อจาก snapshot อีกชั้นถึงจะได้สภาพก่อนเทิร์น)
+   */
+  git?: { tree: string; pathsBefore: Set<string> };
 }
 
 const STREAM_FLUSH_MS = 40;
 
-function helpMessage(settings: AppSettings, instructionsFile?: string): string {
+function helpMessage(settings: AppSettings, instructionsFile: string | undefined, skills: SkillInfo[]): string {
   const provider = PROVIDERS_CATALOG.find((p) => p.id === settings.provider);
   const isEn = settings.language === 'en';
   const none = isEn ? 'none (add DEX.md or AGENTS.md to the workspace root)' : 'ไม่มี (สร้าง DEX.md หรือ AGENTS.md ไว้ที่ราก workspace)';
+  const skillLines =
+    skills.length > 0
+      ? skills.map((s) => `  - \`/${s.name}\` — ${s.description.replace(/\s+/g, ' ').slice(0, 120)}`)
+      : [`  - ${isEn ? 'none — add one at' : 'ยังไม่มี — สร้างได้ที่'} \`${SKILL_ROOTS_HINT}\``];
   return [
     '### Dex Agent',
     `- **${isEn ? 'Provider' : 'ผู้ให้บริการ'}:** \`${provider?.name ?? settings.provider}\` (${settings.model})`,
@@ -67,11 +94,14 @@ function helpMessage(settings: AppSettings, instructionsFile?: string): string {
     `  - \`/clear\` — ${isEn ? 'clear this conversation' : 'ล้างการสนทนานี้'}`,
     `  - \`/undo\` — ${isEn ? 'revert files changed in the last turn' : 'ย้อนไฟล์ที่ agent แก้ในเทิร์นล่าสุด'}`,
     `  - \`/help\` — ${isEn ? 'show this help' : 'แสดงวิธีใช้'}`,
+    `- **Skills:**`,
+    ...skillLines,
   ].join('\n');
 }
 
 export function useAgentChat({
   settings,
+  sessionId,
   messages,
   agentServiceRef,
   setMessages,
@@ -85,6 +115,11 @@ export function useAgentChat({
   const [attachedImages, setAttachedImages] = useState<ImageAttachment[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [activeCommandId, setActiveCommandId] = useState<string | null>(null);
+  const [backgroundCommands, setBackgroundCommands] = useState<BackgroundCommand[]>([]);
+  const removeBackgroundCommand = useCallback(
+    (id: string) => setBackgroundCommands((prev) => (prev.some((c) => c.id === id) ? prev.filter((c) => c.id !== id) : prev)),
+    []
+  );
 
   // ref คู่กับ state: เช็คแบบ synchronous กันการกดส่งซ้อนใน tick เดียวกัน
   const isRunningRef = useRef(false);
@@ -97,6 +132,8 @@ export function useAgentChat({
   const pendingAgentNotesRef = useRef<string[]>([]);
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
 
   const setActiveCommand = useCallback((id: string | null) => {
     activeCommandIdRef.current = id;
@@ -145,7 +182,18 @@ export function useAgentChat({
     const failures: string[] = [];
     for (const m of turns) {
       const ckpt = checkpointsRef.current.get(m.id)!;
+      // 1) snapshot → สภาพก่อนคำสั่ง shell ตัวแรก  2) checkpoint ที่เกิดก่อน snapshot → สภาพก่อนเทิร์น
+      let gitRestored = false;
+      if (ckpt.git) {
+        try {
+          for (const path of await tauriBridge.gitRestoreSnapshot(ckpt.cwd, ckpt.git.tree)) restored.add(path);
+          gitRestored = true;
+        } catch (err: any) {
+          failures.push(`git snapshot: ${err?.message || String(err)}`);
+        }
+      }
       for (const [path, original] of ckpt.originals) {
+        if (gitRestored && !ckpt.git!.pathsBefore.has(path)) continue;
         try {
           await tauriBridge.restoreFile(path, original, ckpt.cwd);
           restored.add(path);
@@ -200,8 +248,11 @@ export function useAgentChat({
     }
     if (prompt === '/help') {
       setInputPrompt('');
-      const instructions = await agentServiceRef.current?.loadProjectInstructions();
-      appendAssistantNote(helpMessage(settings, instructions?.file));
+      const [instructions, skills] = await Promise.all([
+        agentServiceRef.current?.loadProjectInstructions(),
+        agentServiceRef.current?.listSkills() ?? [],
+      ]);
+      appendAssistantNote(helpMessage(settings, instructions?.file, skills));
       return;
     }
     if (prompt === '/undo') {
@@ -212,17 +263,42 @@ export function useAgentChat({
       return;
     }
 
-    if (!settings.apiKeys[settings.provider]?.trim()) {
+    if (!settings.apiKeys[settings.provider]?.trim() && requiresApiKey(settings.provider)) {
       onOpenSettings();
       return;
     }
     const agent = agentServiceRef.current;
     if (!agent) return;
 
+    // `/ชื่อ-skill ข้อความ` → แนบคำสั่งของ skill ไปกับข้อความ (UI แสดงข้อความตามที่ผู้ใช้พิมพ์)
+    let skillBlock = '';
+    if (prompt.startsWith('/')) {
+      const hit = matchSkillCommand(prompt, await agent.listSkills());
+      if (hit) {
+        try {
+          skillBlock = skillInvocationBlock(hit.skill, await readSkill(hit.skill, settings.cwd));
+        } catch (err: any) {
+          appendAssistantNote(`**Skill \`${hit.skill.name}\`:** ${err?.message || String(err)}`, true);
+          return;
+        }
+      } else if (/^\/[\w-]+$/.test(prompt)) {
+        setInputPrompt('');
+        appendAssistantNote(
+          settings.language === 'en'
+            ? `Unknown command \`${prompt}\` — type \`/help\` to see commands and skills.`
+            : `ไม่รู้จักคำสั่ง \`${prompt}\` — พิมพ์ \`/help\` เพื่อดูคำสั่งและ skill ที่มี`
+        );
+        return;
+      }
+    }
+
     isRunningRef.current = true;
     setIsRunning(true);
-    setInputPrompt('');
-    if (textToSend === undefined) setAttachedImages([]);
+    // ส่งจาก composer เท่านั้นที่ล้างช่องพิมพ์ — regenerate/แก้ข้อความ ต้องไม่ลบสิ่งที่ผู้ใช้พิมพ์ค้างไว้
+    if (textToSend === undefined) {
+      setInputPrompt('');
+      setAttachedImages([]);
+    }
 
     const now = Date.now();
     const assistantMsgId = `asst-${now}`;
@@ -253,15 +329,34 @@ export function useAgentChat({
       });
     };
 
+    // ข้อความผู้ใช้อยู่ท้ายสุดเสมอ — rewindBeforeUserTurn เทียบแบบ "ลงท้ายด้วย"
+    // snapshot ครั้งเดียวต่อเทิร์น ก่อนคำสั่ง shell ตัวแรกที่อาจแก้ไฟล์ (workspace ที่ไม่ใช่ git repo = ข้าม)
+    let gitSnapshotTried = false;
+    const onBeforeShellCommand = async () => {
+      if (gitSnapshotTried) return;
+      gitSnapshotTried = true;
+      const tree = await tauriBridge.gitSnapshot(turnCheckpoint.cwd).catch(() => null);
+      if (!tree) return;
+      turnCheckpoint.git = { tree, pathsBefore: new Set(turnCheckpoint.originals.keys()) };
+      checkpointsRef.current.set(assistantMsgId, turnCheckpoint);
+      updateAssistant((msg) => ({ ...msg, checkpoint: { ...(msg.checkpoint ?? { files: [] }), shell: true } }));
+    };
+
     const notes = pendingAgentNotesRef.current.splice(0);
-    const agentPrompt = notes.length > 0 ? `${notes.join('\n')}\n\n${prompt}` : prompt;
+    const agentPrompt = [...notes, skillBlock, prompt].filter(Boolean).join('\n\n');
 
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
+    const turnSessionId = sessionId;
+    const notifyEnabled = settings.notifications !== false;
 
     // รวม chunk ที่ถี่มากให้ render อย่างมากทุก 40ms
     let pendingContent = '';
     let pendingThought = '';
+    // แยก "ยังไม่เคยได้ข้อความ" ออกจาก "ข้อความถูกรีเซ็ตเป็นว่าง" (step ที่ลองใหม่ส่งข้อความเดิมกลับมาตั้งแต่ต้น)
+    let contentTouched = false;
+    let thoughtTouched = false;
+    let pendingRetry: ChatMessage['retry'];
     let lastFlush = 0;
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     const flush = () => {
@@ -270,7 +365,15 @@ export function useAgentChat({
       lastFlush = Date.now();
       const content = pendingContent;
       const thought = pendingThought;
-      updateAssistant((msg) => ({ ...msg, content: content || msg.content, thought: thought || msg.thought }));
+      const useContent = contentTouched;
+      const useThought = thoughtTouched;
+      const retry = pendingRetry;
+      updateAssistant((msg) => ({
+        ...msg,
+        content: useContent ? content : msg.content,
+        thought: useThought ? thought : msg.thought,
+        retry,
+      }));
     };
     const scheduleFlush = () => {
       if (Date.now() - lastFlush > STREAM_FLUSH_MS) flush();
@@ -302,15 +405,25 @@ export function useAgentChat({
         { text: agentPrompt, images },
         {
           onFileCheckpoint,
+          onBeforeShellCommand,
           onTextChunk: (_chunk, full) => {
             pendingContent = full;
+            contentTouched = true;
+            pendingRetry = undefined;
             scheduleFlush();
           },
           onThoughtChunk: (_chunk, full) => {
             pendingThought = full;
+            thoughtTouched = true;
+            pendingRetry = undefined;
             scheduleFlush();
           },
+          onRetry: (info) => {
+            pendingRetry = { attempt: info.attempt, maxAttempts: info.maxAttempts, reason: info.reason };
+            flush();
+          },
           onToolStart: (tool) => {
+            pendingRetry = undefined;
             flush();
             if (tool.name === 'run_shell_command') setActiveCommand(tool.id);
             upsertTool(tool);
@@ -318,19 +431,35 @@ export function useAgentChat({
           onToolUpdate: (tool) => {
             flush();
             upsertTool(tool);
+            if (tool.name !== 'run_shell_command' || tool.status === 'running' || tool.status === 'pending_approval') return;
+            // คำสั่งจบแล้ว (หรือเริ่มเบื้องหลังแล้ว) — ปุ่มหยุดต้องไม่ไปฆ่า dev server ที่รันต่อ
+            if (activeCommandIdRef.current === tool.id) setActiveCommand(null);
+            const background = tool.args.run_in_background === true || tool.args.run_in_background === 'true';
+            if (background && tool.status === 'completed' && tool.exitCode === undefined) {
+              const command = String(tool.args.command ?? '');
+              setBackgroundCommands((prev) => (prev.some((c) => c.id === tool.id) ? prev : [...prev, { id: tool.id, command }]));
+            }
           },
           onRequestApproval: (tool) =>
             new Promise<ApprovalDecision>((resolve) => {
               if (abortController.signal.aborted) return resolve('reject');
               approvalResolversRef.current.set(tool.id, resolve);
+              if (notifyEnabled) {
+                const t = translations[settings.language];
+                const what = String(tool.args.command ?? tool.args.path ?? '');
+                notifyIfAway(t.notifyApprovalTitle, `${t.toolNames[tool.name] ?? tool.name}${what ? `: ${what}` : ''}`);
+              }
             }),
           onAddPermissionRule,
         },
         abortController.signal
       );
       pendingContent = res.text;
+      contentTouched = true;
+      pendingRetry = undefined;
       flush();
 
+      if (notifyEnabled) notifyIfAway(translations[settings.language].notifyDoneTitle, notificationBody(res.text));
       setLastTokenUsage(res.tokenUsage);
       setSessionTokens((prev) => prev + res.tokenUsage.totalTokens);
       updateAssistant((msg) => ({
@@ -341,6 +470,7 @@ export function useAgentChat({
         providerUsed: settings.provider,
       }));
     } catch (err: any) {
+      pendingRetry = undefined;
       flush();
       const isEn = settings.language === 'en';
       const note =
@@ -348,8 +478,18 @@ export function useAgentChat({
           ? `\n\n*${isEn ? '(Stopped by user)' : '(หยุดการทำงานโดยผู้ใช้)'}*`
           : `\n\n**${isEn ? 'Error' : 'ข้อผิดพลาด'}:** ${err?.message || String(err)}`;
       updateAssistant((msg) => ({ ...msg, content: msg.content + note, isError: !(err instanceof AgentAbortError) }));
+      // กด Stop เอง = อยู่หน้าจออยู่แล้ว ไม่ต้องแจ้ง
+      if (notifyEnabled && !(err instanceof AgentAbortError)) {
+        notifyIfAway(translations[settings.language].notifyErrorTitle, notificationBody(err?.message || String(err)));
+      }
     } finally {
       if (flushTimer) clearTimeout(flushTimer);
+      // บันทึกประวัติแบบ native ของแชทนี้ — ถ้าผู้ใช้สลับแชทไประหว่างเทิร์น ประวัติใน agent เป็นของแชทใหม่แล้ว
+      const unchanged = sessionIdRef.current === turnSessionId && agent.historyVersion === agent.lastTurnVersion;
+      const snapshot = unchanged ? agent.exportHistory() : null;
+      if (snapshot) {
+        tauriBridge.saveSessionHistory(turnSessionId, snapshot).catch((e) => console.warn('Failed to save chat history:', e));
+      }
       approvalResolversRef.current.clear();
       abortControllerRef.current = null;
       isRunningRef.current = false;
@@ -358,10 +498,49 @@ export function useAgentChat({
     }
   };
 
+  /**
+   * ตัดแชทกลับไปก่อนข้อความผู้ใช้ `userId` แล้วส่ง `text` ใหม่จากจุดนั้น (ใช้กับทั้ง regenerate และแก้ข้อความ)
+   * ไฟล์ที่ agent แก้ไปแล้วไม่ถูกย้อนอัตโนมัติ — ผู้ใช้ย้อนเองได้ก่อนกดถ้าต้องการ
+   */
+  const resendFrom = async (userId: string, text: string) => {
+    const agent = agentServiceRef.current;
+    if (isRunningRef.current || !agent) return;
+    const list = messagesRef.current;
+    const index = list.findIndex((m) => m.id === userId && m.role === 'user');
+    if (index === -1) return;
+    const original = list[index];
+    const turnsFromEnd = list.slice(index).filter((m) => m.role === 'user').length;
+    if (!agent.rewindBeforeUserTurn(original.content, turnsFromEnd)) {
+      agent.setHistory(list.slice(0, index).map((m) => ({ role: m.role, content: m.content })));
+    }
+    const kept = list.slice(0, index);
+    for (const m of list.slice(index)) checkpointsRef.current.delete(m.id);
+    messagesRef.current = kept;
+    setMessages(kept);
+    await handleSendMessage(text, original.images ?? []);
+  };
+
+  const handleRegenerate = (assistantId: string) => {
+    const list = messagesRef.current;
+    const index = list.findIndex((m) => m.id === assistantId);
+    const user = [...list.slice(0, index)].reverse().find((m) => m.role === 'user');
+    if (index !== -1 && user) void resendFrom(user.id, user.content);
+  };
+
+  const handleEditUser = (userId: string, text: string) => {
+    if (text.trim()) void resendFrom(userId, text);
+  };
+
   // คงที่ตลอดอายุ component — ChatMessageItem เป็น memo
   const undoTurnRef = useRef(handleUndoTurn);
   undoTurnRef.current = handleUndoTurn;
   const stableUndoTurn = useCallback((messageId: string) => undoTurnRef.current(messageId), []);
+  const regenerateRef = useRef(handleRegenerate);
+  regenerateRef.current = handleRegenerate;
+  const stableRegenerate = useCallback((messageId: string) => regenerateRef.current(messageId), []);
+  const editUserRef = useRef(handleEditUser);
+  editUserRef.current = handleEditUser;
+  const stableEditUser = useCallback((messageId: string, text: string) => editUserRef.current(messageId, text), []);
 
   return {
     inputPrompt,
@@ -378,5 +557,9 @@ export function useAgentChat({
     handleRejectTool,
     canUndoTurn,
     handleUndoTurn: stableUndoTurn,
+    handleRegenerate: stableRegenerate,
+    handleEditUser: stableEditUser,
+    backgroundCommands,
+    removeBackgroundCommand,
   };
 }

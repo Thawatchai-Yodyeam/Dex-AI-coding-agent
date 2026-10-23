@@ -40,6 +40,8 @@ export function ruleMatches(rule: Pick<PermissionRule, 'tool' | 'pattern'>, tool
   const pattern = rule.pattern.trim();
   if (rule.tool !== tool || !pattern) return false;
   if (tool === 'shell') return globToRegExp(normalizeCommand(pattern)).test(normalizeCommand(subject));
+  // ชื่อ tool ของ MCP เช่น `mcp__github__create_issue` หรือ `mcp__github__*`
+  if (tool === 'mcp') return globToRegExp(pattern).test(subject);
   const re = globToRegExp(pattern.replace(/\\/g, '/').replace(/^\.\//, ''));
   const rel = subject.replace(/\\/g, '/');
   // pattern ที่ไม่มี `/` เทียบชื่อไฟล์ได้ด้วย — `.env*` จับ `config/.env.local`

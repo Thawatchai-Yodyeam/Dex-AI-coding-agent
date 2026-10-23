@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import type { AppSettings, ChatMessage, ChatSession, TokenUsage } from '../types/agent';
 import type { MultiProviderAgentService } from '../services/agent';
+import { tauriBridge } from '../services/tauriBridge';
 
 export const SESSIONS_STORAGE_KEY = 'dex_chat_sessions_v1';
 export const ACTIVE_SESSION_STORAGE_KEY = 'dex_active_session_id';
@@ -94,9 +95,31 @@ export function useChatSessions(
   const [sessionTokens, setSessionTokens] = useState<number>(initialSession?.sessionTokens ?? 0);
   const [lastTokenUsage, setLastTokenUsage] = useState<TokenUsage | null>(null);
 
-  // ให้ agent รู้ประวัติของ session ที่เปิดค้างไว้ตอนเปิดแอป
+  /**
+   * ให้ agent รู้ประวัติของแชท: ใส่แบบ text-only ทันที (ส่งข้อความได้เลย) แล้วแทนด้วยประวัติเต็ม
+   * จากไฟล์ (รวม tool call/result) เมื่อโหลดเสร็จ — ถ้าผู้ใช้ส่งข้อความไปก่อน agent จะไม่รับของที่มาช้า
+   */
+  const loadAgentHistory = (session: ChatSession | undefined) => {
+    const agent = agentServiceRef.current;
+    if (!agent) return;
+    agent.setHistory(toHistoryPayload(session?.messages ?? []));
+    if (!session || session.messages.length === 0) return;
+    const version = agent.historyVersion;
+    tauriBridge
+      .loadSessionHistory(session.id)
+      .then((json) => {
+        if (json) agent.restoreHistory(json, version);
+      })
+      .catch((e) => console.warn('Failed to load chat history:', e));
+  };
+
+  const forgetAgentHistory = (sessionId: string) =>
+    tauriBridge.deleteSessionHistory(sessionId).catch((e) => console.warn('Failed to delete chat history:', e));
+
+  // ครั้งเดียวตอนเปิดแอป — สลับแชทหลังจากนี้โหลดผ่าน activate()
   useEffect(() => {
-    agentServiceRef.current?.setHistory(toHistoryPayload(initialSession?.messages ?? []));
+    loadAgentHistory(initialSession);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -160,7 +183,7 @@ export function useChatSessions(
     setSessionTokens(session.sessionTokens || 0);
     setLastTokenUsage(null);
     onClearTerminal?.();
-    agentServiceRef.current?.setHistory(toHistoryPayload(session.messages || []));
+    loadAgentHistory(session);
   };
 
   const handleNewChat = () => {
@@ -181,6 +204,7 @@ export function useChatSessions(
   };
 
   const handleDeleteSession = (sessionId: string) => {
+    void forgetAgentHistory(sessionId);
     const remaining = sessions.filter((s) => s.id !== sessionId);
     if (remaining.length === 0) {
       if (getIsRunning()) onStopExecution();
@@ -207,6 +231,7 @@ export function useChatSessions(
     setLastTokenUsage(null);
     onClearTerminal?.();
     agentServiceRef.current?.clearHistory();
+    void forgetAgentHistory(currentSessionId);
   };
 
   return {

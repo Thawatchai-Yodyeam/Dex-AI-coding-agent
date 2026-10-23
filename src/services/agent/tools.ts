@@ -1,7 +1,18 @@
 import type { ApprovalReason, AppSettings, PermissionRule, PermissionTool, ToolCallRecord } from '../../types/agent';
-import { tauriBridge } from '../tauriBridge';
+import { tauriBridge, type FileEdit, type SkillInfo } from '../tauriBridge';
+import { readSkill } from './skills';
 import { evaluateRules, isSensitiveFileError, relativeToWorkspace, suggestShellPattern } from './permissions';
 import type { AgentCallbacks, PermissionStore } from './types';
+
+const SHELL_DEFAULT_TIMEOUT_SECS = 120;
+/** ต้องตรงกับ MAX_TIMEOUT_SECS ฝั่ง Rust */
+const SHELL_MAX_TIMEOUT_SECS = 1800;
+/** รอ output แรกของคำสั่งเบื้องหลัง ให้โมเดลเห็น error ที่เกิดทันที (พอร์ตชน, พิมพ์คำสั่งผิด) */
+export const BACKGROUND_WARMUP_MS = 1500;
+
+const READ_FILE_DEFAULT_LINES = 2000;
+/** read_file แบ่งหน้าเองตามงบนี้ (~8k token) จึงไม่ต้องโดนตัดกลางแบบ tool อื่น */
+const READ_FILE_MAX_CHARS = 32_000;
 
 /**
  * แหล่งเดียวของ tool schema (JSON Schema) — provider ทุกตัวแปลงจากตรงนี้
@@ -11,22 +22,54 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'run_shell_command',
     description:
-      'Run a PowerShell command on Windows in the current workspace directory. Read-only commands may run automatically; anything that modifies the system asks the user first.',
+      'Run a PowerShell command on Windows in the current workspace directory. Read-only commands may run automatically; anything that modifies the system asks the user first. ' +
+      `Commands time out after timeout_secs (default ${SHELL_DEFAULT_TIMEOUT_SECS}s, max ${SHELL_MAX_TIMEOUT_SECS}s) — raise it for slow builds. ` +
+      'For servers and watchers that never exit, set run_in_background=true and check on them with read_background_output.',
     parameters: {
       type: 'object',
       properties: {
         command: { type: 'string', description: 'PowerShell command, e.g. `git status`, `npm test`' },
+        timeout_secs: { type: 'number', description: `Seconds before the command is killed (default ${SHELL_DEFAULT_TIMEOUT_SECS})` },
+        run_in_background: {
+          type: 'boolean',
+          description: 'Start the command and return immediately with a background_id (for dev servers, watchers)',
+        },
       },
       required: ['command'],
     },
   },
   {
+    name: 'read_background_output',
+    description: 'Get new output from a background command since the last read, and whether it is still running.',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'background_id returned by run_shell_command' },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'stop_background_command',
+    description: 'Stop a background command (and its child processes).',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'background_id returned by run_shell_command' },
+      },
+      required: ['id'],
+    },
+  },
+  {
     name: 'read_file',
-    description: 'Read the full text content of a file in the workspace.',
+    description:
+      'Read a text file in the workspace. Each output line is prefixed with its line number and a tab — never include those prefixes in edits. Long files are returned in pages: use offset/limit to read the rest.',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'File path, relative to the workspace or absolute inside it' },
+        offset: { type: 'number', description: 'First line to read, 1-based (default 1)' },
+        limit: { type: 'number', description: `Maximum lines to read (default ${READ_FILE_DEFAULT_LINES})` },
       },
       required: ['path'],
     },
@@ -56,25 +99,53 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'replace_file_content',
     description:
-      'Surgically edit a file: replace exactly one occurrence of target_content with replacement_content. target_content must match the file byte-for-byte (including whitespace) and be unique. Prefer this over write_file for edits.',
+      'Surgically edit a file: replace target_content with replacement_content. target_content must match the file exactly (including whitespace, without read_file line-number prefixes) and be unique unless replace_all is true. Prefer this over write_file for edits.',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'File to edit' },
         target_content: { type: 'string', description: 'Existing text to replace (must be unique in the file)' },
         replacement_content: { type: 'string', description: 'New text' },
+        replace_all: { type: 'boolean', description: 'Replace every occurrence (e.g. renaming a variable). Default false' },
       },
       required: ['path', 'target_content', 'replacement_content'],
     },
   },
   {
-    name: 'grep_search',
+    name: 'multi_edit_file',
     description:
-      'Search all text files in the workspace for a plain substring (not a regex). Skips node_modules, target, dist, .git and files over 2 MB.',
+      'Make several edits to one file in a single atomic call. Edits apply in order, each on the result of the previous one; if any edit fails, the file is left unchanged. Same matching rules as replace_file_content.',
     parameters: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Substring to search for' },
+        path: { type: 'string', description: 'File to edit' },
+        edits: {
+          type: 'array',
+          description: 'Edits to apply in order',
+          items: {
+            type: 'object',
+            properties: {
+              target_content: { type: 'string', description: 'Existing text to replace' },
+              replacement_content: { type: 'string', description: 'New text' },
+              replace_all: { type: 'boolean', description: 'Replace every occurrence. Default false' },
+            },
+            required: ['target_content', 'replacement_content'],
+          },
+        },
+      },
+      required: ['path', 'edits'],
+    },
+  },
+  {
+    name: 'grep_search',
+    description:
+      'Search text files in the workspace line by line. Plain substring by default, or a Rust-syntax regex with regex=true. Filter files with include (glob). Skips node_modules, target, dist, .git, secret files and files over 2 MB.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Substring, or regex when regex=true' },
+        regex: { type: 'boolean', description: 'Treat query as a regular expression (default false)' },
+        include: { type: 'string', description: 'Only search files matching this glob, e.g. *.ts or src/**/*.tsx' },
         case_insensitive: { type: 'boolean', description: 'Ignore case (default true)' },
         max_results: { type: 'number', description: 'Maximum matches to return (default 50)' },
       },
@@ -82,12 +153,35 @@ export const TOOL_DEFINITIONS = [
     },
   },
   {
-    name: 'find_files',
-    description: 'Find files by extension (`*.tsx`) or by a substring of their relative path (`Header`, `src/hooks`).',
+    name: 'update_todos',
+    description:
+      'Show the user your plan for a multi-step task as a checklist. Send the whole list every time (it replaces the previous one). Keep exactly one item in_progress while working, and mark items completed as soon as they are done.',
     parameters: {
       type: 'object',
       properties: {
-        pattern: { type: 'string', description: 'e.g. *.ts, App.css, components/' },
+        todos: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              content: { type: 'string', description: 'Short imperative step, e.g. "Add retry to the API client"' },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+            },
+            required: ['content', 'status'],
+          },
+        },
+      },
+      required: ['todos'],
+    },
+  },
+  {
+    name: 'find_files',
+    description:
+      'Find files by glob (`*.tsx`, `src/**/*.test.ts`) or by a substring of their relative path (`Header`, `src/hooks`). Returns up to 200 paths.',
+    parameters: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'e.g. *.ts, src/**/*.css, components/' },
       },
       required: ['pattern'],
     },
@@ -106,12 +200,15 @@ function truncateMiddle(text: string, max = MAX_TOOL_RESULT_CHARS): string {
   return `${text.slice(0, head)}\n\n... [truncated ${text.length - max} of ${text.length} chars] ...\n\n${text.slice(-tail)}`;
 }
 
-export function compactToolResult(result: unknown): unknown {
-  if (typeof result === 'string') return truncateMiddle(result);
+export function compactToolResult(result: unknown, toolName?: string): unknown {
+  // read_file แบ่งหน้าเองแล้ว (เผื่อเลขบรรทัด) — ตัดกลางอีกทีจะทำให้โมเดลไม่เห็นบรรทัดที่หายไป
+  // คำสั่งของ skill ก็ต้องได้ครบ ไม่งั้นโมเดลทำตามได้ครึ่งเดียว
+  const max = toolName === 'read_file' || toolName === 'use_skill' ? READ_FILE_MAX_CHARS + 2000 : MAX_TOOL_RESULT_CHARS;
+  if (typeof result === 'string') return truncateMiddle(result, max);
   if (result && typeof result === 'object') {
     const copy: Record<string, unknown> = { ...(result as Record<string, unknown>) };
     for (const key of ['content', 'stdout', 'stderr']) {
-      if (typeof copy[key] === 'string') copy[key] = truncateMiddle(copy[key] as string);
+      if (typeof copy[key] === 'string') copy[key] = truncateMiddle(copy[key] as string, max);
     }
     return copy;
   }
@@ -138,6 +235,8 @@ export function resolveWorkspacePath(cwd: string, inputPath?: string): string {
   return `${base}/${rel}`;
 }
 
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 const str = (v: unknown, fallback = ''): string => (typeof v === 'string' ? v : v == null ? fallback : String(v));
 const bool = (v: unknown, fallback: boolean): boolean =>
   typeof v === 'boolean' ? v : v === 'true' ? true : v === 'false' ? false : fallback;
@@ -146,11 +245,25 @@ const num = (v: unknown, fallback: number): number => {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 };
 
+/** ของที่เปลี่ยนไปตามเทิร์น: skill ที่ค้นเจอ และตัวเรียก tool ของ MCP server */
+export interface ToolContext {
+  skills?: readonly SkillInfo[];
+  mcp?: McpToolRunner;
+}
+
+/** ส่วนที่ tools.ts ต้องใช้จาก MCP manager (แยก interface ไว้ให้เทสต์ mock ได้ง่าย) */
+export interface McpToolRunner {
+  /** tool นี้ประกาศ readOnlyHint (รันใน Auto-Pilot ได้โดยไม่ถาม) */
+  isReadOnly(toolName: string): boolean;
+  callTool(toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<{ text: string; isError: boolean }>;
+}
+
 interface ToolEnv {
   settings: AppSettings;
   record: ToolCallRecord;
   callbacks: AgentCallbacks;
   permissions: PermissionStore;
+  context: ToolContext;
 }
 
 type Suggestion = Pick<PermissionRule, 'tool' | 'pattern'>;
@@ -242,6 +355,82 @@ async function checkpointBeforeWrite(env: ToolEnv, path: string, allowSensitive:
   env.callbacks.onFileCheckpoint(path, original);
 }
 
+/** edits อาจมาเป็น JSON string (บางโมเดลส่ง array ซ้อนเป็นสตริง) และรองรับชื่อ field แบบ camelCase */
+function parseEdits(value: unknown): FileEdit[] {
+  let list = value;
+  if (typeof list === 'string') {
+    try {
+      list = JSON.parse(list);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((e) => e && typeof e === 'object')
+    .map((e: Record<string, unknown>) => ({
+      target_content: str(e.target_content ?? e.targetContent),
+      replacement_content: str(e.replacement_content ?? e.replacementContent),
+      replace_all: bool(e.replace_all ?? e.replaceAll, false),
+    }));
+}
+
+export interface TodoItem {
+  content: string;
+  status: 'pending' | 'in_progress' | 'completed';
+}
+
+const TODO_STATUSES: readonly TodoItem['status'][] = ['pending', 'in_progress', 'completed'];
+
+/** todos อาจมาเป็น JSON string และ status ที่ไม่รู้จักถือเป็น pending */
+export function parseTodos(value: unknown): TodoItem[] {
+  let list = value;
+  if (typeof list === 'string') {
+    try {
+      list = JSON.parse(list);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((t) => t && typeof t === 'object' && str(t.content ?? t.title).trim())
+    .map((t: Record<string, unknown>) => {
+      const status = str(t.status) as TodoItem['status'];
+      return {
+        content: str(t.content ?? t.title).trim(),
+        status: TODO_STATUSES.includes(status) ? status : 'pending',
+      };
+    });
+}
+
+/** ขั้นตอนร่วมของ replace_file_content / multi_edit_file: กฎ → อนุมัติ (Supervised) → checkpoint → แก้ */
+async function applyFileEdits(env: ToolEnv, path: string, edits: FileEdit[]) {
+  const guard = checkFileRules(env, 'edit', path);
+  if (guard.denied) return guard.denied;
+  const suggestion = { tool: 'edit' as const, pattern: guard.rel };
+  if (!guard.allowed && !env.settings.autoPilot) {
+    const rejected = await requireApproval(env, 'User rejected file modification', 'supervised', suggestion);
+    if (rejected) return rejected;
+  }
+  markRunning(env);
+  const guarded = await withSensitiveRetry(
+    env,
+    async (ok) => {
+      await checkpointBeforeWrite(env, path, ok);
+      return tauriBridge.editFile(path, edits, env.settings.cwd, ok);
+    },
+    guard.trustSensitive,
+    suggestion,
+    'User rejected modifying a sensitive file'
+  );
+  if (!guarded.ok) return guarded.error;
+  const res = guarded.value;
+  env.record.output = res.message;
+  env.record.status = res.success ? 'completed' : 'failed';
+  return res;
+}
+
 type ToolHandler = (args: Record<string, any>, env: ToolEnv) => Promise<unknown>;
 
 const HANDLERS: Record<ToolName, ToolHandler> = {
@@ -270,31 +459,105 @@ const HANDLERS: Record<ToolName, ToolHandler> = {
       const rejected = await requireApproval(env, 'User rejected command execution', reason, suggestion);
       if (rejected) return rejected;
     }
+    if (!sec.is_read_only) {
+      // snapshot ล้มก็ยังรันต่อ — แค่ย้อนไฟล์ที่คำสั่งนี้แก้ไม่ได้
+      await env.callbacks.onBeforeShellCommand?.().catch(() => {});
+    }
     markRunning(env);
-    const res = await tauriBridge.executeCommand(env.record.id, cmd, env.settings.cwd);
+    if (bool(args.run_in_background ?? args.background, false)) {
+      const id = env.record.id;
+      await tauriBridge.startBackgroundCommand(id, cmd, env.settings.cwd);
+      await delay(BACKGROUND_WARMUP_MS);
+      const snap = await tauriBridge.readBackgroundOutput(id);
+      env.record.output = snap.output;
+      env.record.exitCode = snap.exit_code ?? undefined;
+      env.record.status = snap.running || snap.exit_code === 0 ? 'completed' : 'failed';
+      return {
+        background_id: id,
+        running: snap.running,
+        ...(snap.running ? {} : { exit_code: snap.exit_code }),
+        stdout: snap.output,
+        note: snap.running
+          ? 'Running in the background. Use read_background_output to check it and stop_background_command when done.'
+          : 'The command already exited.',
+      };
+    }
+    const timeout = Math.min(num(args.timeout_secs ?? args.timeout, SHELL_DEFAULT_TIMEOUT_SECS), SHELL_MAX_TIMEOUT_SECS);
+    const res = await tauriBridge.executeCommand(env.record.id, cmd, env.settings.cwd, timeout);
     env.record.output = res.stdout + (res.stderr ? `\n[STDERR]: ${res.stderr}` : '');
     env.record.exitCode = res.exit_code;
     env.record.status = res.success ? 'completed' : 'failed';
     return { stdout: res.stdout, stderr: res.stderr, exit_code: res.exit_code, success: res.success };
   },
 
+  async read_background_output(args, env) {
+    markRunning(env);
+    const snap = await tauriBridge.readBackgroundOutput(str(args.id ?? args.background_id));
+    env.record.output = snap.output;
+    env.record.status = 'completed';
+    return {
+      running: snap.running,
+      ...(snap.running ? {} : { exit_code: snap.exit_code }),
+      stdout: snap.output || '(no new output)',
+      ...(snap.dropped_bytes ? { note: `${snap.dropped_bytes} bytes of older output were dropped.` } : {}),
+    };
+  },
+
+  async stop_background_command(args, env) {
+    markRunning(env);
+    const id = str(args.id ?? args.background_id);
+    // อ่านก่อนเพื่อยืนยันว่าเป็นคำสั่งเบื้องหลังที่ agent เปิดเอง (id ผิด = throw) และเก็บ output ท้ายสุด
+    const snap = await tauriBridge.readBackgroundOutput(id);
+    if (snap.running) await tauriBridge.killCommand(id);
+    env.record.status = 'completed';
+    env.record.output = snap.running ? 'stopped' : 'already exited';
+    return { stopped: snap.running, stdout: snap.output };
+  },
+
   async read_file(args, env) {
-    const path = resolveWorkspacePath(env.settings.cwd, str(args.path));
+    const path = resolveWorkspacePath(env.settings.cwd, str(args.path ?? args.file_path ?? args.filePath));
     env.record.args.path = path;
     const guard = checkFileRules(env, 'read', path);
     if (guard.denied) return guard.denied;
     markRunning(env);
+    const range = {
+      offset: num(args.offset ?? args.start_line, 1),
+      limit: num(args.limit, READ_FILE_DEFAULT_LINES),
+      maxChars: READ_FILE_MAX_CHARS,
+    };
     const res = await withSensitiveRetry(
       env,
-      (ok) => tauriBridge.readFile(path, env.settings.cwd, ok),
+      (ok) => tauriBridge.readFileLines(path, env.settings.cwd, ok, range),
       guard.trustSensitive,
       { tool: 'read', pattern: guard.rel },
       'User rejected reading a sensitive file'
     );
     if (!res.ok) return res.error;
-    env.record.output = `${res.value.length.toLocaleString()} chars`;
+    const slice = res.value;
     env.record.status = 'completed';
-    return { content: res.value };
+    if (slice.end_line === 0) {
+      env.record.output = slice.total_lines === 0 ? 'empty' : `0 of ${slice.total_lines} lines`;
+      return {
+        content: '',
+        total_lines: slice.total_lines,
+        note: slice.total_lines === 0 ? 'The file is empty.' : `offset is past the end of the file (${slice.total_lines} lines).`,
+      };
+    }
+    env.record.output = `lines ${slice.start_line}–${slice.end_line} / ${slice.total_lines}`;
+    const notes: string[] = [];
+    if (slice.end_line < slice.total_lines) {
+      notes.push(
+        `Showing lines ${slice.start_line}-${slice.end_line} of ${slice.total_lines}. Call read_file with offset=${slice.end_line + 1} to continue.`
+      );
+    }
+    if (slice.truncated_lines > 0) notes.push(`${slice.truncated_lines} very long line(s) were cut.`);
+    return {
+      content: slice.content,
+      start_line: slice.start_line,
+      end_line: slice.end_line,
+      total_lines: slice.total_lines,
+      ...(notes.length ? { note: notes.join(' ') } : {}),
+    };
   },
 
   async write_file(args, env) {
@@ -336,42 +599,37 @@ const HANDLERS: Record<ToolName, ToolHandler> = {
 
   async replace_file_content(args, env) {
     const path = resolveWorkspacePath(env.settings.cwd, str(args.path ?? args.filePath ?? args.file));
-    const target = str(args.target_content ?? args.targetContent);
-    const replacement = str(args.replacement_content ?? args.replacementContent);
-    Object.assign(env.record.args, { path, target_content: target, replacement_content: replacement });
-    const guard = checkFileRules(env, 'edit', path);
-    if (guard.denied) return guard.denied;
-    const suggestion = { tool: 'edit' as const, pattern: guard.rel };
-    if (!guard.allowed && !env.settings.autoPilot) {
-      const rejected = await requireApproval(env, 'User rejected file modification', 'supervised', suggestion);
-      if (rejected) return rejected;
+    const edit: FileEdit = {
+      target_content: str(args.target_content ?? args.targetContent),
+      replacement_content: str(args.replacement_content ?? args.replacementContent),
+      replace_all: bool(args.replace_all ?? args.replaceAll, false),
+    };
+    Object.assign(env.record.args, { path, ...edit });
+    return applyFileEdits(env, path, [edit]);
+  },
+
+  async multi_edit_file(args, env) {
+    const path = resolveWorkspacePath(env.settings.cwd, str(args.path ?? args.filePath ?? args.file));
+    const edits = parseEdits(args.edits);
+    Object.assign(env.record.args, { path, edits });
+    if (edits.length === 0) {
+      env.record.status = 'failed';
+      env.record.error = 'edits must be a non-empty array of { target_content, replacement_content }';
+      return { error: env.record.error };
     }
-    markRunning(env);
-    const guarded = await withSensitiveRetry(
-      env,
-      async (ok) => {
-        await checkpointBeforeWrite(env, path, ok);
-        return tauriBridge.replaceFileContent(path, target, replacement, env.settings.cwd, ok);
-      },
-      guard.trustSensitive,
-      suggestion,
-      'User rejected modifying a sensitive file'
-    );
-    if (!guarded.ok) return guarded.error;
-    const res = guarded.value;
-    env.record.output = res.message;
-    env.record.status = res.success ? 'completed' : 'failed';
-    return res;
+    return applyFileEdits(env, path, edits);
   },
 
   async grep_search(args, env) {
     markRunning(env);
     const query = str(args.query ?? args.search ?? args.term);
+    const include = str(args.include ?? args.glob).trim();
     const matches = await tauriBridge.grepSearch(
       query,
       bool(args.case_insensitive ?? args.caseInsensitive, true),
       num(args.max_results ?? args.maxResults, 50),
-      env.settings.cwd
+      env.settings.cwd,
+      { regex: bool(args.regex, false), ...(include ? { include } : {}) }
     );
     // ไฟล์ลับถูกข้ามตั้งแต่ฝั่ง Rust แล้ว ที่นี่ตัดไฟล์ที่ผู้ใช้ตั้งกฎ deny read ไว้
     const rules = env.permissions.rules();
@@ -379,6 +637,23 @@ const HANDLERS: Record<ToolName, ToolHandler> = {
     env.record.output = `${visible.length} matches`;
     env.record.status = 'completed';
     return { matches: visible };
+  },
+
+  async update_todos(args, env) {
+    const todos = parseTodos(args.todos);
+    // UI วาด checklist จาก args ของ record นี้
+    env.record.args = { todos };
+    if (todos.length === 0) {
+      env.record.status = 'failed';
+      env.record.error = 'todos must be a non-empty array of { content, status }';
+      return { error: env.record.error };
+    }
+    const count = (s: TodoItem['status']) => todos.filter((t) => t.status === s).length;
+    env.record.status = 'completed';
+    env.record.output = `${count('completed')}/${todos.length}`;
+    return {
+      message: `Todo list updated: ${count('completed')} completed, ${count('in_progress')} in progress, ${count('pending')} pending.`,
+    };
   },
 
   async find_files(args, env) {
@@ -390,6 +665,87 @@ const HANDLERS: Record<ToolName, ToolHandler> = {
   },
 };
 
+/** tool ที่ไม่แก้อะไรเลย — โมเดลเรียกหลายตัวติดกันใน step เดียวก็รันพร้อมกันได้ */
+const PARALLEL_SAFE_TOOLS: ReadonlySet<string> = new Set([
+  'read_file',
+  'list_directory',
+  'grep_search',
+  'find_files',
+  'read_background_output',
+  'use_skill',
+]);
+
+/**
+ * รัน tool call ทั้งหมดของหนึ่ง step: กลุ่ม tool อ่านอย่างเดียวที่อยู่ติดกันรันพร้อมกัน
+ * ส่วนตัวที่แก้ไฟล์/รันคำสั่งรันทีละตัวตามลำดับ (ผลของตัวก่อนอาจมีผลกับตัวถัดไป)
+ * ผลลัพธ์เรียงตามลำดับ call เดิมเสมอ เพราะ API จับคู่ call/result ตามลำดับ
+ */
+export async function runToolCalls<C, R>(
+  calls: readonly C[],
+  nameOf: (call: C) => string,
+  run: (call: C) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = [];
+  let i = 0;
+  while (i < calls.length) {
+    let end = i;
+    while (end < calls.length && PARALLEL_SAFE_TOOLS.has(nameOf(calls[end]))) end++;
+    if (end > i) {
+      results.push(...(await Promise.all(calls.slice(i, end).map(run))));
+      i = end;
+    } else {
+      results.push(await run(calls[i]));
+      i++;
+    }
+  }
+  return results;
+}
+
+/** tool ที่มีเฉพาะบางเทิร์น (ไม่อยู่ใน TOOL_DEFINITIONS): use_skill เมื่อมี skill */
+const EXTRA_HANDLERS: Record<string, ToolHandler> = {
+  async use_skill(args, env) {
+    markRunning(env);
+    const name = str(args.name ?? args.skill).trim();
+    const skills = env.context.skills ?? [];
+    const skill = skills.find((s) => s.name.toLowerCase() === name.toLowerCase());
+    if (!skill) {
+      env.record.status = 'failed';
+      env.record.error = `Unknown skill "${name}". Available: ${skills.map((s) => s.name).join(', ') || '(none)'}`;
+      return { error: env.record.error };
+    }
+    const file = str(args.file).trim() || undefined;
+    const content = await readSkill(skill, env.settings.cwd, file);
+    env.record.output = file ? `${skill.name}/${file}` : skill.name;
+    env.record.status = 'completed';
+    return { skill: skill.name, folder: skill.dir, content };
+  },
+};
+
+export const MCP_TOOL_PREFIX = 'mcp__';
+
+/** tool ของ MCP server — อาจทำอะไรก็ได้ จึงถามก่อนเสมอ ยกเว้นตัวที่ประกาศว่าอ่านอย่างเดียวในโหมด Auto-Pilot */
+const mcpHandler: ToolHandler = async (args, env) => {
+  const mcp = env.context.mcp;
+  const name = env.record.name;
+  if (!mcp) {
+    env.record.status = 'failed';
+    env.record.error = `MCP server for ${name} is not connected`;
+    return { error: env.record.error };
+  }
+  const verdict = evaluateRules(env.permissions.rules(), 'mcp', name);
+  if (verdict?.action === 'deny') return blockedByRule(env, verdict.rule);
+  const autoAllowed = verdict?.action === 'allow' || (env.settings.autoPilot && mcp.isReadOnly(name));
+  if (!autoAllowed) {
+    const rejected = await requireApproval(env, 'User rejected the MCP tool call', 'mcp_tool', { tool: 'mcp', pattern: name });
+    if (rejected) return rejected;
+  }
+  markRunning(env);
+  const res = await mcp.callTool(name, args);
+  env.record.output = res.text;
+  env.record.status = res.isError ? 'failed' : 'completed';
+  return res.isError ? { error: res.text || 'MCP tool returned an error' } : { content: res.text };
+};
+
 /**
  * รัน tool หนึ่งตัวพร้อม guard (security check + approval) และรายงานสถานะผ่าน callbacks
  * ไม่ throw — error ทุกชนิดถูกคืนเป็น `{ error }` เพื่อส่งกลับให้โมเดลรับรู้
@@ -399,7 +755,8 @@ export async function executeTool(
   args: Record<string, any>,
   settings: AppSettings,
   callbacks: AgentCallbacks,
-  permissions: PermissionStore = { rules: () => settings.permissionRules ?? [], addRule: () => {} }
+  permissions: PermissionStore = { rules: () => settings.permissionRules ?? [], addRule: () => {} },
+  context: ToolContext = {}
 ): Promise<unknown> {
   const record: ToolCallRecord = {
     id: `tool-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -408,10 +765,11 @@ export async function executeTool(
     status: 'running',
   };
   callbacks.onToolStart({ ...record });
-  const env: ToolEnv = { settings, record, callbacks, permissions };
+  const env: ToolEnv = { settings, record, callbacks, permissions, context };
 
   let result: unknown;
-  const handler = HANDLERS[name as ToolName];
+  const handler =
+    HANDLERS[name as ToolName] ?? EXTRA_HANDLERS[name] ?? (name.startsWith(MCP_TOOL_PREFIX) ? mcpHandler : undefined);
   try {
     if (!handler) {
       record.status = 'failed';

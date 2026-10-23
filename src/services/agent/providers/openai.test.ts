@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { reasoningParams } from './openai';
+import { chatBaseUrl, reasoningParams } from './openai';
 
 describe('reasoningParams', () => {
   it('passes the effort straight through for OpenAI', () => {
@@ -27,5 +27,16 @@ describe('reasoningParams', () => {
       thinking_budget: 4096,
       preserve_thinking: true,
     });
+  });
+});
+
+describe('chatBaseUrl', () => {
+  it('normalises the custom endpoint URL and ignores fixed providers', () => {
+    expect(chatBaseUrl('custom', ' http://localhost:11434/v1/ ')).toBe('http://localhost:11434/v1');
+    expect(chatBaseUrl('custom', 'https://openrouter.ai/api/v1/chat/completions')).toBe('https://openrouter.ai/api/v1');
+    expect(() => chatBaseUrl('custom', '')).toThrow(/Base URL/);
+    expect(() => chatBaseUrl('custom', 'localhost:11434')).toThrow(/Base URL/);
+    expect(chatBaseUrl('openai', 'http://ignored')).toBeUndefined();
+    expect(reasoningParams('custom', 'llama3.3', 'high')).toEqual({});
   });
 });

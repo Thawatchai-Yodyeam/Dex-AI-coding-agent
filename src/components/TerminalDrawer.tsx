@@ -9,6 +9,8 @@ interface TerminalDrawerProps {
   logs: ShellOutputEventPayload[];
   onClearLogs: () => void;
   activeCommandId?: string | null;
+  /** คำสั่งเบื้องหลังที่ยังรันอยู่ (dev server ฯลฯ) */
+  backgroundCommands?: { id: string; command: string }[];
   onKillCommand?: (id: string) => void;
   t: Translation;
   height: number;
@@ -23,6 +25,7 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   logs,
   onClearLogs,
   activeCommandId,
+  backgroundCommands = [],
   onKillCommand,
   t,
   height,
@@ -80,6 +83,28 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
           </button>
         </div>
       </div>
+
+      {backgroundCommands.length > 0 && (
+        <ul className="terminal-bg-list" aria-label={t.backgroundCommands}>
+          {backgroundCommands.map((cmd) => (
+            <li key={cmd.id} className="terminal-bg-item" title={cmd.command}>
+              <span className="pulse-dot" aria-hidden="true" />
+              <code>{cmd.command}</code>
+              {onKillCommand && (
+                <button
+                  type="button"
+                  className="icon-btn icon-btn-sm"
+                  onClick={() => onKillCommand(cmd.id)}
+                  aria-label={`${t.stopProcess}: ${cmd.command}`}
+                  title={t.stopProcess}
+                >
+                  <Square size={11} fill="currentColor" aria-hidden="true" />
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
 
       <div className="terminal-console" ref={consoleRef} role="log" aria-live="polite">
         {logs.length === 0 ? (

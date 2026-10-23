@@ -6,6 +6,7 @@ import type {
   ToolCallRecord,
   TokenUsage,
 } from '../../types/agent';
+import type { RetryInfo } from './retry';
 
 export interface AgentCallbacks {
   onTextChunk: (chunk: string, fullText: string) => void;
@@ -20,6 +21,10 @@ export interface AgentCallbacks {
    * `undefined` = เก็บ checkpoint ไม่ได้ (ไฟล์ใหญ่/ไม่ใช่ข้อความ)
    */
   onFileCheckpoint?: (path: string, original: string | null | undefined) => void;
+  /** ก่อนรันคำสั่ง shell ที่ไม่ใช่แบบอ่านอย่างเดียว — UI ถือโอกาส snapshot workspace ไว้ย้อน */
+  onBeforeShellCommand?: () => Promise<void>;
+  /** API ล้มชั่วคราว กำลังรอลองใหม่ — ข้อความของ step นั้นจะถูกส่งมาใหม่ตั้งแต่ต้นผ่าน onTextChunk */
+  onRetry?: (info: RetryInfo) => void;
 }
 
 /** ที่มาของกฎสิทธิ์ระหว่างรัน tool — กฎถาวรใน settings + กฎ "ตลอดแชทนี้" ที่อยู่ในหน่วยความจำ */
@@ -51,15 +56,33 @@ export interface TurnResult {
   usage: TokenUsage;
 }
 
+/** tool หนึ่งตัวในรูป JSON Schema กลาง — driver แปลงเป็นรูปแบบของแต่ละค่าย */
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
 /** สิ่งที่ driver ทุกตัวได้รับ — history เป็นรูปแบบ native ของ provider นั้น และ driver จะ push ต่อท้ายเอง */
 export interface TurnContext {
   settings: AppSettings;
   apiKey: string;
   history: any[];
+  /** tool ของเทิร์นนี้: ชุดพื้นฐาน + use_skill (ถ้ามี skill) + tool จาก MCP server ที่เชื่อมต่ออยู่ */
+  tools: readonly ToolDefinition[];
   callbacks: AgentCallbacks;
   signal?: AbortSignal;
   systemPrompt: string;
   runTool: (name: string, args: Record<string, any>) => Promise<unknown>;
+  /** เรียกก่อนทุก step (เริ่ม 0) — false = ผู้ใช้ให้หยุดที่เพดาน step, driver ต้องปิดเทิร์นเอง */
+  shouldContinue?: (step: number) => Promise<boolean>;
+}
+
+/** ข้อความที่ driver ใส่ท้ายคำตอบเมื่อผู้ใช้ให้หยุดที่เพดาน step */
+export function stepLimitNote(language: string, steps: number): string {
+  return language === 'en'
+    ? `*(Stopped after ${steps} steps at your request.)*`
+    : `*(หยุดหลังทำไป ${steps} รอบตามที่คุณเลือก)*`;
 }
 
 export type HistoryFormat = 'google' | 'anthropic' | 'openai';
@@ -89,6 +112,7 @@ export function addUsage(total: TokenUsage, step: TokenUsage) {
   total.promptTokens += step.promptTokens;
   total.completionTokens += step.completionTokens;
   total.totalTokens += step.totalTokens || step.promptTokens + step.completionTokens;
+  if (step.cachedTokens) total.cachedTokens = (total.cachedTokens ?? 0) + step.cachedTokens;
 }
 
 /**

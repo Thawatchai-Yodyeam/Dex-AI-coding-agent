@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ArrowUp, Square, Brain, ChevronDown, ImagePlus, X } from 'lucide-react';
-import type { AIProvider, AppSettings, ImageAttachment, ReasoningEffort, TokenUsage } from '../types/agent';
-import { PROVIDERS_CATALOG, effectiveEffort, findModel, supportsImages } from '../types/agent';
+import type { AppSettings, ImageAttachment, ReasoningEffort, TokenUsage } from '../types/agent';
+import { effectiveEffort, findModel, supportsImages } from '../types/agent';
+import { ModelOptions, modelOptionValue, parseModelOptionValue } from './ModelOptions';
 import type { Translation } from '../utils/i18n';
 import {
   ImageAttachError,
@@ -109,10 +110,9 @@ export const Composer: React.FC<ComposerProps> = ({
     if (autoFocus) textareaRef.current?.focus();
   }, [autoFocus]);
 
-  const modelValue = `${settings.provider}::${settings.model}`;
-  const currentProvider = PROVIDERS_CATALOG.find((p) => p.id === settings.provider);
-  const currentModel = currentProvider?.models.find((m) => m.id === settings.model);
-  const currentModelName = currentModel?.name ?? settings.model;
+  const modelValue = modelOptionValue(settings.provider, settings.model);
+  const currentModel = findModel(settings.provider, settings.model);
+  const currentModelName = currentModel?.name ?? (settings.model || t.noModel);
 
   const effortLabels: Record<ReasoningEffort, string> = {
     none: t.effortNone,
@@ -263,20 +263,12 @@ export const Composer: React.FC<ComposerProps> = ({
               className="overlay-select"
               value={modelValue}
               onChange={(e) => {
-                const [provider, model] = e.target.value.split('::') as [AIProvider, string];
+                const { provider, model } = parseModelOptionValue(e.target.value);
                 // เปลี่ยนโมเดล → ใช้ effort เริ่มต้นของโมเดลนั้น (แต่ละโมเดลรองรับคนละชุด)
                 onUpdateSettings({ provider, model, reasoningEffort: findModel(provider, model)?.defaultEffort ?? 'medium' });
               }}
             >
-              {PROVIDERS_CATALOG.map((p) => (
-                <optgroup key={p.id} label={p.name}>
-                  {p.models.map((m) => (
-                    <option key={m.id} value={`${p.id}::${m.id}`}>
-                      {m.name}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
+              <ModelOptions settings={settings} />
             </select>
           </div>
 

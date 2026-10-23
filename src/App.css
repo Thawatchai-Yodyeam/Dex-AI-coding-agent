@@ -1304,6 +1304,51 @@ pre,
   text-overflow: ellipsis;
 }
 
+.todo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 2px 14px 10px 40px;
+  list-style: none;
+  font-size: 13.5px;
+}
+
+.todo-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--text-muted);
+}
+
+.todo-item svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.todo-item.is-in_progress {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.todo-item.is-completed span {
+  text-decoration: line-through;
+}
+
+.todo-item.is-completed svg {
+  color: var(--success);
+}
+
+.tool-tag {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 .tool-status {
   display: inline-flex;
   align-items: center;
@@ -1753,6 +1798,36 @@ pre,
   gap: 2px;
 }
 
+.terminal-bg-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 6px 10px;
+  list-style: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.terminal-bg-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 2px 4px 2px 8px;
+  border-radius: 999px;
+  background: rgba(229, 184, 92, 0.12);
+  color: #e5b85c;
+  font-size: 12px;
+}
+
+.terminal-bg-item code {
+  overflow: hidden;
+  max-width: 320px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: inherit;
+}
+
 .running-badge {
   display: inline-flex;
   align-items: center;
@@ -1913,6 +1988,106 @@ pre,
   min-width: 200px;
 }
 
+.field-row-between {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.field-row-between h3 {
+  margin: 0;
+  font-size: inherit;
+}
+
+/* Skills / MCP lists in Settings */
+.ext-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ext-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.ext-item > svg {
+  flex-shrink: 0;
+  margin-top: 3px;
+  color: var(--text-muted);
+}
+
+.ext-item-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.ext-item-name {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-weight: 500;
+}
+
+.ext-item-text .field-hint {
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+
+.ext-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+.ext-status::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.ext-status.is-ready {
+  color: var(--success);
+}
+
+.ext-status.is-error {
+  color: var(--danger, #c0392b);
+}
+
+.mcp-errors {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--danger);
+}
+
+.mcp-error {
+  margin: 6px 0 0;
+  max-height: 140px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 12px;
+}
+
+.mcp-config {
+  min-height: 180px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
 .field-stack {
   display: flex;
   flex-direction: column;
@@ -1923,6 +2098,17 @@ pre,
   margin: 0;
   font-size: 13px;
   color: var(--text-muted);
+}
+
+.field-sublabel {
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.custom-endpoint {
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
 }
 
 /* Permission rules */
@@ -2251,6 +2437,55 @@ pre,
   flex-direction: column;
   align-items: flex-end;
   gap: 6px;
+}
+
+.msg-user-actions {
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  color: var(--text-muted);
+}
+
+.msg-user:hover .msg-user-actions,
+.msg-user-actions:focus-within {
+  opacity: 1;
+}
+
+.user-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(100%, 640px);
+}
+
+.user-edit-input {
+  width: 100%;
+  min-height: 60px;
+  padding: 10px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  background: var(--bubble);
+  color: inherit;
+  font: inherit;
+  line-height: 1.5;
+  resize: none;
+}
+
+.user-edit-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.user-edit-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.user-edit-actions .field-hint {
+  margin: 0 auto 0 0;
 }
 
 .user-images {

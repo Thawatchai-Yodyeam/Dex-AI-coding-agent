@@ -64,7 +64,7 @@ describe('stripImageData', () => {
 });
 
 describe('buildSystemPrompt project instructions', () => {
-  const settings = { cwd: 'D:\proj', language: 'en' } as AppSettings;
+  const settings = { cwd: 'D:\\proj', language: 'en' } as AppSettings;
 
   it('includes the project file when present', () => {
     const prompt = buildSystemPrompt(settings, { file: 'DEX.md', content: 'Use pnpm.\n' });

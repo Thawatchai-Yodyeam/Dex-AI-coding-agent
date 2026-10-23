@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { fromNeutral, isUserTextTurn, pruneHistory, toNeutral } from './history';
+import {
+  CLEARED_TOOL_RESULT,
+  estimateHistoryChars,
+  fromNeutral,
+  isUserTextTurn,
+  pruneHistory,
+  pruneHistoryToBudget,
+  toNeutral,
+  trimToolResults,
+} from './history';
 import type { HistoryFormat, NeutralMessage } from './types';
 
 const conversation: NeutralMessage[] = [
@@ -211,5 +220,71 @@ describe('pruneHistory', () => {
       { role: 'assistant', content: 'a2' },
     ];
     expect(pruneHistory(h, 'openai', 5)).toEqual(h.slice(4));
+  });
+});
+
+describe('context budget', () => {
+  const big = (n: number) => 'x'.repeat(n);
+
+  /** เทิร์นเดียวที่เรียก tool หลายรอบ (รูปแบบ OpenAI) */
+  function openaiLoop(results: number, size: number) {
+    const h: any[] = [{ role: 'user', content: 'refactor everything' }];
+    for (let i = 0; i < results; i++) {
+      h.push({ role: 'assistant', content: null, tool_calls: [{ id: `c${i}`, type: 'function', function: { name: 'read_file', arguments: '{}' } }] });
+      h.push({ role: 'tool', tool_call_id: `c${i}`, content: big(size) });
+    }
+    return h;
+  }
+
+  it('counts images as a fixed cost instead of their base64 length', () => {
+    const image = { role: 'user', content: [{ type: 'image', source: { type: 'base64', data: 'A'.repeat(500_000) } }] };
+    expect(estimateHistoryChars([image])).toBeLessThan(10_000);
+    expect(estimateHistoryChars([{ role: 'user', content: big(50_000) }])).toBeGreaterThan(50_000);
+  });
+
+  it('clears the oldest tool results first and keeps the recent ones and every pair', () => {
+    const h = openaiLoop(20, 30_000);
+    const cleared = trimToolResults(h, 'openai', 400_000);
+    expect(cleared).toBeGreaterThan(0);
+    const tools = h.filter((m) => m.role === 'tool');
+    expect(tools).toHaveLength(20);
+    expect(tools[0].content).toBe(CLEARED_TOOL_RESULT);
+    // 8 ตัวล่าสุด (240k) ไม่ถูกแตะ แม้จะทำให้ลงไม่ถึงเป้า 60%
+    expect(tools.slice(-8).every((m) => m.content.length === 30_000)).toBe(true);
+    expect(tools.slice(0, 12).every((m) => m.content === CLEARED_TOOL_RESULT)).toBe(true);
+    expect(estimateHistoryChars(h)).toBeLessThanOrEqual(400_000);
+  });
+
+  it('does nothing while under budget', () => {
+    const h = openaiLoop(3, 1_000);
+    expect(trimToolResults(h, 'openai', 400_000)).toBe(0);
+  });
+
+  it('clears Anthropic tool_result blocks and Gemini functionResponses', () => {
+    const anth: any[] = [{ role: 'user', content: 'go' }];
+    const gem: any[] = [{ role: 'user', parts: [{ text: 'go' }] }];
+    for (let i = 0; i < 12; i++) {
+      anth.push({ role: 'assistant', content: [{ type: 'tool_use', id: `t${i}`, name: 'read_file', input: {} }] });
+      anth.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: `t${i}`, content: big(10_000) }] });
+      gem.push({ role: 'model', parts: [{ functionCall: { name: 'read_file', args: {} } }] });
+      gem.push({ role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { content: big(10_000) } } }] });
+    }
+    expect(trimToolResults(anth, 'anthropic', 50_000)).toBeGreaterThan(0);
+    expect(anth[2].content[0]).toMatchObject({ type: 'tool_result', tool_use_id: 't0', content: CLEARED_TOOL_RESULT });
+    expect(trimToolResults(gem, 'google', 50_000)).toBeGreaterThan(0);
+    expect(gem[2].parts[0].functionResponse).toEqual({ name: 'read_file', response: { result: CLEARED_TOOL_RESULT } });
+  });
+
+  it('drops whole old turns when plain text alone is over budget, but keeps the latest turn', () => {
+    const h: any[] = [];
+    for (let i = 0; i < 6; i++) {
+      h.push({ role: 'user', content: `q${i} ${big(30_000)}` });
+      h.push({ role: 'assistant', content: `a${i} ${big(30_000)}` });
+    }
+    const out = pruneHistoryToBudget(h, 'openai', 200_000);
+    expect(out.length).toBeLessThan(h.length);
+    expect(isUserTextTurn(out[0], 'openai')).toBe(true);
+    expect(out[out.length - 1].content.startsWith('a5')).toBe(true);
+    expect(estimateHistoryChars(out)).toBeLessThanOrEqual(200_000);
   });
 });

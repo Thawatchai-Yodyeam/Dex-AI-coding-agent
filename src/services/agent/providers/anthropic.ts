@@ -1,11 +1,14 @@
 import { effectiveEffort } from '../../../types/agent';
+import { trimToolResults } from '../history';
+import { TransientApiError, httpError, withRetry } from '../retry';
 import { readSseData, tryParseJson } from '../sse';
-import { TOOL_DEFINITIONS, isToolError, toolResultToString } from '../tools';
+import { isToolError, runToolCalls, toolResultToString } from '../tools';
 import {
   addUsage,
   appendStepText,
   emptyUsage,
   imagesWithData,
+  stepLimitNote,
   throwIfAborted,
   type TurnContext,
   type TurnResult,
@@ -45,6 +48,38 @@ function buildThinkingParams(model: string, effort: string): Record<string, unkn
   return { thinking: { type: 'enabled', budget_tokens: budget } };
 }
 
+const EPHEMERAL = { type: 'ephemeral' } as const;
+
+/** สำเนาข้อความที่มี cache_control ที่ block สุดท้าย (thinking block ใส่ไม่ได้ จึงข้าม) */
+function withCacheControl(message: any): any {
+  if (typeof message.content === 'string') {
+    return message.content ? { ...message, content: [{ type: 'text', text: message.content, cache_control: EPHEMERAL }] } : message;
+  }
+  if (!Array.isArray(message.content)) return message;
+  const content = [...message.content];
+  for (let i = content.length - 1; i >= 0; i--) {
+    if (content[i]?.type !== 'thinking' && content[i]?.type !== 'redacted_thinking') {
+      content[i] = { ...content[i], cache_control: EPHEMERAL };
+      return { ...message, content };
+    }
+  }
+  return message;
+}
+
+/**
+ * Prompt caching: tool loop ส่งประวัติทั้งก้อนซ้ำทุก step — ใส่ breakpoint ที่ข้อความ user ล่าสุด
+ * และ user ก่อนหน้า (เผื่อ step ใหม่ยาวเกินช่วงที่ API มองย้อนหา cache เดิม) ส่วน tools + system
+ * มี breakpoint ของตัวเองใน body รวมเป็น 3 จากที่ API ให้ 4
+ * คืนสำเนา — ถ้าเขียนลง history จริง breakpoint จะสะสมจนเกินเพดาน
+ */
+export function withCacheBreakpoints(history: any[]): any[] {
+  const marks = new Set<number>();
+  for (let i = history.length - 1; i >= 0 && marks.size < 2; i--) {
+    if (history[i]?.role === 'user') marks.add(i);
+  }
+  return history.map((m, i) => (marks.has(i) ? withCacheControl(m) : m));
+}
+
 /** content block ระหว่างสตรีม — เก็บ field ดิบไว้ทั้งหมดเพื่อส่งคืน API แบบไม่แก้ไข */
 type StreamBlock = Record<string, any> & { type: string; _json?: string };
 
@@ -65,7 +100,7 @@ export async function runAnthropicTurn(ctx: TurnContext, input: UserInput): Prom
   const { settings, callbacks, signal, history } = ctx;
   const model = settings.model || DEFAULT_MODEL;
 
-  const tools = TOOL_DEFINITIONS.map((t) => ({
+  const tools = ctx.tools.map((t) => ({
     name: t.name,
     description: t.description,
     input_schema: t.parameters,
@@ -88,77 +123,113 @@ export async function runAnthropicTurn(ctx: TurnContext, input: UserInput): Prom
   let fullThought = '';
   const usage = emptyUsage();
 
-  // ไม่จำกัดจำนวน step: วนจนโมเดลตอบจบเอง (ผู้ใช้หยุดได้ด้วยปุ่ม Stop → abort signal)
-  for (;;) {
+  // วนจนโมเดลตอบจบเอง — ผู้ใช้หยุดได้ด้วยปุ่ม Stop (abort signal) และถูกถามทุก STEPS_PER_CONFIRM step
+  for (let step = 0; ; step++) {
     throwIfAborted(signal);
-    let stepHasText = false;
+    if (ctx.shouldContinue && !(await ctx.shouldContinue(step))) {
+      const note = stepLimitNote(settings.language, step);
+      // ปิดเทิร์นด้วยข้อความ assistant ให้ลำดับ role ถูกต้องสำหรับเทิร์นถัดไป
+      history.push({ role: 'assistant', content: [{ type: 'text', text: note }] });
+      return { text: appendStepText(fullText, note, false), usage };
+    }
+    // tool loop ยาว ๆ (อ่านไฟล์หลายสิบไฟล์) ทำให้ประวัติโตเกิน context ได้ภายในเทิร์นเดียว
+    trimToolResults(history, 'anthropic');
 
     const body: Record<string, unknown> = {
       model,
       max_tokens: MAX_TOKENS,
-      system: ctx.systemPrompt,
-      messages: history,
+      // breakpoint ที่ system ครอบ tools ด้วย (ลำดับ prefix ของ cache คือ tools → system → messages)
+      system: [{ type: 'text', text: ctx.systemPrompt, cache_control: EPHEMERAL }],
+      messages: withCacheBreakpoints(history),
       tools,
       stream: true,
       ...buildThinkingParams(model, effectiveEffort(settings)),
     };
     if (useFallback) body.fallbacks = 'default';
 
-    const response = await fetch(API_URL, { method: 'POST', headers, body: JSON.stringify(body), signal });
-    if (!response.ok) {
-      throw new Error(`Anthropic Error [${response.status}]: ${await response.text()}`);
-    }
-
-    const blocks: StreamBlock[] = [];
-    let stopReason: string | null = null;
-    let stepInput = 0;
-    let stepOutput = 0;
-
-    for await (const data of readSseData(response, signal)) {
-      const ev = tryParseJson(data);
-      if (!ev) continue;
-
-      switch (ev.type) {
-        case 'error':
-          throw new Error(`Anthropic Error: ${ev.error?.message || JSON.stringify(ev.error)}`);
-        case 'message_start': {
-          const u = ev.message?.usage ?? {};
-          stepInput = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
-          break;
+    // หนึ่ง step = request + อ่านสตรีมจนจบ ถ้าล้มชั่วคราว (529, เน็ตหลุดกลางสตรีม) จะลองใหม่ทั้ง step
+    // และส่งข้อความของ step นี้ให้ UI ใหม่ตั้งแต่ต้น — tool ยังไม่ถูกรันจนกว่าสตรีมจะจบ จึงปลอดภัย
+    const textBefore = fullText;
+    const thoughtBefore = fullThought;
+    const streamed = await withRetry(
+      async (attempt) => {
+        if (attempt > 0) {
+          fullText = textBefore;
+          fullThought = thoughtBefore;
+          callbacks.onTextChunk('', fullText);
+          callbacks.onThoughtChunk?.('', fullThought);
         }
-        case 'message_delta':
-          if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason;
-          if (typeof ev.usage?.output_tokens === 'number') stepOutput = ev.usage.output_tokens;
-          break;
-        case 'content_block_start': {
-          const block: StreamBlock = { ...ev.content_block };
-          if (block.type === 'tool_use') block._json = '';
-          blocks[ev.index] = block;
-          break;
-        }
-        case 'content_block_delta': {
-          const block = blocks[ev.index];
-          const d = ev.delta;
-          if (!block || !d) break;
-          if (d.type === 'text_delta') {
-            block.text = (block.text ?? '') + d.text;
-            fullText = appendStepText(fullText, d.text, stepHasText);
-            stepHasText = true;
-            callbacks.onTextChunk(d.text, fullText);
-          } else if (d.type === 'thinking_delta') {
-            block.thinking = (block.thinking ?? '') + d.thinking;
-            fullThought += d.thinking;
-            callbacks.onThoughtChunk?.(d.thinking, fullThought);
-          } else if (d.type === 'signature_delta') {
-            block.signature = d.signature;
-          } else if (d.type === 'input_json_delta') {
-            block._json = (block._json ?? '') + d.partial_json;
+        const response = await fetch(API_URL, { method: 'POST', headers, body: JSON.stringify(body), signal });
+        if (!response.ok) throw await httpError('Anthropic Error', response);
+
+        const blocks: StreamBlock[] = [];
+        let stopReason: string | null = null;
+        let input = 0;
+        let cached = 0;
+        let output = 0;
+        let stepHasText = false;
+
+        for await (const data of readSseData(response, signal)) {
+          const ev = tryParseJson(data);
+          if (!ev) continue;
+
+          switch (ev.type) {
+            case 'error': {
+              const message = `Anthropic Error: ${ev.error?.message || JSON.stringify(ev.error)}`;
+              // overloaded/api_error กลางสตรีม = ฝั่ง API ล้มชั่วคราว ลองใหม่ได้
+              throw ['overloaded_error', 'api_error'].includes(ev.error?.type)
+                ? new TransientApiError(message)
+                : new Error(message);
+            }
+            case 'message_start': {
+              const u = ev.message?.usage ?? {};
+              cached = u.cache_read_input_tokens ?? 0;
+              input = (u.input_tokens ?? 0) + cached + (u.cache_creation_input_tokens ?? 0);
+              break;
+            }
+            case 'message_delta':
+              if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason;
+              if (typeof ev.usage?.output_tokens === 'number') output = ev.usage.output_tokens;
+              break;
+            case 'content_block_start': {
+              const block: StreamBlock = { ...ev.content_block };
+              if (block.type === 'tool_use') block._json = '';
+              blocks[ev.index] = block;
+              break;
+            }
+            case 'content_block_delta': {
+              const block = blocks[ev.index];
+              const d = ev.delta;
+              if (!block || !d) break;
+              if (d.type === 'text_delta') {
+                block.text = (block.text ?? '') + d.text;
+                fullText = appendStepText(fullText, d.text, stepHasText);
+                stepHasText = true;
+                callbacks.onTextChunk(d.text, fullText);
+              } else if (d.type === 'thinking_delta') {
+                block.thinking = (block.thinking ?? '') + d.thinking;
+                fullThought += d.thinking;
+                callbacks.onThoughtChunk?.(d.thinking, fullThought);
+              } else if (d.type === 'signature_delta') {
+                block.signature = d.signature;
+              } else if (d.type === 'input_json_delta') {
+                block._json = (block._json ?? '') + d.partial_json;
+              }
+              break;
+            }
           }
-          break;
         }
-      }
-    }
-    addUsage(usage, { promptTokens: stepInput, completionTokens: stepOutput, totalTokens: 0 });
+        return { blocks, stopReason, input, cached, output };
+      },
+      { signal, onRetry: callbacks.onRetry }
+    );
+    const { blocks, stopReason } = streamed;
+    addUsage(usage, {
+      promptTokens: streamed.input,
+      completionTokens: streamed.output,
+      totalTokens: 0,
+      cachedTokens: streamed.cached,
+    });
 
     // แปลง tool_use input จาก JSON ที่สตรีมมา; JSON เสีย (โดนตัดเพราะ max_tokens) → ทำเครื่องหมายไว้ไม่รัน
     const invalidToolIds = new Set<string>();
@@ -206,25 +277,23 @@ export async function runAnthropicTurn(ctx: TurnContext, input: UserInput): Prom
     }
 
     // ผลลัพธ์ทุก tool ต้องอยู่ใน user message เดียว
-    const results: any[] = [];
-    for (const b of toolUses) {
+    const results = await runToolCalls(toolUses, (b) => b.name, async (b): Promise<any> => {
       if (invalidToolIds.has(b.id)) {
-        results.push({
+        return {
           type: 'tool_result',
           tool_use_id: b.id,
           content: 'INVALID_JSON: tool input was incomplete or malformed. Please retry the call.',
           is_error: true,
-        });
-        continue;
+        };
       }
       const result = await ctx.runTool(b.name, b.input);
-      results.push({
+      return {
         type: 'tool_result',
         tool_use_id: b.id,
         content: toolResultToString(result),
         ...(isToolError(result) ? { is_error: true } : {}),
-      });
-    }
+      };
+    });
     history.push({ role: 'user', content: results });
   }
 }

@@ -1,4 +1,5 @@
-export type AIProvider = 'google' | 'anthropic' | 'openai' | 'deepseek' | 'qwen';
+/** custom = endpoint แบบ OpenAI-compatible ที่ผู้ใช้ตั้งเอง (Ollama, LM Studio, OpenRouter, vLLM ฯลฯ) */
+export type AIProvider = 'google' | 'anthropic' | 'openai' | 'deepseek' | 'qwen' | 'custom';
 
 /** ระดับการคิดทั้งหมดที่ค่ายต่าง ๆ ใช้ — แต่ละโมเดลรองรับแค่บางระดับ (ดู ProviderModel.efforts) */
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -16,6 +17,8 @@ export interface TokenUsage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  /** ส่วนของ promptTokens ที่อ่านจาก prompt cache (คิดราคาถูกกว่ามาก) — session เก่าไม่มีฟิลด์นี้ */
+  cachedTokens?: number;
 }
 
 export interface ProviderModel {
@@ -101,13 +104,44 @@ export const PROVIDERS_CATALOG: ProviderInfo[] = [
       { id: 'qwen3.7-plus', name: 'Qwen3.7 Plus', efforts: ['none', 'low', 'medium', 'high'], defaultEffort: 'medium' },
     ],
   },
+  {
+    id: 'custom',
+    name: 'Custom (OpenAI-compatible)',
+    badge: 'Custom',
+    // รายชื่อโมเดลมาจาก settings.customModels — ดู modelsFor()
+    models: [],
+  },
 ];
+
+/** endpoint ที่ผู้ใช้ตั้งเองไม่รู้ว่ารองรับพารามิเตอร์ระดับการคิดหรือไม่ จึงไม่ส่ง */
+const CUSTOM_EFFORTS: ReasoningEffort[] = ['none'];
+
+function customModel(id: string): ProviderModel {
+  return { id, name: id, efforts: CUSTOM_EFFORTS, defaultEffort: 'none' };
+}
+
+/** โมเดลของ custom endpoint จาก settings (คั่นด้วย , หรือขึ้นบรรทัดใหม่) */
+export function customModelIds(settings: Pick<AppSettings, 'customModels'>): string[] {
+  return [...new Set((settings.customModels ?? '').split(/[,\n]/).map((s) => s.trim()).filter(Boolean))];
+}
+
+/** โมเดลที่เลือกได้ของค่ายนี้ — custom มาจาก settings ส่วนค่ายอื่นมาจาก catalog */
+export function modelsFor(provider: AIProvider, settings: Pick<AppSettings, 'customModels'>): ProviderModel[] {
+  if (provider === 'custom') return customModelIds(settings).map(customModel);
+  return PROVIDERS_CATALOG.find((p) => p.id === provider)?.models ?? [];
+}
+
+/** custom endpoint แบบ local (Ollama ฯลฯ) มักไม่ต้องใช้ key */
+export function requiresApiKey(provider: AIProvider): boolean {
+  return provider !== 'custom';
+}
 
 export function supportsImages(provider: AIProvider): boolean {
   return PROVIDERS_CATALOG.find((p) => p.id === provider)?.vision !== false;
 }
 
 export function findModel(provider: AIProvider, modelId: string): ProviderModel | undefined {
+  if (provider === 'custom') return modelId ? customModel(modelId) : undefined;
   return PROVIDERS_CATALOG.find((p) => p.id === provider)?.models.find((m) => m.id === modelId);
 }
 
@@ -152,12 +186,16 @@ export interface ChatMessage {
   checkpoint?: TurnCheckpointInfo;
   /** รูปที่แนบมากับข้อความผู้ใช้ — `data` ไม่ถูกบันทึกลงเครื่อง (ใหญ่เกิน localStorage) */
   images?: ImageAttachment[];
+  /** API ล้มชั่วคราวและกำลังรอลองใหม่ (มีเฉพาะระหว่างสตรีม) */
+  retry?: { attempt: number; maxAttempts: number; reason: string };
 }
 
 export interface TurnCheckpointInfo {
   files: string[];
   /** ไฟล์ที่เก็บ checkpoint ไม่ได้ (ไฟล์ใหญ่/ไม่ใช่ข้อความ) */
   skipped?: string[];
+  /** เทิร์นนี้รันคำสั่ง shell ที่แก้ไฟล์ได้ และมี git snapshot ไว้ย้อน */
+  shell?: boolean;
   revertedAt?: number;
 }
 
@@ -198,11 +236,21 @@ export interface AppSettings {
   cwd: string;
   apiKeys: Record<AIProvider, string>;
   permissionRules: PermissionRule[];
+  /** base URL ของ custom endpoint เช่น http://localhost:11434/v1 */
+  customBaseUrl?: string;
+  /** ชื่อโมเดลของ custom endpoint คั่นด้วย , */
+  customModels?: string;
+  /** แจ้งเตือนของ Windows เมื่อทำเสร็จหรือรออนุมัติ ตอนที่หน้าต่างไม่ได้โฟกัส (ค่าเริ่มต้นเปิด) */
+  notifications?: boolean;
+  /** ชื่อ skill ที่ผู้ใช้ปิดไว้ */
+  disabledSkills?: string[];
+  /** การตั้งค่า MCP server เป็น JSON รูปแบบ `{ "mcpServers": { ... } }` แบบเดียวกับ Claude Desktop / .mcp.json */
+  mcpConfig?: string;
 }
 
-/** shell = คำสั่ง PowerShell, read = อ่าน/ค้นไฟล์, edit = เขียน/แก้ไฟล์ */
-export type PermissionTool = 'shell' | 'read' | 'edit';
-export const PERMISSION_TOOLS: PermissionTool[] = ['shell', 'read', 'edit'];
+/** shell = คำสั่ง PowerShell, read = อ่าน/ค้นไฟล์, edit = เขียน/แก้ไฟล์, mcp = tool ของ MCP server */
+export type PermissionTool = 'shell' | 'read' | 'edit' | 'mcp';
+export const PERMISSION_TOOLS: PermissionTool[] = ['shell', 'read', 'edit', 'mcp'];
 
 /**
  * กฎสิทธิ์ของผู้ใช้ — deny ชนะ allow เสมอ
@@ -216,7 +264,14 @@ export interface PermissionRule {
 }
 
 /** เหตุผลที่ต้องขออนุมัติ — UI แปลเป็นข้อความตามภาษา */
-export type ApprovalReason = 'sensitive_file' | 'shell_chaining' | 'shell_risky' | 'shell_command' | 'supervised';
+export type ApprovalReason =
+  | 'sensitive_file'
+  | 'shell_chaining'
+  | 'shell_risky'
+  | 'shell_command'
+  | 'supervised'
+  | 'step_limit'
+  | 'mcp_tool';
 
 /** ผลการกดอนุมัติ: ครั้งนี้ / ตลอดแชทนี้ / บันทึกเป็นกฎถาวร */
 export type ApprovalDecision = 'reject' | 'once' | 'session' | 'always';

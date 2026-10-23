@@ -17,6 +17,12 @@ import {
   Loader2,
   Undo2,
   ImageIcon,
+  RotateCcw,
+  ListChecks,
+  CheckCircle2,
+  Circle,
+  Sparkles,
+  Plug,
 } from 'lucide-react';
 import type { ApprovalDecision, ChatMessage, ToolCallRecord } from '../types/agent';
 import type { Translation } from '../utils/i18n';
@@ -33,7 +39,61 @@ interface ChatMessageItemProps {
   /** มี checkpoint ในหน่วยความจำให้ย้อน */
   canUndo?: boolean;
   onUndo?: (messageId: string) => void;
+  /** มีเฉพาะคำตอบล่าสุดตอนที่ไม่ได้รันอยู่ */
+  onRegenerate?: (messageId: string) => void;
+  /** แก้ข้อความผู้ใช้แล้วส่งใหม่ (ไม่มี = แก้ไม่ได้ เช่น ระหว่างรัน) */
+  onEditUser?: (messageId: string, text: string) => void;
 }
+
+/** ข้อความผู้ใช้ที่กำลังแก้ — Enter ส่ง, Shift+Enter ขึ้นบรรทัด, Esc ยกเลิก */
+const UserEditor: React.FC<{ initial: string; t: Translation; onSubmit: (text: string) => void; onCancel: () => void }> = ({
+  initial,
+  t,
+  onSubmit,
+  onCancel,
+}) => {
+  const [text, setText] = useState(initial);
+  const ref = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  }, []);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 320)}px`;
+  }, [text]);
+  return (
+    <div className="user-edit">
+      <textarea
+        ref={ref}
+        className="user-edit-input"
+        value={text}
+        aria-label={t.editMessage}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') onCancel();
+          if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+            e.preventDefault();
+            if (text.trim()) onSubmit(text);
+          }
+        }}
+      />
+      <div className="user-edit-actions">
+        <span className="field-hint">{t.editResendHint}</span>
+        <button type="button" className="btn btn-secondary btn-sm" onClick={onCancel}>
+          {t.cancelEdit}
+        </button>
+        <button type="button" className="btn btn-primary btn-sm" disabled={!text.trim()} onClick={() => onSubmit(text)}>
+          {t.resendBtn}
+        </button>
+      </div>
+    </div>
+  );
+};
 
 /** ปุ่มย้อนไฟล์แบบกดสองครั้ง (กันพลาด) — เหมือนปุ่มลบแชท */
 const UndoButton: React.FC<{ count: number; t: Translation; onConfirm: () => void }> = ({ count, t, onConfirm }) => {
@@ -128,26 +188,52 @@ function markdownComponents(t: Translation): Components {
 
 const TOOL_ICONS: Record<string, React.ComponentType<{ size?: number; 'aria-hidden'?: boolean }>> = {
   run_shell_command: TerminalSquare,
+  read_background_output: TerminalSquare,
+  stop_background_command: TerminalSquare,
   read_file: FileText,
   write_file: FilePen,
   replace_file_content: Pencil,
+  multi_edit_file: Pencil,
   list_directory: FolderOpen,
   grep_search: Search,
   find_files: Search,
+  update_todos: ListChecks,
+  use_skill: Sparkles,
 };
 
 const ToolCard: React.FC<{
   tool: ToolCallRecord;
   t: Translation;
+  /** ข้อความยังสตรีมอยู่ — ใช้หมุนไอคอนของงานที่กำลังทำใน checklist */
+  live?: boolean;
   onApprove?: (decision: Exclude<ApprovalDecision, 'reject'>) => void;
   onReject?: () => void;
-}> = ({ tool, t, onApprove, onReject }) => {
+}> = ({ tool, t, live = false, onApprove, onReject }) => {
   const [expanded, setExpanded] = useState(false);
-  const Icon = TOOL_ICONS[tool.name] ?? FileText;
+  const isMcp = tool.name.startsWith('mcp__');
+  const Icon = TOOL_ICONS[tool.name] ?? (isMcp ? Plug : FileText);
+  // mcp__<server>__<tool> → "server · tool"
+  const [, mcpServer, ...mcpTool] = tool.name.split('__');
+  const displayName = isMcp ? `${mcpServer} · ${mcpTool.join('__')}` : (t.toolNames[tool.name] ?? tool.name);
   const pending = tool.status === 'pending_approval';
-  const summary = tool.args.command || tool.args.path || tool.args.query || tool.args.pattern || '';
-  const isEdit = tool.name === 'replace_file_content';
-  const showDiff = isEdit && typeof tool.args.target_content === 'string';
+  const background = tool.args.run_in_background === true || tool.args.run_in_background === 'true';
+  const isContinue = tool.name === 'continue_turn';
+  const todos: { content: string; status: string }[] =
+    tool.name === 'update_todos' && Array.isArray(tool.args.todos) ? tool.args.todos : [];
+  const summary =
+    tool.name === 'continue_turn'
+      ? t.stepsSoFar(Number(tool.args.steps) || 0)
+      : isMcp
+        ? JSON.stringify(tool.args).slice(0, 160)
+        : tool.args.command || tool.args.path || tool.args.query || tool.args.pattern || tool.args.id || tool.args.name || '';
+  const isEdit = tool.name === 'replace_file_content' || tool.name === 'multi_edit_file';
+  // replace_file_content = edit เดียวใน args, multi_edit_file = หลาย edit
+  const edits: { target_content: string; replacement_content?: string }[] = Array.isArray(tool.args.edits)
+    ? tool.args.edits
+    : typeof tool.args.target_content === 'string'
+      ? [tool.args as { target_content: string; replacement_content?: string }]
+      : [];
+  const showDiff = isEdit && edits.length > 0;
   const open = expanded || pending;
 
   const statusText: Record<ToolCallRecord['status'], string> = {
@@ -167,14 +253,33 @@ const ToolCard: React.FC<{
         onClick={() => setExpanded((v) => !v)}
       >
         <Icon size={16} aria-hidden={true} />
-        <span className="tool-name">{t.toolNames[tool.name] ?? tool.name}</span>
+        <span className="tool-name">{displayName}</span>
         <code className="tool-summary">{summary}</code>
+        {background && <span className="tool-tag">{t.backgroundLabel}</span>}
         <span className="tool-status">
           {tool.status === 'running' && <Loader2 size={13} className="spin" aria-hidden="true" />}
           {statusText[tool.status]}
         </span>
         {open ? <ChevronDown size={15} aria-hidden="true" /> : <ChevronRight size={15} aria-hidden="true" />}
       </button>
+
+      {todos.length > 0 && (
+        <ul className="todo-list" aria-label={t.toolNames.update_todos}>
+          {todos.map((todo, i) => (
+            <li key={i} className={`todo-item is-${todo.status}`}>
+              {todo.status === 'completed' ? (
+                <CheckCircle2 size={15} aria-hidden="true" />
+              ) : todo.status === 'in_progress' ? (
+                <Loader2 size={15} className={live ? 'spin' : undefined} aria-hidden="true" />
+              ) : (
+                <Circle size={15} aria-hidden="true" />
+              )}
+              <span>{todo.content}</span>
+              <span className="sr-only">{t.todoStatus[todo.status as keyof typeof t.todoStatus] ?? ''}</span>
+            </li>
+          ))}
+        </ul>
+      )}
 
       {open && (
         <div className="tool-body">
@@ -184,17 +289,22 @@ const ToolCard: React.FC<{
               {tool.args.command}
             </pre>
           )}
-          {showDiff && (
-            <DiffViewer
-              filePath={tool.args.path}
-              originalText={tool.args.target_content}
-              replacementText={tool.args.replacement_content ?? ''}
-            />
-          )}
+          {showDiff &&
+            edits.map((edit, i) => (
+              <DiffViewer
+                key={i}
+                filePath={edits.length > 1 ? `${tool.args.path} (${i + 1}/${edits.length})` : tool.args.path}
+                originalText={edit.target_content}
+                replacementText={edit.replacement_content ?? ''}
+              />
+            ))}
           {tool.name === 'write_file' && pending && typeof tool.args.content === 'string' && (
             <DiffViewer filePath={tool.args.path} originalText="" replacementText={tool.args.content} />
           )}
-          {tool.output && tool.name === 'run_shell_command' && <pre className="tool-output">{tool.output}</pre>}
+          {isMcp && <pre className="tool-command">{JSON.stringify(tool.args, null, 2)}</pre>}
+          {tool.output && (tool.name === 'run_shell_command' || tool.name === 'read_background_output' || isMcp) && (
+            <pre className="tool-output">{tool.output}</pre>
+          )}
           {tool.error && <div className="tool-error">{tool.error}</div>}
         </div>
       )}
@@ -212,7 +322,7 @@ const ToolCard: React.FC<{
           </div>
           <div className="approval-actions">
             <button type="button" className="btn btn-secondary" onClick={onReject}>
-              {t.rejectBtn}
+              {isContinue ? t.stopHereBtn : t.rejectBtn}
             </button>
             {tool.suggestedRule && (
               <>
@@ -225,7 +335,7 @@ const ToolCard: React.FC<{
               </>
             )}
             <button type="button" className="btn btn-primary" onClick={() => onApprove?.('once')} autoFocus>
-              {tool.suggestedRule ? t.approveOnceBtn : t.approveBtn}
+              {isContinue ? t.continueBtn : tool.suggestedRule ? t.approveOnceBtn : t.approveBtn}
             </button>
           </div>
         </div>
@@ -307,6 +417,7 @@ const WorkingIndicator: React.FC<{ label: string; startedAt: number; paused: boo
 );
 
 function workingLabel(message: ChatMessage, t: Translation, lastSegmentIsText: boolean): { label: string; paused: boolean } {
+  if (message.retry) return { label: t.workingRetry(message.retry.attempt, message.retry.maxAttempts), paused: true };
   const tools = message.toolCalls ?? [];
   if (tools.some((tool) => tool.status === 'pending_approval')) return { label: t.workingApproval, paused: true };
   const running = tools.find((tool) => tool.status === 'running');
@@ -322,11 +433,29 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
   onRejectTool,
   canUndo = false,
   onUndo,
+  onRegenerate,
+  onEditUser,
 }) => {
   const [copied, copy] = useCopy();
+  const [editing, setEditing] = useState(false);
 
   if (message.role === 'user') {
     const images = message.images ?? [];
+    if (editing && onEditUser) {
+      return (
+        <div className="msg msg-user">
+          <UserEditor
+            initial={message.content}
+            t={t}
+            onCancel={() => setEditing(false)}
+            onSubmit={(text) => {
+              setEditing(false);
+              onEditUser(message.id, text);
+            }}
+          />
+        </div>
+      );
+    }
     return (
       <div className="msg msg-user">
         {images.length > 0 && (
@@ -345,6 +474,28 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
           </div>
         )}
         {message.content && <div className="user-bubble">{message.content}</div>}
+        {onEditUser && message.content && (
+          <div className="msg-user-actions">
+            <button
+              type="button"
+              className="icon-btn icon-btn-sm"
+              onClick={() => copy(message.content)}
+              aria-label={t.copyMessage}
+              title={t.copyMessage}
+            >
+              {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+            </button>
+            <button
+              type="button"
+              className="icon-btn icon-btn-sm"
+              onClick={() => setEditing(true)}
+              aria-label={t.editMessage}
+              title={t.editMessage}
+            >
+              <Pencil size={14} aria-hidden="true" />
+            </button>
+          </div>
+        )}
       </div>
     );
   }
@@ -353,7 +504,8 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
   const segments = buildMessageSegments(message.content, tools, message.thought ?? '');
   const lastSegment = segments[segments.length - 1];
   // ช่วงคิดล่าสุดที่ยังไม่มีอะไรตามหลัง = กำลังคิดอยู่ → หัวข้อของมันเป็นตัวบอกสถานะแทน WorkingIndicator
-  const thinkingNow = isStreaming && lastSegment?.kind === 'thought';
+  // (ยกเว้นตอนรอลองใหม่ ซึ่งต้องบอกผู้ใช้ว่า API ล้ม)
+  const thinkingNow = isStreaming && lastSegment?.kind === 'thought' && !message.retry;
   const working = isStreaming && !thinkingNow ? workingLabel(message, t, lastSegment?.kind === 'text') : null;
   const components = markdownComponents(t);
   const checkpoint = message.checkpoint;
@@ -380,6 +532,7 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
                   key={tool.id}
                   tool={tool}
                   t={t}
+                  live={isStreaming}
                   onApprove={onApproveTool ? (decision) => onApproveTool(tool.id, decision) : undefined}
                   onReject={onRejectTool ? () => onRejectTool(tool.id) : undefined}
                 />
@@ -398,11 +551,22 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
 
       {working && <WorkingIndicator label={working.label} paused={working.paused} startedAt={message.timestamp} />}
 
-      {!isStreaming && (message.content || checkpoint) && (
+      {!isStreaming && (message.content || checkpoint || onRegenerate) && (
         <div className="msg-footer">
           {message.content && (
             <button type="button" className="icon-btn icon-btn-sm" onClick={() => copy(message.content)} aria-label={t.copyMessage} title={t.copyMessage}>
               {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+            </button>
+          )}
+          {onRegenerate && (
+            <button
+              type="button"
+              className="icon-btn icon-btn-sm"
+              onClick={() => onRegenerate(message.id)}
+              aria-label={t.regenerate}
+              title={t.regenerate}
+            >
+              <RotateCcw size={14} aria-hidden="true" />
             </button>
           )}
           {checkpoint && checkpoint.files.length > 0 && (
@@ -410,6 +574,12 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
               <FilePen size={13} aria-hidden="true" />
               <span className="checkpoint-count">{t.filesChanged(checkpoint.files.length)}</span>
               {checkpoint.revertedAt ? ` · ${t.filesReverted}` : ''}
+            </span>
+          )}
+          {checkpoint?.shell && (
+            <span className={`checkpoint-chip ${checkpoint.revertedAt ? 'is-reverted' : ''}`} title={t.shellTrackedHint}>
+              <TerminalSquare size={13} aria-hidden="true" />
+              {t.shellTracked}
             </span>
           )}
           {checkpoint && !!checkpoint.skipped?.length && (
@@ -423,7 +593,13 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
           {message.modelUsed && <span>{message.modelUsed}</span>}
           {message.tokenUsage && (
             <span
-              title={`${t.inputTokens}: ${message.tokenUsage.promptTokens.toLocaleString()} · ${t.outputTokens}: ${message.tokenUsage.completionTokens.toLocaleString()}`}
+              title={[
+                `${t.inputTokens}: ${message.tokenUsage.promptTokens.toLocaleString()}`,
+                message.tokenUsage.cachedTokens ? `${t.cachedTokens}: ${message.tokenUsage.cachedTokens.toLocaleString()}` : '',
+                `${t.outputTokens}: ${message.tokenUsage.completionTokens.toLocaleString()}`,
+              ]
+                .filter(Boolean)
+                .join(' · ')}
             >
               {message.tokenUsage.totalTokens.toLocaleString()} {t.tokens}
             </span>

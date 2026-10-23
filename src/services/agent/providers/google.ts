@@ -1,11 +1,14 @@
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { effectiveEffort } from '../../../types/agent';
-import { TOOL_DEFINITIONS } from '../tools';
+import { trimToolResults } from '../history';
+import { withRetry } from '../retry';
+import { runToolCalls } from '../tools';
 import {
   addUsage,
   appendStepText,
   emptyUsage,
   imagesWithData,
+  stepLimitNote,
   throwIfAborted,
   type TurnContext,
   type TurnResult,
@@ -57,7 +60,7 @@ export async function runGoogleTurn(ctx: TurnContext, input: UserInput): Promise
 
   const tools = [
     {
-      functionDeclarations: TOOL_DEFINITIONS.map((t) => ({
+      functionDeclarations: ctx.tools.map((t) => ({
         name: t.name,
         description: t.description,
         parametersJsonSchema: t.parameters,
@@ -71,68 +74,90 @@ export async function runGoogleTurn(ctx: TurnContext, input: UserInput): Promise
   let fullThought = '';
   const usage = emptyUsage();
 
-  // ไม่จำกัดจำนวน step: วนจนโมเดลตอบจบเอง (ผู้ใช้หยุดได้ด้วยปุ่ม Stop → abort signal)
-  for (;;) {
+  // วนจนโมเดลตอบจบเอง — ผู้ใช้หยุดได้ด้วยปุ่ม Stop (abort signal) และถูกถามทุก STEPS_PER_CONFIRM step
+  for (let step = 0; ; step++) {
     throwIfAborted(signal);
-    let stepHasText = false;
-
-    const stream = await ai.models.generateContentStream({
-      model,
-      contents: history,
-      config: {
-        systemInstruction: ctx.systemPrompt,
-        tools,
-        thinkingConfig: thinkingConfig(model, effectiveEffort(settings)),
-        abortSignal: signal,
-      },
-    });
-
-    // เก็บ part ทุกชนิดตามที่โมเดลส่งมา (รวม thoughtSignature) — Gemini 3 ต้องได้ signature
-    // กลับมาพร้อม functionCall ในรอบถัดไป ไม่งั้นตอบ 400
-    const modelParts: any[] = [];
-    const calls: { name: string; args: Record<string, any> }[] = [];
-    let stepUsage = emptyUsage();
-
-    for await (const chunk of stream) {
-      throwIfAborted(signal);
-      const u = chunk.usageMetadata;
-      if (u) {
-        stepUsage = {
-          promptTokens: u.promptTokenCount ?? 0,
-          completionTokens: (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0),
-          totalTokens: u.totalTokenCount ?? 0,
-        };
-      }
-      for (const part of chunk.candidates?.[0]?.content?.parts ?? []) {
-        // thought summary ไม่ต้องส่งกลับ เว้นแต่มี signature ติดมา
-        if (!part.thought || part.thoughtSignature) appendPart(modelParts, part);
-        if (part.thought) {
-          const piece = part.text ?? '';
-          fullThought += piece;
-          if (piece) callbacks.onThoughtChunk?.(piece, fullThought);
-        } else if (part.text) {
-          fullText = appendStepText(fullText, part.text, stepHasText);
-          stepHasText = true;
-          callbacks.onTextChunk(part.text, fullText);
-        }
-        if (part.functionCall) {
-          calls.push({
-            name: part.functionCall.name || 'unknown',
-            args: (part.functionCall.args as Record<string, any>) || {},
-          });
-        }
-      }
+    if (ctx.shouldContinue && !(await ctx.shouldContinue(step))) {
+      const note = stepLimitNote(settings.language, step);
+      // ปิดเทิร์นด้วยข้อความ model — Gemini ไม่รับ user ติดกันในเทิร์นถัดไป
+      history.push({ role: 'model', parts: [{ text: note }] });
+      return { text: appendStepText(fullText, note, false), usage };
     }
+    // tool loop ยาว ๆ ทำให้ประวัติโตเกิน context ได้ภายในเทิร์นเดียว
+    trimToolResults(history, 'google');
+
+    // ล้มชั่วคราว (429/5xx/เน็ตหลุดกลางสตรีม) → ลองใหม่ทั้ง step และส่งข้อความ step นี้ให้ UI ใหม่ตั้งแต่ต้น
+    const textBefore = fullText;
+    const thoughtBefore = fullThought;
+    const { modelParts, calls, stepUsage } = await withRetry(
+      async (attempt) => {
+        if (attempt > 0) {
+          fullText = textBefore;
+          fullThought = thoughtBefore;
+          callbacks.onTextChunk('', fullText);
+          callbacks.onThoughtChunk?.('', fullThought);
+        }
+        const stream = await ai.models.generateContentStream({
+          model,
+          contents: history,
+          config: {
+            systemInstruction: ctx.systemPrompt,
+            tools,
+            thinkingConfig: thinkingConfig(model, effectiveEffort(settings)),
+            abortSignal: signal,
+          },
+        });
+
+        // เก็บ part ทุกชนิดตามที่โมเดลส่งมา (รวม thoughtSignature) — Gemini 3 ต้องได้ signature
+        // กลับมาพร้อม functionCall ในรอบถัดไป ไม่งั้นตอบ 400
+        const modelParts: any[] = [];
+        const calls: { name: string; args: Record<string, any> }[] = [];
+        let stepUsage = emptyUsage();
+        let stepHasText = false;
+
+        for await (const chunk of stream) {
+          throwIfAborted(signal);
+          const u = chunk.usageMetadata;
+          if (u) {
+            stepUsage = {
+              promptTokens: u.promptTokenCount ?? 0,
+              completionTokens: (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0),
+              totalTokens: u.totalTokenCount ?? 0,
+              cachedTokens: u.cachedContentTokenCount ?? 0,
+            };
+          }
+          for (const part of chunk.candidates?.[0]?.content?.parts ?? []) {
+            // thought summary ไม่ต้องส่งกลับ เว้นแต่มี signature ติดมา
+            if (!part.thought || part.thoughtSignature) appendPart(modelParts, part);
+            if (part.thought) {
+              const piece = part.text ?? '';
+              fullThought += piece;
+              if (piece) callbacks.onThoughtChunk?.(piece, fullThought);
+            } else if (part.text) {
+              fullText = appendStepText(fullText, part.text, stepHasText);
+              stepHasText = true;
+              callbacks.onTextChunk(part.text, fullText);
+            }
+            if (part.functionCall) {
+              calls.push({
+                name: part.functionCall.name || 'unknown',
+                args: (part.functionCall.args as Record<string, any>) || {},
+              });
+            }
+          }
+        }
+        return { modelParts, calls, stepUsage };
+      },
+      { signal, onRetry: callbacks.onRetry }
+    );
     addUsage(usage, stepUsage);
 
     if (modelParts.length > 0) history.push({ role: 'model', parts: modelParts });
     if (calls.length === 0) return { text: fullText, usage };
 
-    const responses: any[] = [];
-    for (const call of calls) {
-      const result = await ctx.runTool(call.name, call.args);
-      responses.push({ functionResponse: { name: call.name, response: result } });
-    }
+    const responses = await runToolCalls(calls, (c) => c.name, async (call) => ({
+      functionResponse: { name: call.name, response: await ctx.runTool(call.name, call.args) },
+    }));
     history.push({ role: 'user', parts: responses });
   }
 }
