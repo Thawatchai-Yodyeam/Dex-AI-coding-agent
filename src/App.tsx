@@ -8,6 +8,7 @@ import { TerminalDrawer } from './components/TerminalDrawer';
 import { TopBar } from './components/TopBar';
 import { Welcome } from './components/Welcome';
 import { tauriBridge } from './services/tauriBridge';
+import { loadStoredSessions, type StoredSessions } from './services/sessionStore';
 import type { AppSettings, PokemonTheme, ShellOutputEventPayload } from './types/agent';
 import { POKEMON_THEMES } from './types/agent';
 import { translations } from './utils/i18n';
@@ -34,7 +35,7 @@ function useThemePreference(theme: AppSettings['theme']) {
   }, [theme]);
 }
 
-function AppShell() {
+function AppShell({ stored }: { stored: StoredSessions }) {
   const { settings, setSettings, agentServiceRef, handleSelectWorkspace } = useAppSettings();
   const t = translations[settings.language];
   useThemePreference(settings.theme);
@@ -52,6 +53,7 @@ function AppShell() {
   const closeSettings = useCallback(() => setSettingsOpen(false), []);
 
   const sessions = useChatSessions(
+    stored,
     settings,
     agentServiceRef,
     () => chatRef.current?.isRunningRef.current ?? false,
@@ -191,6 +193,12 @@ function AppShell() {
           onClearChat={sessions.handleClearChat}
         />
 
+        {sessions.saveError && (
+          <div className="save-error" role="alert">
+            {t.chatSaveFailed(sessions.saveError)}
+          </div>
+        )}
+
         {messages.length === 0 ? (
           <div className="main-scroll is-centered">
             <Welcome t={t} composer={composer(true)} onQuickPrompt={(p) => chat.handleSendMessage(p)} />
@@ -263,11 +271,17 @@ export function App() {
   } catch {
     // ใช้ค่า default
   }
-  return (
-    <ErrorBoundary language={language}>
-      <AppShell />
-    </ErrorBoundary>
-  );
+  // แชทเก็บเป็นไฟล์ (อ่านแบบ async) — รอให้โหลดเสร็จก่อนค่อยวาด ไม่งั้นแชทใหม่ที่ว่างเปล่าจะโผล่มาแวบหนึ่ง
+  const [stored, setStored] = useState<StoredSessions | null>(null);
+  useEffect(() => {
+    loadStoredSessions()
+      .catch((e) => {
+        console.error('Failed to load chat sessions:', e);
+        return { sessions: [], activeId: null };
+      })
+      .then(setStored);
+  }, []);
+  return <ErrorBoundary language={language}>{stored && <AppShell stored={stored} />}</ErrorBoundary>;
 }
 
 export default App;

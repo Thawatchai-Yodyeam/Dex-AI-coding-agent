@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ArrowUp, Square, Brain, ChevronDown, ImagePlus, X } from 'lucide-react';
+import { ArrowUp, Square, Brain, ChevronDown, ImagePlus, X, FileText } from 'lucide-react';
 import type { AppSettings, ImageAttachment, ReasoningEffort, TokenUsage } from '../types/agent';
 import { effectiveEffort, findModel, supportsImages } from '../types/agent';
 import { ModelOptions, modelOptionValue, parseModelOptionValue } from './ModelOptions';
@@ -12,6 +12,7 @@ import {
   imageSrc,
 } from '../utils/images';
 import { TokenUsageChip } from './TokenUsageChip';
+import { useFileMentions } from '../hooks/useFileMentions';
 
 interface ComposerProps {
   value: string;
@@ -58,6 +59,7 @@ export const Composer: React.FC<ComposerProps> = ({
   const [imageError, setImageError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const visionOk = supportsImages(settings.provider);
+  const mentions = useFileMentions(value, onChange, settings.cwd, textareaRef);
 
   useEffect(() => {
     if (!imageError) return;
@@ -162,6 +164,36 @@ export const Composer: React.FC<ComposerProps> = ({
           ))}
         </ul>
       )}
+      {(mentions.open || mentions.noMatch) && (
+        <div className="mention-menu" id="mention-menu" role="listbox" aria-label={t.mentionMenu}>
+          {mentions.open ? (
+            mentions.items.map((path, i) => {
+              const slash = path.lastIndexOf('/');
+              return (
+                <div
+                  key={path}
+                  id={`mention-option-${i}`}
+                  role="option"
+                  aria-selected={i === mentions.activeIndex}
+                  className={`mention-item ${i === mentions.activeIndex ? 'is-active' : ''}`}
+                  // mousedown + preventDefault: ไม่ให้ช่องพิมพ์เสีย focus ก่อนเลือก
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    mentions.pick(path);
+                  }}
+                  onMouseEnter={() => mentions.setActiveIndex(i)}
+                >
+                  <FileText size={14} aria-hidden="true" />
+                  <span className="mention-name">{path.slice(slash + 1)}</span>
+                  {slash > 0 && <span className="mention-dir">{path.slice(0, slash)}</span>}
+                </div>
+              );
+            })
+          ) : (
+            <div className="mention-empty">{t.mentionNoMatch}</div>
+          )}
+        </div>
+      )}
       <label htmlFor="composer-input" className="sr-only">
         {t.composerLabel}
       </label>
@@ -172,7 +204,17 @@ export const Composer: React.FC<ComposerProps> = ({
         rows={1}
         value={value}
         placeholder={placeholder}
-        onChange={(e) => onChange(e.target.value)}
+        aria-autocomplete="list"
+        aria-controls={mentions.open ? 'mention-menu' : undefined}
+        aria-expanded={mentions.open}
+        aria-activedescendant={mentions.open ? `mention-option-${mentions.activeIndex}` : undefined}
+        onChange={(e) => {
+          onChange(e.target.value);
+          mentions.update(e.target.value, e.target.selectionStart);
+        }}
+        // caret ขยับ (ลูกศร/คลิก) — เปิด/ปิดรายการไฟล์ตามคำที่ caret อยู่
+        onSelect={(e) => mentions.update(e.currentTarget.value, e.currentTarget.selectionStart)}
+        onBlur={() => mentions.update('', 0)}
         onPaste={(e) => {
           const files = [...e.clipboardData.items]
             .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
@@ -184,6 +226,7 @@ export const Composer: React.FC<ComposerProps> = ({
           void addFiles(files);
         }}
         onKeyDown={(e) => {
+          if (mentions.handleKeyDown(e)) return;
           // isComposing: กำลังเลือกคำจาก IME (ไทย/จีน/ญี่ปุ่น) — Enter ยังไม่ใช่การส่ง
           if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
             e.preventDefault();

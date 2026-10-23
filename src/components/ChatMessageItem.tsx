@@ -23,6 +23,7 @@ import {
   Circle,
   Sparkles,
   Plug,
+  FoldVertical,
 } from 'lucide-react';
 import type { ApprovalDecision, ChatMessage, ToolCallRecord } from '../types/agent';
 import type { Translation } from '../utils/i18n';
@@ -418,6 +419,7 @@ const WorkingIndicator: React.FC<{ label: string; startedAt: number; paused: boo
 
 function workingLabel(message: ChatMessage, t: Translation, lastSegmentIsText: boolean): { label: string; paused: boolean } {
   if (message.retry) return { label: t.workingRetry(message.retry.attempt, message.retry.maxAttempts), paused: true };
+  if (message.compaction === 'running') return { label: t.workingCompacting, paused: false };
   const tools = message.toolCalls ?? [];
   if (tools.some((tool) => tool.status === 'pending_approval')) return { label: t.workingApproval, paused: true };
   const running = tools.find((tool) => tool.status === 'running');
@@ -474,6 +476,16 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
           </div>
         )}
         {message.content && <div className="user-bubble">{message.content}</div>}
+        {message.attachedFiles && message.attachedFiles.length > 0 && (
+          <ul className="user-files" aria-label={t.mentionAttached}>
+            {message.attachedFiles.map((path) => (
+              <li key={path} className="user-file" title={t.mentionAttached}>
+                <FileText size={13} aria-hidden="true" />
+                {path}
+              </li>
+            ))}
+          </ul>
+        )}
         {onEditUser && message.content && (
           <div className="msg-user-actions">
             <button
@@ -589,6 +601,12 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
           )}
           {canUndo && !checkpoint?.revertedAt && onUndo && (
             <UndoButton count={checkpoint?.files.length ?? 0} t={t} onConfirm={() => onUndo(message.id)} />
+          )}
+          {message.compaction === 'done' && (
+            <span className="checkpoint-chip" title={t.compactedHint}>
+              <FoldVertical size={13} aria-hidden="true" />
+              {t.compacted}
+            </span>
           )}
           {message.modelUsed && <span>{message.modelUsed}</span>}
           {message.tokenUsage && (

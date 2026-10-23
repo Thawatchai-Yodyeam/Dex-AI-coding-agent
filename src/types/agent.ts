@@ -184,8 +184,12 @@ export interface ChatMessage {
   isError?: boolean;
   /** ไฟล์ที่ agent แก้ในเทิร์นนี้ (เนื้อหาเดิมเก็บในหน่วยความจำ — undo ได้เฉพาะระหว่างที่แอปยังเปิดอยู่) */
   checkpoint?: TurnCheckpointInfo;
-  /** รูปที่แนบมากับข้อความผู้ใช้ — `data` ไม่ถูกบันทึกลงเครื่อง (ใหญ่เกิน localStorage) */
+  /** รูปที่แนบมากับข้อความผู้ใช้ — `data` ไม่ถูกบันทึกลงเครื่อง (ดู stripImageData) */
   images?: ImageAttachment[];
+  /** ไฟล์ที่ผู้ใช้ `@` ถึงและแนบเนื้อหาไปให้ agent แล้ว (พาธใน workspace) */
+  attachedFiles?: string[];
+  /** เทิร์นนี้ให้โมเดลสรุปบทสนทนาเก่าก่อนตอบ ('running' = กำลังสรุป) */
+  compaction?: 'running' | 'done';
   /** API ล้มชั่วคราวและกำลังรอลองใหม่ (มีเฉพาะระหว่างสตรีม) */
   retry?: { attempt: number; maxAttempts: number; reason: string };
 }

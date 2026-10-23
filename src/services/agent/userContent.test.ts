@@ -4,7 +4,7 @@ import { buildSystemPrompt } from './prompt';
 import { anthropicUserContent } from './providers/anthropic';
 import { googleUserParts } from './providers/google';
 import { openaiUserContent } from './providers/openai';
-import { stripImageData } from '../../hooks/useChatSessions';
+import { stripImageData } from '../sessionStore';
 import type { AppSettings, ChatSession } from '../../types/agent';
 
 const img = { id: 'i1', name: 'a.png', mediaType: 'image/png', data: 'QUJD' };
@@ -57,7 +57,7 @@ describe('stripImageData', () => {
       updatedAt: 0,
       messages: [{ id: 'm', role: 'user', content: 'x', timestamp: 0, images: [img] }],
     } as ChatSession;
-    const [out] = stripImageData([session]);
+    const out = stripImageData(session);
     expect(out.messages[0].images).toEqual([{ id: 'i1', name: 'a.png', mediaType: 'image/png' }]);
     expect(session.messages[0].images?.[0].data).toBe('QUJD');
   });

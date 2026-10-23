@@ -25,6 +25,11 @@ export interface AgentCallbacks {
   onBeforeShellCommand?: () => Promise<void>;
   /** API ล้มชั่วคราว กำลังรอลองใหม่ — ข้อความของ step นั้นจะถูกส่งมาใหม่ตั้งแต่ต้นผ่าน onTextChunk */
   onRetry?: (info: RetryInfo) => void;
+  /**
+   * ประวัติใกล้เต็มตอนเริ่มเทิร์น: 'start' = กำลังให้โมเดลสรุปเทิร์นเก่า, 'done' = แทนด้วยสรุปแล้ว,
+   * 'skipped' = สรุปไม่ได้/ไม่มีอะไรให้สรุป (ล้างผล tool และตัดเทิร์นเก่าแบบเดิมแทน)
+   */
+  onCompaction?: (phase: 'start' | 'done' | 'skipped') => void;
 }
 
 /** ที่มาของกฎสิทธิ์ระหว่างรัน tool — กฎถาวรใน settings + กฎ "ตลอดแชทนี้" ที่อยู่ในหน่วยความจำ */

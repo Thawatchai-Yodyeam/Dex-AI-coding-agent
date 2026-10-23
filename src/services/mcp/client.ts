@@ -57,19 +57,41 @@ export class McpClient {
     };
   }
 
-  request(method: string, params?: Record<string, unknown>, timeoutMs = this.timeoutMs): Promise<any> {
+  /**
+   * ส่ง request แล้วรอคำตอบ — `signal` ถูกยกเลิก (ผู้ใช้กดหยุด) = เลิกรอทันทีและบอก server ด้วย
+   * notifications/cancelled ตามสเปก ให้ server หยุดงานที่ค้างอยู่ได้
+   */
+  request(method: string, params?: Record<string, unknown>, timeoutMs = this.timeoutMs, signal?: AbortSignal): Promise<any> {
+    if (signal?.aborted) return Promise.reject(new McpError(`${method} cancelled`));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new McpError(`${method} timed out after ${Math.round(timeoutMs / 1000)}s`));
-      }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
-      this.transport.send({ jsonrpc: '2.0', id, method, ...(params ? { params } : {}) }).catch((err) => {
+      const stopListening = () => signal?.removeEventListener('abort', onAbort);
+      const fail = (err: Error) => {
         clearTimeout(timer);
         this.pending.delete(id);
-        reject(err instanceof Error ? err : new McpError(String(err)));
+        stopListening();
+        reject(err);
+      };
+      const onAbort = () => {
+        void this.notify('notifications/cancelled', { requestId: id, reason: 'Cancelled by the user' }).catch(() => {});
+        fail(new McpError(`${method} cancelled`));
+      };
+      const timer = setTimeout(() => fail(new McpError(`${method} timed out after ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
+      this.pending.set(id, {
+        resolve: (value) => {
+          stopListening();
+          resolve(value);
+        },
+        reject: (err) => {
+          stopListening();
+          reject(err);
+        },
+        timer,
       });
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.transport
+        .send({ jsonrpc: '2.0', id, method, ...(params ? { params } : {}) })
+        .catch((err) => fail(err instanceof Error ? err : new McpError(String(err))));
     });
   }
 
@@ -138,8 +160,8 @@ export class McpClient {
     return tools;
   }
 
-  callTool(name: string, args: Record<string, unknown>, timeoutMs?: number): Promise<any> {
-    return this.request('tools/call', { name, arguments: args }, timeoutMs);
+  callTool(name: string, args: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<any> {
+    return this.request('tools/call', { name, arguments: args }, timeoutMs, signal);
   }
 
   async close(): Promise<void> {

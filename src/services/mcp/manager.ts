@@ -181,11 +181,11 @@ export class McpManager implements McpProvider {
     return this.resolve(name)?.tool.annotations?.readOnlyHint === true;
   }
 
-  async callTool(name: string, args: Record<string, unknown>): Promise<{ text: string; isError: boolean }> {
+  async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<{ text: string; isError: boolean }> {
     const hit = this.resolve(name);
     if (!hit?.entry.client || hit.entry.status.state !== 'ready') throw new Error(`MCP tool ${name} is not available`);
     // tool อย่าง build/deploy อาจนาน — ให้เวลามากกว่า request ทั่วไป
-    const result = await hit.entry.client.callTool(hit.tool.name, args, hit.entry.config.timeoutMs ?? 300_000);
+    const result = await hit.entry.client.callTool(hit.tool.name, args, hit.entry.config.timeoutMs ?? 300_000, signal);
     return { text: formatToolResult(result), isError: result?.isError === true };
   }
 }

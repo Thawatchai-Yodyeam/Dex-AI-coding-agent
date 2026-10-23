@@ -1731,32 +1731,63 @@ fn save_api_key(provider: String, key: String) -> Result<(), String> {
         .map_err(|e| format!("บันทึก API key ของ {} ไม่สำเร็จ: {}", provider, e))
 }
 
-// 7.2 ประวัติแบบ native ของแต่ละแชท (รวม tool call/result, thinking) เก็บเป็นไฟล์ใน app data
-// ใหญ่เกิน localStorage และต้องอยู่รอดหลังปิดแอป ให้ agent จำได้ว่าเคยอ่าน/แก้อะไรไป
-fn session_history_path(app: &AppHandle, session_id: &str) -> Result<PathBuf, String> {
-    if !valid_provider_id(session_id) {
-        return Err(format!("session id ไม่ถูกต้อง: {}", session_id));
-    }
-    let dir = app
+// 7.2 ข้อมูลของแต่ละแชทเก็บเป็นไฟล์ใน app data (localStorage จุได้แค่ ~5 MB และเขียนพลาดแบบเงียบ ๆ)
+// - history/<id>.json  ประวัติแบบ native ของ agent (รวม tool call/result, thinking) ให้ agent จำได้ว่าเคยอ่าน/แก้อะไรไป
+// - chats/<id>.json    ข้อความที่หน้าจอแชทแสดง (ChatSession)
+const HISTORY_DIR: &str = "history";
+const CHATS_DIR: &str = "chats";
+
+fn app_data_subdir(app: &AppHandle, folder: &str) -> Result<PathBuf, String> {
+    Ok(app
         .path()
         .app_data_dir()
         .map_err(|e| format!("หาโฟลเดอร์ข้อมูลแอปไม่เจอ: {}", e))?
-        .join("history");
-    Ok(dir.join(format!("{}.json", session_id)))
+        .join(folder))
+}
+
+fn session_file_path(app: &AppHandle, folder: &str, session_id: &str) -> Result<PathBuf, String> {
+    if !valid_provider_id(session_id) {
+        return Err(format!("session id ไม่ถูกต้อง: {}", session_id));
+    }
+    Ok(app_data_subdir(app, folder)?.join(format!("{}.json", session_id)))
+}
+
+fn save_session_file(app: &AppHandle, folder: &str, session_id: &str, data: &str) -> Result<(), String> {
+    let path = session_file_path(app, folder, session_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("สร้างโฟลเดอร์ไม่สำเร็จ: {}", e))?;
+    }
+    write_atomic(&path, data.as_bytes()).map_err(|e| format!("บันทึกไม่สำเร็จ: {}", e))
+}
+
+fn delete_session_file(app: &AppHandle, folder: &str, session_id: &str) -> Result<(), String> {
+    let path = session_file_path(app, folder, session_id)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("ลบไม่สำเร็จ: {}", e)),
+    }
+}
+
+/// เนื้อหาของไฟล์ .json ทุกไฟล์ในโฟลเดอร์ (ไม่มีโฟลเดอร์ = ว่าง) — ไฟล์ที่อ่านไม่ได้ถูกข้าม ไม่ให้ไฟล์เสียไฟล์เดียวทำแชททั้งหมดหาย
+fn read_json_files(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|p| fs::read_to_string(&p).ok())
+        .collect()
 }
 
 #[tauri::command]
 fn save_session_history(app: AppHandle, session_id: String, data: String) -> Result<(), String> {
-    let path = session_history_path(&app, &session_id)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("สร้างโฟลเดอร์ไม่สำเร็จ: {}", e))?;
-    }
-    write_atomic(&path, data.as_bytes()).map_err(|e| format!("บันทึกประวัติไม่สำเร็จ: {}", e))
+    save_session_file(&app, HISTORY_DIR, &session_id, &data)
 }
 
 #[tauri::command]
 fn load_session_history(app: AppHandle, session_id: String) -> Result<Option<String>, String> {
-    let path = session_history_path(&app, &session_id)?;
+    let path = session_file_path(&app, HISTORY_DIR, &session_id)?;
     match fs::read_to_string(&path) {
         Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1766,12 +1797,23 @@ fn load_session_history(app: AppHandle, session_id: String) -> Result<Option<Str
 
 #[tauri::command]
 fn delete_session_history(app: AppHandle, session_id: String) -> Result<(), String> {
-    let path = session_history_path(&app, &session_id)?;
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("ลบประวัติไม่สำเร็จ: {}", e)),
-    }
+    delete_session_file(&app, HISTORY_DIR, &session_id)
+}
+
+// async = ไม่รันบน main thread — แชทยาว ๆ เป็นไฟล์หลาย MB และถูกบันทึกถี่ระหว่างสตรีม
+#[tauri::command]
+async fn save_chat_session(app: AppHandle, session_id: String, data: String) -> Result<(), String> {
+    save_session_file(&app, CHATS_DIR, &session_id, &data)
+}
+
+#[tauri::command]
+async fn load_chat_sessions(app: AppHandle) -> Result<Vec<String>, String> {
+    Ok(read_json_files(&app_data_subdir(&app, CHATS_DIR)?))
+}
+
+#[tauri::command]
+async fn delete_chat_session(app: AppHandle, session_id: String) -> Result<(), String> {
+    delete_session_file(&app, CHATS_DIR, &session_id)
 }
 
 // 8. เปิดหน้าต่างเลือกโฟลเดอร์แบบ Native บน Windows
@@ -1829,6 +1871,9 @@ pub fn run() {
             save_session_history,
             load_session_history,
             delete_session_history,
+            save_chat_session,
+            load_chat_sessions,
+            delete_chat_session,
             select_folder,
             edit_file,
             snapshot_file,
@@ -2169,5 +2214,18 @@ mod tests {
         assert!(snapshot_file(ws.join(".env").to_string_lossy().to_string(), ws_str, None).is_err());
 
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn json_files_are_read_and_temp_files_skipped() {
+        let dir = std::env::temp_dir().join(format!("dex_chats_{}", std::process::id()));
+        assert!(read_json_files(&dir).is_empty(), "missing folder = no chats");
+        fs::create_dir_all(&dir).unwrap();
+        write_atomic(&dir.join("session-1.json"), b"{\"id\":\"session-1\"}").unwrap();
+        fs::write(dir.join(".session-2.json.dex-tmp"), "half written").unwrap();
+        fs::write(dir.join("notes.txt"), "not a chat").unwrap();
+
+        assert_eq!(read_json_files(&dir), vec!["{\"id\":\"session-1\"}".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

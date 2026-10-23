@@ -1,7 +1,8 @@
-import type { AIProvider, AppSettings, PermissionRule, ToolCallRecord } from '../../types/agent';
+import type { AIProvider, AppSettings, PermissionRule, TokenUsage, ToolCallRecord } from '../../types/agent';
 import { PROVIDERS_CATALOG, requiresApiKey, supportsImages } from '../../types/agent';
 import { tauriBridge } from '../tauriBridge';
-import { fromNeutral, isUserTextTurn, pruneHistory, pruneHistoryToBudget, toNeutral } from './history';
+import { COMPACT_AT_CHARS, compactHistory, type CompactionResult } from './compaction';
+import { estimateHistoryChars, fromNeutral, isUserTextTurn, pruneHistory, pruneHistoryToBudget, toNeutral } from './history';
 import { newRuleId } from './permissions';
 import {
   MAX_PROJECT_INSTRUCTION_CHARS,
@@ -24,6 +25,7 @@ import {
 import type { SkillInfo } from '../tauriBridge';
 import {
   AgentAbortError,
+  addUsage,
   imagesWithData,
   throwIfAborted,
   type AgentCallbacks,
@@ -216,6 +218,43 @@ export class MultiProviderAgentService {
     this.mcp = provider;
   }
 
+  /**
+   * ประวัติใกล้เต็ม → ให้โมเดลสรุปเทิร์นเก่าแทนการทิ้ง (แทนที่ this.history เมื่อสำเร็จ)
+   * สรุปไม่ได้ก็ทำเทิร์นต่อได้ เพราะ pruneHistoryToBudget จะล้าง/ตัดแบบเดิมให้ — ยกเว้นผู้ใช้กดหยุด
+   */
+  private async compactIfNeeded(
+    format: HistoryFormat,
+    apiKey: string,
+    callbacks: AgentCallbacks,
+    turnVersion: number,
+    signal?: AbortSignal
+  ): Promise<TokenUsage | null> {
+    if (estimateHistoryChars(this.history) <= COMPACT_AT_CHARS) return null;
+    const before = this.history;
+    callbacks.onCompaction?.('start');
+    let res: CompactionResult | null = null;
+    try {
+      res = await compactHistory(before, format, DRIVERS[format], {
+        settings: this.settings,
+        apiKey,
+        signal,
+        onRetry: callbacks.onRetry,
+      });
+    } catch (err) {
+      if (signal?.aborted) throw new AgentAbortError();
+      console.warn('Context compaction failed, trimming instead:', err);
+    }
+    // ผู้ใช้สลับ/ล้างแชทระหว่างรอสรุป — ประวัตินี้ไม่ใช่ของเทิร์นนี้แล้ว
+    if (this.version !== turnVersion || this.history !== before) throw new AgentAbortError();
+    if (!res) {
+      callbacks.onCompaction?.('skipped');
+      return null;
+    }
+    this.history = res.history;
+    callbacks.onCompaction?.('done');
+    return res.usage;
+  }
+
   /** อ่าน DEX.md / AGENTS.md / CLAUDE.md จากราก workspace (ไม่มี = null) — อ่านใหม่ทุกเทิร์นเพื่อให้แก้แล้วมีผลทันที */
   async loadProjectInstructions(): Promise<ProjectInstructions | null> {
     const cwd = this.settings.cwd;
@@ -272,14 +311,15 @@ export class MultiProviderAgentService {
       ...(skills.length > 0 ? [USE_SKILL_TOOL] : []),
       ...(mcp?.toolDefinitions() ?? []),
     ];
-    const toolContext: ToolContext = { skills, ...(mcp ? { mcp } : {}) };
+    const toolContext: ToolContext = { skills, signal, ...(mcp ? { mcp } : {}) };
 
     const format = formatFor(provider);
     const turnVersion = ++this.version;
     this.turnVersion = turnVersion;
-    this.history = pruneHistoryToBudget(pruneHistory(this.historyFor(format), format, MAX_HISTORY_MESSAGES), format);
-    const turnHistory = this.history;
-    const snapshotLength = turnHistory.length;
+    this.history = pruneHistory(this.historyFor(format), format, MAX_HISTORY_MESSAGES);
+    // ถูกแทนหลังสรุปบทสนทนา (ถ้ามี) — catch ใช้ย้อนประวัติของเทิร์นนี้
+    let turnHistory = this.history;
+    let snapshotLength = turnHistory.length;
     const startTime = Date.now();
 
     let partialText = '';
@@ -315,7 +355,13 @@ export class MultiProviderAgentService {
     };
 
     try {
+      const compactionUsage = await this.compactIfNeeded(format, apiKey, trackedCallbacks, turnVersion, signal);
+      this.history = pruneHistoryToBudget(this.history, format);
+      turnHistory = ctx.history = this.history;
+      snapshotLength = turnHistory.length;
+
       const result = await DRIVERS[format](ctx, input);
+      if (compactionUsage) addUsage(result.usage, compactionUsage);
       return { text: result.text, tokenUsage: result.usage, durationMs: Date.now() - startTime };
     } catch (err) {
       // ย้อนประวัติให้สะอาด แล้วจำสิ่งที่ผู้ใช้ถามและที่ตอบไปแล้วแบบ text-only

@@ -162,7 +162,7 @@ export function trimToolResults(history: any[], format: HistoryFormat, budget = 
 }
 
 /** ตัดหัวประวัติที่ตำแหน่ง cut (ต้องเป็นขอบเทิร์น) — Claude ต้องถอด thinking ของข้อความที่เหลือด้วย */
-function cutAt(history: any[], format: HistoryFormat, cut: number): any[] {
+export function cutAt(history: any[], format: HistoryFormat, cut: number): any[] {
   const kept = history.slice(cut);
   if (format === 'anthropic') {
     // ประวัติถูกแก้ (ตัดหัว) → thinking block เดิมใช้ต่อไม่ได้ (preserved thinking ตรวจลำดับ)

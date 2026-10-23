@@ -12,6 +12,7 @@ import type {
 } from '../types/agent';
 import { PROVIDERS_CATALOG, effectiveEffort, requiresApiKey } from '../types/agent';
 import { SKILL_ROOTS_HINT, matchSkillCommand, readSkill, skillInvocationBlock } from '../services/agent/skills';
+import { attachMentionedFiles } from '../services/agent/mentions';
 import type { SkillInfo } from '../services/tauriBridge';
 import { translations } from '../utils/i18n';
 import { notificationBody, notifyIfAway } from '../utils/notify';
@@ -301,10 +302,11 @@ export function useAgentChat({
     }
 
     const now = Date.now();
+    const userMsgId = `user-${now}`;
     const assistantMsgId = `asst-${now}`;
     setMessages((prev) => [
       ...prev,
-      { id: `user-${now}`, role: 'user', content: prompt, timestamp: now, ...(images.length ? { images } : {}) },
+      { id: userMsgId, role: 'user', content: prompt, timestamp: now, ...(images.length ? { images } : {}) },
       { id: assistantMsgId, role: 'assistant', content: '', thought: '', toolCalls: [], timestamp: now },
     ]);
 
@@ -342,8 +344,14 @@ export function useAgentChat({
       updateAssistant((msg) => ({ ...msg, checkpoint: { ...(msg.checkpoint ?? { files: [] }), shell: true } }));
     };
 
+    // `@ไฟล์` → แนบเนื้อหาไฟล์ไปกับข้อความ และบอกผู้ใช้ว่าแนบไฟล์ไหนได้บ้าง (พิมพ์พาธผิดจะไม่ขึ้น)
+    const mentioned = await attachMentionedFiles(prompt, settings.cwd, settings.permissionRules ?? []).catch(() => null);
+    if (mentioned?.files.length) {
+      setMessages((prev) => prev.map((m) => (m.id === userMsgId ? { ...m, attachedFiles: mentioned.files } : m)));
+    }
+
     const notes = pendingAgentNotesRef.current.splice(0);
-    const agentPrompt = [...notes, skillBlock, prompt].filter(Boolean).join('\n\n');
+    const agentPrompt = [...notes, skillBlock, mentioned?.block, prompt].filter(Boolean).join('\n\n');
 
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
@@ -417,6 +425,12 @@ export function useAgentChat({
             thoughtTouched = true;
             pendingRetry = undefined;
             scheduleFlush();
+          },
+          onCompaction: (phase) => {
+            updateAssistant((msg) => ({
+              ...msg,
+              compaction: phase === 'start' ? 'running' : phase === 'done' ? 'done' : undefined,
+            }));
           },
           onRetry: (info) => {
             pendingRetry = { attempt: info.attempt, maxAttempts: info.maxAttempts, reason: info.reason };

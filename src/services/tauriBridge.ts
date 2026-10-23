@@ -98,6 +98,20 @@ export const tauriBridge = {
     await invoke('delete_session_history', { sessionId });
   },
 
+  /** ข้อความที่หน้าจอแชทแสดง (ChatSession เป็น JSON) หนึ่งไฟล์ต่อแชท */
+  async saveChatSession(sessionId: string, data: string): Promise<void> {
+    await invoke('save_chat_session', { sessionId, data });
+  },
+
+  /** JSON ของทุกแชทที่บันทึกไว้ (ไม่เรียงลำดับ) */
+  async loadChatSessions(): Promise<string[]> {
+    return await invoke('load_chat_sessions');
+  },
+
+  async deleteChatSession(sessionId: string): Promise<void> {
+    await invoke('delete_chat_session', { sessionId });
+  },
+
   async checkSecurity(
     command: string,
     workspace?: string

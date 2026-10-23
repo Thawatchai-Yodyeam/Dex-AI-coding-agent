@@ -102,7 +102,7 @@ export async function runGoogleTurn(ctx: TurnContext, input: UserInput): Promise
           contents: history,
           config: {
             systemInstruction: ctx.systemPrompt,
-            tools,
+            ...(ctx.tools.length > 0 ? { tools } : {}),
             thinkingConfig: thinkingConfig(model, effectiveEffort(settings)),
             abortSignal: signal,
           },

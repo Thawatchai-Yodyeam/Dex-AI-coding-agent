@@ -26,7 +26,7 @@ const th = {
   emptyFolder: 'ไม่มีไฟล์ในโฟลเดอร์นี้',
   noWorkspace: 'ยังไม่ได้เลือก Workspace',
   mentionFile: 'ถามเกี่ยวกับไฟล์นี้',
-  mentionFilePrompt: (path: string) => `ช่วยอ่านและอธิบายไฟล์ \`${path}\``,
+  mentionFilePrompt: (path: string) => `ช่วยอ่านและอธิบายไฟล์ @${path} `,
 
   // Top bar
   workspaceTitle: 'เปลี่ยนโฟลเดอร์ Workspace',
@@ -54,7 +54,7 @@ const th = {
   qpTestPrompt: 'หาวิธีรันเทสต์หรือ build ของโปรเจกต์นี้ แล้วรันและสรุปผล',
 
   // Composer
-  inputPlaceholder: 'ตอบกลับ Dex…  (/help ดูคำสั่ง)',
+  inputPlaceholder: 'ตอบกลับ Dex…  (/help ดูคำสั่ง · @ อ้างถึงไฟล์)',
   composerLabel: 'ข้อความถึง Dex',
   send: 'ส่ง (Enter)',
   stopBtn: 'หยุด',
@@ -74,6 +74,9 @@ const th = {
   thinking: 'กำลังคิด…',
   workingWriting: 'กำลังเขียนคำตอบ…',
   workingApproval: 'รอให้คุณอนุมัติ',
+  workingCompacting: 'กำลังสรุปบทสนทนาเก่าเพื่อประหยัด context…',
+  compacted: 'สรุปบทสนทนาเก่าแล้ว',
+  compactedHint: 'ประวัติแชทใกล้เต็ม Dex จึงให้โมเดลสรุปเทิร์นเก่าแทนการทิ้ง — เทิร์นล่าสุดยังเก็บไว้ครบ',
   workingRetry: (n: number, max: number) => `API ไม่ว่างชั่วคราว — กำลังลองใหม่ (${n}/${max})…`,
   thoughtProcess: 'กระบวนการคิด',
   copyCode: 'คัดลอก',
@@ -94,6 +97,10 @@ const th = {
   imageTooLarge: 'รูปใหญ่เกินไป',
   imageDecodeFailed: 'เปิดรูปนี้ไม่ได้',
   imageNotSaved: 'รูป (ไม่ได้บันทึกไว้)',
+  // @ไฟล์
+  mentionAttached: 'แนบเนื้อหาไฟล์นี้ไปให้ agent แล้ว',
+  mentionMenu: 'ไฟล์ใน Workspace',
+  mentionNoMatch: 'ไม่พบไฟล์ที่ตรงกัน',
   // Checkpoint / undo
   undoTurn: 'ย้อนการแก้ไฟล์',
   undoTurnConfirm: 'กดอีกครั้งเพื่อยืนยัน',
@@ -242,6 +249,7 @@ const th = {
   // Errors
   crashTitle: 'เกิดข้อผิดพลาดในหน้าจอ',
   crashReload: 'โหลดใหม่',
+  chatSaveFailed: (err: string) => `บันทึกแชทลงเครื่องไม่สำเร็จ — ถ้าปิดแอปตอนนี้ข้อความล่าสุดอาจหาย (${err})`,
 };
 
 export type Translation = typeof th;
@@ -268,7 +276,7 @@ const en: Translation = {
   emptyFolder: 'This folder is empty',
   noWorkspace: 'No workspace selected',
   mentionFile: 'Ask about this file',
-  mentionFilePrompt: (path: string) => `Read and explain \`${path}\``,
+  mentionFilePrompt: (path: string) => `Read and explain @${path} `,
 
   workspaceTitle: 'Change workspace folder',
   chooseWorkspace: 'Choose workspace',
@@ -293,7 +301,7 @@ const en: Translation = {
   qpTestTitle: 'Run tests',
   qpTestPrompt: 'Find how to run the tests or build for this project, run them, and summarize',
 
-  inputPlaceholder: 'Reply to Dex…  (/help for commands)',
+  inputPlaceholder: 'Reply to Dex…  (/help for commands, @ to mention a file)',
   composerLabel: 'Message to Dex',
   send: 'Send (Enter)',
   stopBtn: 'Stop',
@@ -312,6 +320,9 @@ const en: Translation = {
   thinking: 'Thinking…',
   workingWriting: 'Writing…',
   workingApproval: 'Waiting for your approval',
+  workingCompacting: 'Summarizing earlier conversation to save context…',
+  compacted: 'Earlier conversation summarized',
+  compactedHint: 'The chat history was nearly full, so Dex had the model summarize older turns instead of dropping them — recent turns are kept in full.',
   workingRetry: (n: number, max: number) => `API temporarily unavailable — retrying (${n}/${max})…`,
   thoughtProcess: 'Thought process',
   copyCode: 'Copy',
@@ -331,6 +342,10 @@ const en: Translation = {
   imageTooLarge: 'Image is too large',
   imageDecodeFailed: "Couldn't open this image",
   imageNotSaved: 'Image (not saved)',
+  // @file
+  mentionAttached: 'File contents were sent to the agent',
+  mentionMenu: 'Workspace files',
+  mentionNoMatch: 'No matching files',
   undoTurn: 'Undo file changes',
   undoTurnConfirm: 'Click again to confirm',
   undoTurnHint: (n: number) =>
@@ -474,6 +489,7 @@ const en: Translation = {
 
   crashTitle: 'Something went wrong in the UI',
   crashReload: 'Reload',
+  chatSaveFailed: (err: string) => `Could not save this chat to disk — recent messages may be lost if you close the app (${err})`,
 };
 
 export const translations: Record<AppLanguage, Translation> = { th, en };

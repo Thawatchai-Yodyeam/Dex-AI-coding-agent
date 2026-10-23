@@ -99,6 +99,22 @@ describe('McpClient', () => {
     vi.useRealTimers();
   });
 
+  it('stops waiting and tells the server when the request is cancelled', async () => {
+    const sent: any[] = [];
+    const transport: McpTransport = { send: async (m) => void sent.push(m), close: async () => {} };
+    const client = new McpClient(transport);
+    const controller = new AbortController();
+    const call = client.callTool('build', {}, 300_000, controller.signal);
+    controller.abort();
+    await expect(call).rejects.toThrow(/cancelled/);
+    expect(sent.at(-1)).toMatchObject({ method: 'notifications/cancelled', params: { requestId: sent[0].id } });
+
+    // คำตอบที่มาช้าหลังยกเลิกถูกทิ้ง และ signal ที่ยกเลิกไปแล้วไม่ส่ง request เลย
+    transport.onMessage?.({ jsonrpc: '2.0', id: sent[0].id, result: {} });
+    await expect(client.callTool('build', {}, 1000, controller.signal)).rejects.toThrow(/cancelled/);
+    expect(sent).toHaveLength(2);
+  });
+
   it('parses SSE bodies from Streamable HTTP', () => {
     expect(parseSseMessages('event: message\ndata: {"id":1}\n\ndata: {"id":\ndata: 2}\n\n')).toEqual([{ id: 1 }, { id: 2 }]);
   });
@@ -207,5 +223,11 @@ describe('MCP tool permissions', () => {
       error: expect.stringContaining('mcp__gh__delete*'),
     });
     expect(asked).toEqual([]);
+  });
+
+  it("passes the turn's abort signal to the server call", async () => {
+    const signal = new AbortController().signal;
+    await executeTool('mcp__gh__search', { q: 'x' }, settings(true), callbacks('once', []), undefined, { mcp, signal });
+    expect(mcp.callTool).toHaveBeenLastCalledWith('mcp__gh__search', { q: 'x' }, signal);
   });
 });

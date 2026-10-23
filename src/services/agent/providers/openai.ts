@@ -107,7 +107,8 @@ export async function runOpenAITurn(ctx: TurnContext, input: UserInput): Promise
       model,
       // system prompt ไม่เก็บใน history — แนบใหม่ทุกครั้ง จึงไม่ซ้ำและเปลี่ยนตาม workspace ได้
       messages: [{ role: 'system', content: ctx.systemPrompt }, ...history],
-      tools,
+      // ไม่มี tool (ตอนสรุปบทสนทนา) ต้องไม่ส่ง field นี้เลย — OpenAI ไม่รับ array ว่าง
+      ...(tools.length > 0 ? { tools } : {}),
       stream: true,
       stream_options: { include_usage: true },
     };

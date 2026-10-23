@@ -141,7 +141,7 @@ export async function runAnthropicTurn(ctx: TurnContext, input: UserInput): Prom
       // breakpoint ที่ system ครอบ tools ด้วย (ลำดับ prefix ของ cache คือ tools → system → messages)
       system: [{ type: 'text', text: ctx.systemPrompt, cache_control: EPHEMERAL }],
       messages: withCacheBreakpoints(history),
-      tools,
+      ...(tools.length > 0 ? { tools } : {}),
       stream: true,
       ...buildThinkingParams(model, effectiveEffort(settings)),
     };

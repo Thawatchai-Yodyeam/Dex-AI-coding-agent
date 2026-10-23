@@ -5,6 +5,7 @@ const bridge = vi.hoisted(() => ({ readFile: vi.fn(), listDir: vi.fn(async () =>
 vi.mock('../tauriBridge', () => ({ tauriBridge: bridge }));
 
 import { MultiProviderAgentService, STEPS_PER_CONFIRM } from './AgentService';
+import { AgentAbortError } from './types';
 import type { AgentCallbacks } from './types';
 
 const settings = (patch: Partial<AppSettings> = {}) =>
@@ -123,6 +124,94 @@ describe('step limit', () => {
     const history = JSON.parse(agent.exportHistory()!).history;
     expect(history[history.length - 1]).toMatchObject({ role: 'assistant' });
     expect(history[history.length - 2]).toMatchObject({ role: 'tool' });
+    fetchSpy.mockRestore();
+  });
+});
+
+describe('context compaction', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    bridge.readFile.mockRejectedValue(new Error('not found'));
+  });
+
+  const textResponse = (text: string, tokens: number) =>
+    new Response(
+      `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n` +
+        `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: tokens, completion_tokens: 1, total_tokens: tokens + 1 } })}\n\n` +
+        'data: [DONE]\n\n',
+      { status: 200 }
+    );
+  // ~350k ตัวอักษร: เกินเกณฑ์สรุป (320k) แต่ยังไม่ถึงงบที่เริ่มล้างผล tool
+  const bigHistory = [
+    { role: 'user', content: 'first' },
+    { role: 'assistant', content: 'a'.repeat(200_000) },
+    { role: 'user', content: 'second' },
+    { role: 'assistant', content: 'b'.repeat(100_000) },
+    { role: 'user', content: 'third' },
+    { role: 'assistant', content: 'c'.repeat(50_000) },
+  ];
+  const openaiSettings = () => settings({ provider: 'openai', model: 'gpt-6.1-sol', apiKeys: { openai: 'k' } as any });
+  const callbacks = (phases: string[]): AgentCallbacks => ({
+    onTextChunk: () => {},
+    onToolStart: () => {},
+    onToolUpdate: () => {},
+    onRequestApproval: async () => 'once',
+    onCompaction: (phase) => phases.push(phase),
+  });
+
+  it('summarizes old turns before answering when the history is nearly full', async () => {
+    const bodies: any[] = [];
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      bodies.push(JSON.parse(String(init!.body)));
+      return bodies.length === 1 ? textResponse('- goal: ship it', 100) : textResponse('done', 20);
+    });
+    const agent = new MultiProviderAgentService(openaiSettings());
+    agent.restoreHistory(JSON.stringify({ v: 1, format: 'openai', history: bigHistory }), agent.historyVersion);
+    const phases: string[] = [];
+    const res = await agent.sendMessage({ text: 'go on' }, callbacks(phases));
+
+    expect(phases).toEqual(['start', 'done']);
+    expect(bodies[0].tools).toBeUndefined();
+    expect(bodies[0].reasoning_effort).toBe('none');
+    const sent = bodies[1].messages.map((m: any) => m.content);
+    expect(sent[1]).toContain('- goal: ship it');
+    expect(sent.slice(3)).toEqual(['second', 'b'.repeat(100_000), 'third', 'c'.repeat(50_000), 'go on']);
+    // token ของการสรุปนับรวมในเทิร์นนี้
+    expect(res.tokenUsage.promptTokens).toBe(120);
+    expect(JSON.parse(agent.exportHistory()!).history[0].content).toContain('<conversation_summary>');
+    fetchSpy.mockRestore();
+  });
+
+  it('carries on with plain trimming when the summary request fails', async () => {
+    let calls = 0;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      ++calls === 1 ? new Response('{"error":{"message":"bad"}}', { status: 400 }) : textResponse('done', 20)
+    );
+    const agent = new MultiProviderAgentService(openaiSettings());
+    agent.restoreHistory(JSON.stringify({ v: 1, format: 'openai', history: bigHistory }), agent.historyVersion);
+    const phases: string[] = [];
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const res = await agent.sendMessage({ text: 'go on' }, callbacks(phases));
+
+    expect(phases).toEqual(['start', 'skipped']);
+    expect(res.text).toBe('done');
+    expect(JSON.parse(agent.exportHistory()!).history[0]).toEqual({ role: 'user', content: 'first' });
+    fetchSpy.mockRestore();
+    warn.mockRestore();
+  });
+
+  it('stops without answering when the user aborts during the summary', async () => {
+    const controller = new AbortController();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      controller.abort();
+      throw new DOMException('aborted', 'AbortError');
+    });
+    const agent = new MultiProviderAgentService(openaiSettings());
+    agent.restoreHistory(JSON.stringify({ v: 1, format: 'openai', history: bigHistory }), agent.historyVersion);
+    await expect(agent.sendMessage({ text: 'go on' }, callbacks([]), controller.signal)).rejects.toBeInstanceOf(AgentAbortError);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    // ข้อความผู้ใช้ยังถูกจำไว้แบบ text-only เหมือนกดหยุดตอนอื่น
+    expect(JSON.parse(agent.exportHistory()!).history.at(-2)).toEqual({ role: 'user', content: 'go on' });
     fetchSpy.mockRestore();
   });
 });

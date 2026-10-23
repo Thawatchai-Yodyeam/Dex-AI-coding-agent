@@ -245,10 +245,11 @@ const num = (v: unknown, fallback: number): number => {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 };
 
-/** ของที่เปลี่ยนไปตามเทิร์น: skill ที่ค้นเจอ และตัวเรียก tool ของ MCP server */
+/** ของที่เปลี่ยนไปตามเทิร์น: skill ที่ค้นเจอ ตัวเรียก tool ของ MCP server และสัญญาณหยุดของเทิร์น */
 export interface ToolContext {
   skills?: readonly SkillInfo[];
   mcp?: McpToolRunner;
+  signal?: AbortSignal;
 }
 
 /** ส่วนที่ tools.ts ต้องใช้จาก MCP manager (แยก interface ไว้ให้เทสต์ mock ได้ง่าย) */
@@ -740,7 +741,8 @@ const mcpHandler: ToolHandler = async (args, env) => {
     if (rejected) return rejected;
   }
   markRunning(env);
-  const res = await mcp.callTool(name, args);
+  // ผู้ใช้กดหยุด → เลิกรอ server ทันที (tool อย่าง build/deploy อาจค้างได้หลายนาที)
+  const res = await mcp.callTool(name, args, env.context.signal);
   env.record.output = res.text;
   env.record.status = res.isError ? 'failed' : 'completed';
   return res.isError ? { error: res.text || 'MCP tool returned an error' } : { content: res.text };
