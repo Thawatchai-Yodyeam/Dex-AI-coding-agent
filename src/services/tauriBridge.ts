@@ -20,6 +20,20 @@ export interface SkillInfo {
   source: 'workspace' | 'user';
 }
 
+export interface WebPage {
+  /** URL สุดท้ายหลังตาม redirect ภายในโดเมนเดียวกัน */
+  url: string;
+  status: number;
+  content_type: string;
+  title: string | null;
+  /** HTML ถูกแปลงเป็นข้อความแล้ว */
+  content: string;
+  /** หน้าใหญ่เกิน 3 MB — ได้แค่ส่วนต้น */
+  truncated: boolean;
+  /** redirect ไปโดเมนอื่น (ไม่ได้ตามให้) */
+  redirect: string | null;
+}
+
 export interface FileEdit {
   target_content: string;
   replacement_content: string;
@@ -225,6 +239,11 @@ export const tauriBridge = {
 
   async findFiles(pattern: string, workspace?: string): Promise<string[]> {
     return await invoke('find_files', { pattern, workspace });
+  },
+
+  /** GET หน้าเว็บผ่าน Rust (ไม่ติด CORS) — HTML ถูกแปลงเป็นข้อความ */
+  async webFetch(url: string): Promise<WebPage> {
+    return await invoke('web_fetch', { url });
   },
 
   async selectFolder(): Promise<string | null> {

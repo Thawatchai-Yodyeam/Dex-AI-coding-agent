@@ -24,6 +24,7 @@ import {
   Sparkles,
   Plug,
   FoldVertical,
+  Globe,
 } from 'lucide-react';
 import type { ApprovalDecision, ChatMessage, ToolCallRecord } from '../types/agent';
 import type { Translation } from '../utils/i18n';
@@ -200,6 +201,7 @@ const TOOL_ICONS: Record<string, React.ComponentType<{ size?: number; 'aria-hidd
   find_files: Search,
   update_todos: ListChecks,
   use_skill: Sparkles,
+  web_fetch: Globe,
 };
 
 const ToolCard: React.FC<{
@@ -226,7 +228,14 @@ const ToolCard: React.FC<{
       ? t.stepsSoFar(Number(tool.args.steps) || 0)
       : isMcp
         ? JSON.stringify(tool.args).slice(0, 160)
-        : tool.args.command || tool.args.path || tool.args.query || tool.args.pattern || tool.args.id || tool.args.name || '';
+        : tool.args.command ||
+          tool.args.path ||
+          tool.args.url ||
+          tool.args.query ||
+          tool.args.pattern ||
+          tool.args.id ||
+          tool.args.name ||
+          '';
   const isEdit = tool.name === 'replace_file_content' || tool.name === 'multi_edit_file';
   // replace_file_content = edit เดียวใน args, multi_edit_file = หลาย edit
   const edits: { target_content: string; replacement_content?: string }[] = Array.isArray(tool.args.edits)

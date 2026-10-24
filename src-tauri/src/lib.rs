@@ -1685,6 +1685,162 @@ async fn mcp_http_request(
     .map_err(|e| e.to_string())?
 }
 
+// 6.x web_fetch: อ่านหน้าเว็บ (เอกสาร, changelog, issue) ให้ agent — ผ่าน Rust จึงไม่ติด CORS
+const WEB_FETCH_MAX_BYTES: usize = 3 * 1024 * 1024;
+const WEB_FETCH_MAX_REDIRECTS: usize = 5;
+
+#[derive(Serialize)]
+struct WebPage {
+    /// URL สุดท้ายหลังตาม redirect ภายในโดเมนเดียวกัน
+    url: String,
+    status: u16,
+    content_type: String,
+    title: Option<String>,
+    /// HTML ถูกแปลงเป็นข้อความ (ลิงก์อยู่ท้ายเป็น footnote)
+    content: String,
+    /// body ใหญ่เกิน WEB_FETCH_MAX_BYTES — อ่านแค่ส่วนต้น
+    truncated: bool,
+    /// redirect ไปโดเมนอื่น — ไม่ตามให้ เพราะผู้ใช้อนุญาตแค่โดเมนเดิม (agent ต้องขอใหม่ด้วย URL นี้)
+    redirect: Option<String>,
+}
+
+fn parse_web_url(raw: &str) -> Result<url::Url, String> {
+    let url = url::Url::parse(raw.trim()).map_err(|e| format!("URL ไม่ถูกต้อง: {}", e))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err("web_fetch รองรับเฉพาะ http:// และ https://".to_string());
+    }
+    if url.host_str().is_none() {
+        return Err("URL ไม่มีชื่อโดเมน".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("URL ต้องไม่มีชื่อผู้ใช้หรือรหัสผ่าน".to_string());
+    }
+    Ok(url)
+}
+
+fn is_text_content_type(content_type: &str) -> bool {
+    content_type.starts_with("text/")
+        || ["json", "xml", "javascript", "yaml", "toml"].iter().any(|t| content_type.contains(t))
+}
+
+/// server ไม่บอก content-type — เดาจากเนื้อหา
+fn looks_like_html(body: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&body[..body.len().min(1024)]).to_lowercase();
+    let head = head.trim_start_matches('\u{feff}').trim_start();
+    head.starts_with("<!doctype html") || head.starts_with("<html") || (head.starts_with('<') && head.contains("<body"))
+}
+
+fn decode_basic_entities(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+}
+
+fn html_title(html: &str) -> Option<String> {
+    let re = regex::Regex::new(r"(?is)<title[^>]*>(.*?)</title>").ok()?;
+    let raw = re.captures(html)?.get(1)?.as_str();
+    let title = decode_basic_entities(&raw.split_whitespace().collect::<Vec<_>>().join(" "));
+    (!title.is_empty()).then_some(title)
+}
+
+/// ยุบบรรทัดว่างที่ติดกันเกิน 1 บรรทัด และตัดช่องว่างท้ายบรรทัด (หน้าเว็บมี layout ว่าง ๆ เยอะ)
+fn tidy_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut blank_run = 0;
+    for line in text.lines() {
+        let line = line.trim_end();
+        blank_run = if line.is_empty() { blank_run + 1 } else { 0 };
+        if blank_run <= 1 {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.trim().to_string()
+}
+
+fn page_from_body(url: String, status: u16, content_type: &str, body: &[u8], truncated: bool) -> Result<WebPage, String> {
+    let is_html = content_type.contains("html") || (content_type.is_empty() && looks_like_html(body));
+    let (title, content) = if is_html {
+        let html = String::from_utf8_lossy(body);
+        let text = html2text::config::plain()
+            .no_link_wrapping()
+            .allow_width_overflow()
+            .string_from_read(body, 120)
+            .unwrap_or_else(|_| html.to_string());
+        (html_title(&html), tidy_text(&text))
+    } else if is_text_content_type(content_type) || (content_type.is_empty() && !body.contains(&0)) {
+        (None, String::from_utf8_lossy(body).into_owned())
+    } else {
+        return Err(format!(
+            "web_fetch อ่านได้เฉพาะหน้าเว็บและไฟล์ข้อความ — URL นี้เป็น {}",
+            if content_type.is_empty() { "ไฟล์ binary" } else { content_type }
+        ));
+    };
+    let content_type = if content_type.is_empty() && is_html { "text/html".to_string() } else { content_type.to_string() };
+    Ok(WebPage { url, status, content_type, title, content, truncated, redirect: None })
+}
+
+fn fetch_web_page(raw_url: &str) -> Result<WebPage, String> {
+    use std::io::Read;
+    let mut url = parse_web_url(raw_url)?;
+    // ตาม redirect เอง: ไปต่อเฉพาะโดเมนเดิม (ผู้ใช้อนุญาตเป็นรายโดเมน)
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .redirects(0)
+        .user_agent("Mozilla/5.0 (compatible; Dex-Agent/0.1)")
+        .build();
+    for _ in 0..=WEB_FETCH_MAX_REDIRECTS {
+        let resp = match agent
+            .get(url.as_str())
+            .set("Accept", "text/html,application/xhtml+xml,text/plain;q=0.9,application/json;q=0.9,*/*;q=0.5")
+            .call()
+        {
+            Ok(r) => r,
+            // 404/500 ก็อ่าน body ด้วย — หน้า error มักบอกว่าผิดตรงไหน
+            Err(ureq::Error::Status(_, r)) => r,
+            Err(e) => return Err(format!("เชื่อมต่อไม่สำเร็จ: {}", e)),
+        };
+        let status = resp.status();
+        if (300..400).contains(&status) {
+            let location = resp.header("location").ok_or_else(|| format!("HTTP {} แต่ไม่มี Location", status))?;
+            let next = url.join(location).map_err(|e| format!("redirect ไม่ถูกต้อง: {}", e))?;
+            if next.host_str() != url.host_str() || !matches!(next.scheme(), "http" | "https") {
+                return Ok(WebPage {
+                    url: url.to_string(),
+                    status,
+                    content_type: String::new(),
+                    title: None,
+                    content: String::new(),
+                    truncated: false,
+                    redirect: Some(next.to_string()),
+                });
+            }
+            url = next;
+            continue;
+        }
+        let content_type = if resp.header("content-type").is_some() { resp.content_type().to_lowercase() } else { String::new() };
+        let mut body = Vec::new();
+        resp.into_reader()
+            .take(WEB_FETCH_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(|e| format!("อ่านหน้าเว็บไม่สำเร็จ: {}", e))?;
+        let truncated = body.len() > WEB_FETCH_MAX_BYTES;
+        body.truncate(WEB_FETCH_MAX_BYTES);
+        return page_from_body(url.to_string(), status, &content_type, &body, truncated);
+    }
+    Err(format!("redirect เกิน {} ครั้ง", WEB_FETCH_MAX_REDIRECTS))
+}
+
+#[tauri::command]
+async fn web_fetch(url: String) -> Result<WebPage, String> {
+    tokio::task::spawn_blocking(move || fetch_web_page(&url))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 // 7.1 API key เก็บใน Windows Credential Manager (เข้ารหัสด้วยบัญชีผู้ใช้ของ Windows) แทน localStorage
 const KEYRING_SERVICE: &str = "com.thegrace.dex";
 
@@ -1868,6 +2024,7 @@ pub fn run() {
             mcp_send,
             mcp_stop,
             mcp_http_request,
+            web_fetch,
             save_session_history,
             load_session_history,
             delete_session_history,
@@ -2214,6 +2371,42 @@ mod tests {
         assert!(snapshot_file(ws.join(".env").to_string_lossy().to_string(), ws_str, None).is_err());
 
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn web_urls_are_validated() {
+        assert!(parse_web_url("https://docs.rs/regex").is_ok());
+        assert!(parse_web_url("  http://localhost:1420/  ").is_ok());
+        assert!(parse_web_url("file:///C:/Windows/win.ini").is_err());
+        assert!(parse_web_url("ftp://example.com").is_err());
+        assert!(parse_web_url("https://user:pass@example.com").is_err());
+        assert!(parse_web_url("not a url").is_err());
+    }
+
+    #[test]
+    fn web_pages_become_readable_text() {
+        let html = br#"<!doctype html><html><head><title> Regex &amp; You </title>
+            <style>body { color: red }</style><script>alert("x")</script></head>
+            <body><h1>Install</h1><p>Run <code>cargo add regex</code>.</p>
+
+
+            <p>See <a href="https://docs.rs/regex">the docs</a>.</p></body></html>"#;
+        let page = page_from_body("https://x.dev/".into(), 200, "text/html", html, false).unwrap();
+        assert_eq!(page.title.as_deref(), Some("Regex & You"));
+        assert!(page.content.contains("Install"));
+        assert!(page.content.contains("`cargo add regex`"));
+        assert!(page.content.contains("https://docs.rs/regex"));
+        assert!(!page.content.contains("alert"), "scripts are dropped: {}", page.content);
+        assert!(!page.content.contains("color: red"), "styles are dropped: {}", page.content);
+        assert!(!page.content.contains("\n\n\n"));
+
+        // ไม่มี content-type: เดาว่าเป็น HTML จากเนื้อหา
+        let sniffed = page_from_body("u".into(), 200, "", b"<html><body>hi</body></html>", false).unwrap();
+        assert_eq!(sniffed.content_type, "text/html");
+        let json = page_from_body("u".into(), 200, "application/json", br#"{"a":1}"#, false).unwrap();
+        assert_eq!(json.content, r#"{"a":1}"#);
+        assert!(page_from_body("u".into(), 200, "image/png", b"\x89PNG", false).is_err());
+        assert!(page_from_body("u".into(), 200, "", b"\x00\x01binary", false).is_err());
     }
 
     #[test]

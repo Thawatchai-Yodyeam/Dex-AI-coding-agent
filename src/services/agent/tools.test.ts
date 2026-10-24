@@ -17,10 +17,19 @@ const bridge = vi.hoisted(() => ({
   startBackgroundCommand: vi.fn(async () => 123),
   readBackgroundOutput: vi.fn(async () => ({ output: 'listening on 5173', dropped_bytes: 0, running: true, exit_code: null })),
   killCommand: vi.fn(async () => true),
+  webFetch: vi.fn(),
 }));
 vi.mock('../tauriBridge', () => ({ tauriBridge: bridge }));
 
-import { BACKGROUND_WARMUP_MS, compactToolResult, executeTool, resolveWorkspacePath, runToolCalls, toolResultToString } from './tools';
+import {
+  BACKGROUND_WARMUP_MS,
+  clearWebCache,
+  compactToolResult,
+  executeTool,
+  resolveWorkspacePath,
+  runToolCalls,
+  toolResultToString,
+} from './tools';
 
 const RANGE = { offset: 1, limit: 2000, maxChars: 32_000 };
 
@@ -443,5 +452,108 @@ describe('shell snapshot hook', () => {
     expect(order).toEqual(['run']);
     await executeTool('run_shell_command', { command: 'npm run format' }, settings, callbacks);
     expect(order).toEqual(['run', 'snapshot', 'run']);
+  });
+});
+
+describe('web_fetch', () => {
+  const settings = { cwd: 'D:\\proj', autoPilot: true, permissionRules: [] } as unknown as AppSettings;
+  const page = (content: string, patch: Record<string, unknown> = {}) => ({
+    url: 'https://docs.rs/regex/latest/regex/',
+    status: 200,
+    content_type: 'text/html',
+    title: 'regex - Rust',
+    content,
+    truncated: false,
+    redirect: null,
+    ...patch,
+  });
+
+  function setup(decision: ApprovalDecision = 'once', rules: PermissionRule[] = []) {
+    const approvals: ToolCallRecord[] = [];
+    const added: Pick<PermissionRule, 'tool' | 'pattern'>[] = [];
+    const callbacks: AgentCallbacks = {
+      onTextChunk: () => {},
+      onToolStart: () => {},
+      onToolUpdate: () => {},
+      onRequestApproval: async (tool) => {
+        approvals.push(tool);
+        return decision;
+      },
+    };
+    const store: PermissionStore = { rules: () => rules, addRule: (r) => added.push(r) };
+    const run = (args: Record<string, any>, signal?: AbortSignal) =>
+      executeTool('web_fetch', args, settings, callbacks, store, { signal }) as Promise<any>;
+    return { approvals, added, run };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearWebCache();
+  });
+
+  it('asks for each new domain, even in Auto-Pilot, and offers a domain rule', async () => {
+    bridge.webFetch.mockResolvedValue(page('Install with cargo add regex'));
+    const { approvals, added, run } = setup('session');
+    const res = await run({ url: 'https://docs.rs/regex' });
+    expect(approvals[0].approvalReason).toBe('web_fetch');
+    expect(approvals[0].suggestedRule).toEqual({ tool: 'web', pattern: 'docs.rs' });
+    expect(added).toEqual([{ tool: 'web', pattern: 'docs.rs' }]);
+    expect(bridge.webFetch).toHaveBeenCalledWith('https://docs.rs/regex');
+    expect(res).toMatchObject({ status: 200, title: 'regex - Rust', content: 'Install with cargo add regex' });
+    expect(res.note).toMatch(/untrusted/);
+  });
+
+  it('follows allow and deny rules without asking', async () => {
+    bridge.webFetch.mockResolvedValue(page('ok'));
+    const allow = { id: 'a', action: 'allow' as const, tool: 'web' as const, pattern: '*.github.com' };
+    const deny = { id: 'd', action: 'deny' as const, tool: 'web' as const, pattern: 'evil.example' };
+    const { approvals, run } = setup('reject', [allow, deny]);
+    expect(await run({ url: 'https://api.github.com/repos/x/y' })).toMatchObject({ content: 'ok' });
+    expect(await run({ url: 'https://evil.example/?q=1' })).toMatchObject({ error: expect.stringContaining('evil.example') });
+    expect(approvals).toEqual([]);
+    expect(bridge.webFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not fetch when the user rejects', async () => {
+    const { run } = setup('reject');
+    expect(await run({ url: 'https://example.com' })).toMatchObject({ error: expect.stringMatching(/rejected/i) });
+    expect(bridge.webFetch).not.toHaveBeenCalled();
+  });
+
+  it('pages through long content from the cache without asking again', async () => {
+    const long = 'a'.repeat(20_000) + 'b'.repeat(5_000);
+    bridge.webFetch.mockResolvedValue(page(long));
+    const { approvals, run } = setup();
+    const first = await run({ url: 'https://docs.rs/regex' });
+    expect(first.content).toBe('a'.repeat(20_000));
+    expect(first.note).toContain('offset=20000');
+    const second = await run({ url: 'https://docs.rs/regex', offset: 20_000 });
+    expect(second.content).toBe('b'.repeat(5_000));
+    expect(second.note).not.toContain('offset=');
+    expect(bridge.webFetch).toHaveBeenCalledTimes(1);
+    expect(approvals).toHaveLength(1);
+  });
+
+  it('reports cross-domain redirects instead of following them', async () => {
+    bridge.webFetch.mockResolvedValue(page('', { status: 302, redirect: 'https://other.example/login' }));
+    const res = await setup().run({ url: 'https://short.link/x' });
+    expect(res).toMatchObject({ status: 302, redirect: 'https://other.example/login' });
+  });
+
+  it('rejects URLs that are not http(s)', async () => {
+    const { approvals, run } = setup();
+    expect(await run({ url: 'file:///C:/Windows/win.ini' })).toMatchObject({ error: expect.stringContaining('http') });
+    expect(await run({ url: 'not a url' })).toMatchObject({ error: expect.stringContaining('Invalid URL') });
+    expect(approvals).toEqual([]);
+    expect(bridge.webFetch).not.toHaveBeenCalled();
+  });
+
+  it('stops waiting when the turn is aborted', async () => {
+    bridge.webFetch.mockReturnValue(new Promise(() => {}));
+    const controller = new AbortController();
+    const pending = setup().run({ url: 'https://slow.example' }, controller.signal);
+    await vi.waitFor(() => expect(bridge.webFetch).toHaveBeenCalled());
+    controller.abort();
+    expect(await pending).toMatchObject({ error: 'Cancelled by the user' });
   });
 });

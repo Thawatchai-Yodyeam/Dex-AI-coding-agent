@@ -252,9 +252,9 @@ export interface AppSettings {
   mcpConfig?: string;
 }
 
-/** shell = คำสั่ง PowerShell, read = อ่าน/ค้นไฟล์, edit = เขียน/แก้ไฟล์, mcp = tool ของ MCP server */
-export type PermissionTool = 'shell' | 'read' | 'edit' | 'mcp';
-export const PERMISSION_TOOLS: PermissionTool[] = ['shell', 'read', 'edit', 'mcp'];
+/** shell = คำสั่ง PowerShell, read = อ่าน/ค้นไฟล์, edit = เขียน/แก้ไฟล์, mcp = tool ของ MCP server, web = โดเมนที่ web_fetch อ่านได้ */
+export type PermissionTool = 'shell' | 'read' | 'edit' | 'mcp' | 'web';
+export const PERMISSION_TOOLS: PermissionTool[] = ['shell', 'read', 'edit', 'mcp', 'web'];
 
 /**
  * กฎสิทธิ์ของผู้ใช้ — deny ชนะ allow เสมอ
@@ -275,7 +275,8 @@ export type ApprovalReason =
   | 'shell_command'
   | 'supervised'
   | 'step_limit'
-  | 'mcp_tool';
+  | 'mcp_tool'
+  | 'web_fetch';
 
 /** ผลการกดอนุมัติ: ครั้งนี้ / ตลอดแชทนี้ / บันทึกเป็นกฎถาวร */
 export type ApprovalDecision = 'reject' | 'once' | 'session' | 'always';
