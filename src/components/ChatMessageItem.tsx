@@ -25,6 +25,7 @@ import {
   Plug,
   FoldVertical,
   Globe,
+  AppWindow,
 } from 'lucide-react';
 import type { ApprovalDecision, ChatMessage, ToolCallRecord } from '../types/agent';
 import type { Translation } from '../utils/i18n';
@@ -202,6 +203,7 @@ const TOOL_ICONS: Record<string, React.ComponentType<{ size?: number; 'aria-hidd
   update_todos: ListChecks,
   use_skill: Sparkles,
   web_fetch: Globe,
+  browser: AppWindow,
 };
 
 const ToolCard: React.FC<{
@@ -228,7 +230,12 @@ const ToolCard: React.FC<{
       ? t.stepsSoFar(Number(tool.args.steps) || 0)
       : isMcp
         ? JSON.stringify(tool.args).slice(0, 160)
-        : tool.args.command ||
+        : tool.name === 'browser'
+          ? [tool.args.action, tool.args.url ?? tool.args.ref ?? tool.args.key ?? tool.args.expression ?? tool.args.text]
+              .filter(Boolean)
+              .join(' ')
+              .slice(0, 160)
+          : tool.args.command ||
           tool.args.path ||
           tool.args.url ||
           tool.args.query ||

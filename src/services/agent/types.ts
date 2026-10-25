@@ -61,6 +61,22 @@ export interface TurnResult {
   usage: TokenUsage;
 }
 
+/** รูปที่ tool ส่งกลับ (เช่น screenshot ของ browser) — base64 ไม่มี prefix */
+export interface ToolImage {
+  mediaType: string;
+  data: string;
+}
+
+/** key ในผลของ tool ที่เก็บรูป — driver แยกออกไปแนบตามรูปแบบของแต่ละค่าย ไม่ให้ base64 ไปปนในข้อความ */
+export const TOOL_IMAGES_KEY = 'images__';
+
+/** แยกรูปออกจากผลของ tool */
+export function takeToolImages(result: unknown): { result: unknown; images: ToolImage[] } {
+  if (!result || typeof result !== 'object' || !(TOOL_IMAGES_KEY in result)) return { result, images: [] };
+  const { [TOOL_IMAGES_KEY]: images, ...rest } = result as Record<string, unknown>;
+  return { result: rest, images: Array.isArray(images) ? (images as ToolImage[]) : [] };
+}
+
 /** tool หนึ่งตัวในรูป JSON Schema กลาง — driver แปลงเป็นรูปแบบของแต่ละค่าย */
 export interface ToolDefinition {
   name: string;

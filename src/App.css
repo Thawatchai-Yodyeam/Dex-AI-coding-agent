@@ -808,7 +808,8 @@ pre,
    ============================================================ */
 .main {
   flex: 1;
-  min-width: 0;
+  /* เปิด browser pane แล้ว pane จะหดแทน แชทไม่แคบกว่านี้ */
+  min-width: 380px;
   display: flex;
   flex-direction: column;
   position: relative;
@@ -2650,4 +2651,92 @@ pre,
   border-color: var(--danger);
   color: var(--danger);
   background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+/* ============================================================
+   Browser pane — หน้าเว็บจริงเป็น native webview ที่ลอยทับ .browser-viewport
+   ============================================================ */
+.browser-pane {
+  flex: 0 1 auto;
+  min-width: 320px;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.browser-toolbar {
+  height: 52px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.browser-toolbar .is-spinning svg {
+  animation: spin 1s linear infinite;
+}
+
+.browser-url-form {
+  flex: 1;
+  min-width: 0;
+  margin: 0 4px;
+}
+
+.browser-url {
+  width: 100%;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.browser-url:focus {
+  outline: none;
+  border-color: var(--accent-border);
+  box-shadow: var(--focus);
+}
+
+.browser-error {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+  color: var(--danger);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.browser-viewport {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background: var(--bg);
+}
+
+.browser-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+
+.browser-empty p {
+  max-width: 320px;
+  margin: 0;
 }

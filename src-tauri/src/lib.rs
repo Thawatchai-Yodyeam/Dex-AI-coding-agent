@@ -1999,6 +1999,220 @@ async fn select_folder() -> Result<Option<String>, String> {
     Ok(if path.is_empty() { None } else { Some(path) })
 }
 
+// 9. Browser pane: child webview ในหน้าต่างหลัก ให้ agent เปิดเว็บ (เช่น dev server) แล้วทดสอบเอง
+// คุมผ่าน DevTools protocol ของ WebView2 — หน้าเว็บใน pane เป็น origin ภายนอก Tauri จึงไม่ให้เรียกคำสั่งของแอป
+// ยกเว้นหน้าของตัวแอปเอง (devUrl / *.localhost) ที่ Tauri ถือเป็น origin ภายใน — จึงห้ามเปิดหน้าเหล่านั้นใน pane
+const BROWSER_LABEL: &str = "dex-browser";
+
+/// method ของ DevTools protocol ที่ UI เรียกได้ — ไม่เปิดทั้งหมด (Network/Storage/Target ฯลฯ)
+const BROWSER_CDP_METHODS: &[&str] = &[
+    "Runtime.evaluate",
+    "Page.captureScreenshot",
+    "Page.reload",
+    "Page.getNavigationHistory",
+    "Page.navigateToHistoryEntry",
+    "Input.dispatchMouseEvent",
+    "Input.dispatchKeyEvent",
+    "Input.insertText",
+];
+
+/// ตำแหน่งของ pane ในหน้าต่าง (CSS px ของหน้าแอป = logical px)
+#[derive(Deserialize, Clone, Copy)]
+struct PaneBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Serialize, Clone)]
+struct BrowserEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loading: Option<bool>,
+}
+
+/// URL ที่ Tauri จะถือว่าเป็นหน้าของแอปเอง (ได้สิทธิ์เรียกคำสั่งของแอป)
+fn is_app_url(dev_url: Option<&url::Url>, url: &url::Url) -> bool {
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    // tauri://localhost, http://tauri.localhost, ipc/asset protocol บน Windows เป็น http://<ชื่อ>.localhost
+    url.scheme() == "tauri"
+        || url.scheme() == "ipc"
+        || host.ends_with(".localhost")
+        || dev_url.is_some_and(|dev| dev.origin() == url.origin())
+}
+
+fn browser_url_allowed(dev_url: Option<&url::Url>, url: &url::Url) -> bool {
+    url.as_str() == "about:blank"
+        || (matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && !is_app_url(dev_url, url))
+}
+
+fn check_browser_url(app: &AppHandle, raw: &str) -> Result<url::Url, String> {
+    let url = url::Url::parse(raw.trim()).map_err(|e| format!("URL ไม่ถูกต้อง: {}", e))?;
+    if browser_url_allowed(app.config().build.dev_url.as_ref(), &url) {
+        Ok(url)
+    } else if is_app_url(app.config().build.dev_url.as_ref(), &url) {
+        Err("เปิดหน้าของตัว Dex เองใน browser pane ไม่ได้".to_string())
+    } else {
+        Err("browser pane เปิดได้เฉพาะ http:// และ https://".to_string())
+    }
+}
+
+fn browser_webview(app: &AppHandle) -> Result<tauri::Webview, String> {
+    app.get_webview(BROWSER_LABEL).ok_or_else(|| "browser pane ยังไม่ได้เปิด".to_string())
+}
+
+fn apply_bounds(webview: &tauri::Webview, bounds: PaneBounds) -> Result<(), String> {
+    webview
+        .set_position(tauri::LogicalPosition::new(bounds.x, bounds.y))
+        .and_then(|_| webview.set_size(tauri::LogicalSize::new(bounds.width.max(1.0), bounds.height.max(1.0))))
+        .map_err(|e| e.to_string())
+}
+
+// ทุกคำสั่งของ pane เป็น async: คำสั่ง sync รันบน main thread และการสร้าง webview จากตรงนั้นค้างบน Windows
+/// `init_script` ใช้ตอนสร้าง webview ครั้งแรกเท่านั้น — รันก่อนสคริปต์ของทุกหน้า (เช่น ตัวเก็บ console ให้ agent)
+#[tauri::command]
+async fn browser_open(app: AppHandle, bounds: PaneBounds, init_script: Option<String>) -> Result<(), String> {
+    if let Some(webview) = app.get_webview(BROWSER_LABEL) {
+        apply_bounds(&webview, bounds)?;
+        return webview.show().map_err(|e| e.to_string());
+    }
+    let window = app.get_window("main").ok_or_else(|| "ไม่พบหน้าต่างหลัก".to_string())?;
+    let dev_url = app.config().build.dev_url.clone();
+    let popup_app = app.clone();
+    let load_app = app.clone();
+    let title_app = app.clone();
+    let mut builder = tauri::webview::WebviewBuilder::new(BROWSER_LABEL, tauri::WebviewUrl::External("about:blank".parse().unwrap()))
+        // ครอบทุกการนำทาง รวมถึงลิงก์และ script ในหน้า ไม่ใช่แค่ที่ agent สั่ง
+        .on_navigation(move |url| browser_url_allowed(dev_url.as_ref(), url))
+        // target=_blank / window.open → เปิดใน pane เดิม (หน้าต่างใหม่จะไม่มีการป้องกันแบบเดียวกัน)
+        // นำทางทีหลัง ไม่ทำใน handler ที่ WebView2 กำลังรอคำตอบอยู่
+        .on_new_window(move |url, _features| {
+            let app = popup_app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(webview) = app.get_webview(BROWSER_LABEL) {
+                    let _ = webview.navigate(url);
+                }
+            });
+            tauri::webview::NewWindowResponse::Deny
+        })
+        .on_page_load(move |_webview, payload| {
+            let event = BrowserEvent {
+                url: Some(payload.url().to_string()),
+                title: None,
+                loading: Some(matches!(payload.event(), tauri::webview::PageLoadEvent::Started)),
+            };
+            let _ = load_app.emit_to("main", "browser-state", event);
+        })
+        .on_document_title_changed(move |_webview, title| {
+            let _ = title_app.emit_to("main", "browser-state", BrowserEvent { url: None, title: Some(title), loading: None });
+        });
+    if let Some(script) = init_script {
+        builder = builder.initialization_script(script);
+    }
+    window
+        .add_child(
+            builder,
+            tauri::LogicalPosition::new(bounds.x, bounds.y),
+            tauri::LogicalSize::new(bounds.width.max(1.0), bounds.height.max(1.0)),
+        )
+        .map_err(|e| format!("เปิด browser pane ไม่สำเร็จ: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn browser_set_bounds(app: AppHandle, bounds: PaneBounds) -> Result<(), String> {
+    match app.get_webview(BROWSER_LABEL) {
+        Some(webview) => apply_bounds(&webview, bounds),
+        None => Ok(()),
+    }
+}
+
+/// ซ่อนตอนมีหน้าต่างของแอปมาทับ (webview อยู่บนสุดเสมอ จะบัง modal) หรือตอนผู้ใช้ปิด pane — หน้าเว็บยังอยู่
+#[tauri::command]
+async fn browser_set_visible(app: AppHandle, visible: bool) -> Result<(), String> {
+    let Some(webview) = app.get_webview(BROWSER_LABEL) else { return Ok(()) };
+    if visible { webview.show() } else { webview.hide() }.map_err(|e| e.to_string())
+}
+
+/// URL ปัจจุบันของ pane (None = ยังไม่ได้เปิด)
+#[tauri::command]
+async fn browser_url(app: AppHandle) -> Result<Option<String>, String> {
+    match app.get_webview(BROWSER_LABEL) {
+        Some(webview) => webview.url().map(|u| Some(u.to_string())).map_err(|e| e.to_string()),
+        None => Ok(None),
+    }
+}
+
+/// นำทางด้วย Page.navigate — คืนผลของ DevTools (มี errorText เมื่อโหลดไม่ได้ เช่น dev server ไม่ได้รัน)
+#[tauri::command]
+async fn browser_navigate(app: AppHandle, url: String) -> Result<String, String> {
+    let url = check_browser_url(&app, &url)?;
+    let params = serde_json::json!({ "url": url.as_str() }).to_string();
+    devtools_call(&app, "Page.navigate", params).await
+}
+
+#[tauri::command]
+async fn browser_cdp(app: AppHandle, method: String, params: String) -> Result<String, String> {
+    if !BROWSER_CDP_METHODS.contains(&method.as_str()) {
+        return Err(format!("DevTools method {} is not allowed", method));
+    }
+    devtools_call(&app, &method, params).await
+}
+
+#[cfg(windows)]
+async fn devtools_call(app: &AppHandle, method: &str, params: String) -> Result<String, String> {
+    use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+    use windows_core::HSTRING;
+
+    type Reply = Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>>>;
+    fn send(reply: &Reply, result: Result<String, String>) {
+        if let Some(tx) = reply.lock().unwrap().take() {
+            let _ = tx.send(result);
+        }
+    }
+
+    let webview = browser_webview(app)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let reply: Reply = Arc::new(Mutex::new(Some(tx)));
+    let method_name = method.to_string();
+    let outer = reply.clone();
+    // COM ของ WebView2 ต้องเรียกบน UI thread — with_webview พาไปให้ แล้วผลกลับมาทาง callback
+    webview
+        .with_webview(move |platform| {
+            let inner = outer.clone();
+            let started = unsafe {
+                platform.controller().CoreWebView2().and_then(|core| {
+                    let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |result, json| {
+                        send(&inner, result.map(|_| json.clone()).map_err(|e| format!("{} {}", e.message(), json)));
+                        Ok(())
+                    }));
+                    core.CallDevToolsProtocolMethod(&HSTRING::from(method_name.as_str()), &HSTRING::from(params.as_str()), &handler)
+                })
+            };
+            if let Err(e) = started {
+                send(&outer, Err(e.message()));
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    match tokio::time::timeout(Duration::from_secs(30), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(format!("{} ไม่ได้รับคำตอบ", method)),
+        Err(_) => Err(format!("{} ใช้เวลานานเกิน 30 วินาที", method)),
+    }
+}
+
+#[cfg(not(windows))]
+async fn devtools_call(_app: &AppHandle, _method: &str, _params: String) -> Result<String, String> {
+    Err("browser pane รองรับเฉพาะ Windows".to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -2025,6 +2239,12 @@ pub fn run() {
             mcp_stop,
             mcp_http_request,
             web_fetch,
+            browser_open,
+            browser_set_bounds,
+            browser_set_visible,
+            browser_url,
+            browser_navigate,
+            browser_cdp,
             save_session_history,
             load_session_history,
             delete_session_history,
@@ -2371,6 +2591,26 @@ mod tests {
         assert!(snapshot_file(ws.join(".env").to_string_lossy().to_string(), ws_str, None).is_err());
 
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn browser_pane_never_opens_the_app_itself() {
+        let dev = url::Url::parse("http://localhost:1420").unwrap();
+        let ok = |u: &str| browser_url_allowed(Some(&dev), &url::Url::parse(u).unwrap());
+        assert!(ok("http://localhost:5173/"));
+        assert!(ok("http://127.0.0.1:1420/"), "ต่าง host จาก devUrl = Tauri ไม่ถือเป็นหน้าของแอป");
+        assert!(ok("https://example.com/a?b=1"));
+        assert!(ok("about:blank"));
+        assert!(!ok("http://localhost:1420/"));
+        assert!(!ok("http://localhost:1420/settings"));
+        assert!(!ok("http://tauri.localhost/"));
+        assert!(!ok("http://ipc.localhost/cmd"));
+        assert!(!ok("tauri://localhost/"));
+        assert!(!ok("file:///C:/Users/me/.ssh/id_rsa"));
+        assert!(!ok("javascript:alert(1)"));
+        assert!(!ok("https://user:pw@example.com/"));
+        assert!(BROWSER_CDP_METHODS.contains(&"Runtime.evaluate"));
+        assert!(!BROWSER_CDP_METHODS.contains(&"Network.getCookies"));
     }
 
     #[test]

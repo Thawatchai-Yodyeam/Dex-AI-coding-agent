@@ -1,5 +1,5 @@
 import { PROVIDERS_CATALOG, effectiveEffort, type AIProvider, type ReasoningEffort } from '../../../types/agent';
-import { trimToolResults } from '../history';
+import { TOOL_IMAGES_NOTE, dropOldToolImages, trimToolResults } from '../history';
 import { httpError, withRetry } from '../retry';
 import { readSseData, tryParseJson } from '../sse';
 import { runToolCalls, toolResultToString } from '../tools';
@@ -9,7 +9,9 @@ import {
   emptyUsage,
   imagesWithData,
   stepLimitNote,
+  takeToolImages,
   throwIfAborted,
+  type ToolImage,
   type TurnContext,
   type TurnResult,
   type UserInput,
@@ -68,6 +70,29 @@ export function openaiUserContent(input: UserInput): string | any[] {
   return parts;
 }
 
+/**
+ * ผลของ tool → tool message ตามลำดับ call — tool message รับได้แค่ข้อความ รูปจาก tool จึงส่งตามไป
+ * เป็นข้อความ user ที่มีหัวเฉพาะ (history รู้ว่าไม่ใช่ข้อความที่ผู้ใช้พิมพ์)
+ */
+export function openaiToolMessages(callIds: string[], results: unknown[]): any[] {
+  const images: ToolImage[] = [];
+  const messages: any[] = callIds.map((id, i) => {
+    const { result, images: found } = takeToolImages(results[i]);
+    images.push(...found);
+    return { role: 'tool', tool_call_id: id, content: toolResultToString(result) };
+  });
+  if (images.length > 0) {
+    messages.push({
+      role: 'user',
+      content: [
+        { type: 'text', text: TOOL_IMAGES_NOTE },
+        ...images.map((img) => ({ type: 'image_url', image_url: { url: `data:${img.mediaType};base64,${img.data}` } })),
+      ],
+    });
+  }
+  return messages;
+}
+
 export async function runOpenAITurn(ctx: TurnContext, input: UserInput): Promise<TurnResult> {
   const { settings, callbacks, signal, history } = ctx;
   const provider = settings.provider;
@@ -102,6 +127,7 @@ export async function runOpenAITurn(ctx: TurnContext, input: UserInput): Promise
     }
     // tool loop ยาว ๆ ทำให้ประวัติโตเกิน context ได้ภายในเทิร์นเดียว
     trimToolResults(history, 'openai');
+    dropOldToolImages(history, 'openai');
 
     const body: Record<string, unknown> = {
       model,
@@ -216,8 +242,6 @@ export async function runOpenAITurn(ctx: TurnContext, input: UserInput): Promise
         ? ctx.runTool(call.name, parsedArgs)
         : { error: `Invalid JSON arguments for ${call.name}: ${call.args.slice(0, 200)}` };
     });
-    calls.forEach((call, i) => {
-      history.push({ role: 'tool', tool_call_id: call.id, content: toolResultToString(results[i]) });
-    });
+    history.push(...openaiToolMessages(calls.map((c) => c.id), results));
   }
 }

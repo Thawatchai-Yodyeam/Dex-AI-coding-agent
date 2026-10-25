@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppSettings, ApprovalDecision, PermissionRule, ToolCallRecord } from '../../types/agent';
-import type { AgentCallbacks, PermissionStore } from './types';
+import { TOOL_IMAGES_KEY, type AgentCallbacks, type PermissionStore } from './types';
 
 const { SLICE } = vi.hoisted(() => ({
   SLICE: { content: '     1\tfile body\n', start_line: 1, end_line: 1, total_lines: 1, truncated_lines: 0 },
@@ -555,5 +555,87 @@ describe('web_fetch', () => {
     await vi.waitFor(() => expect(bridge.webFetch).toHaveBeenCalled());
     controller.abort();
     expect(await pending).toMatchObject({ error: 'Cancelled by the user' });
+  });
+});
+
+describe('browser tool', () => {
+  const base = { cwd: 'D:\\proj', autoPilot: true, permissionRules: [], provider: 'anthropic' } as unknown as AppSettings;
+
+  function setup(decision: ApprovalDecision = 'once', rules: PermissionRule[] = [], page = 'http://localhost:5173/') {
+    const approvals: ToolCallRecord[] = [];
+    const driver = {
+      navigate: vi.fn(async () => null),
+      currentUrl: vi.fn(async () => page),
+      sleep: async () => {},
+      cdp: vi.fn(async (method: string, params: any = {}) => {
+        if (method === 'Page.captureScreenshot') return { data: 'SHOT' };
+        const expr = String(params.expression ?? '');
+        if (expr.startsWith('JSON.stringify({ width')) return { result: { value: JSON.stringify({ width: 800, height: 600, dpr: 1, scrollX: 0, scrollY: 0 }) } };
+        if (expr.startsWith('JSON.stringify({ url')) return { result: { value: JSON.stringify({ url: page, title: 'App', ready: 'complete' }) } };
+        return { result: { type: 'number', value: 1 } };
+      }),
+    };
+    const callbacks: AgentCallbacks = {
+      onTextChunk: () => {},
+      onToolStart: () => {},
+      onToolUpdate: () => {},
+      onRequestApproval: async (tool) => {
+        approvals.push(tool);
+        return decision;
+      },
+    };
+    const store: PermissionStore = { rules: () => rules, addRule: () => {} };
+    const run = (args: Record<string, any>, settings = base) =>
+      executeTool('browser', args, settings, callbacks, store, { browser: driver }) as Promise<any>;
+    return { approvals, driver, run };
+  }
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it('opens localhost without asking in Auto-Pilot', async () => {
+    const { approvals, driver, run } = setup();
+    const res = await run({ action: 'navigate', url: 'http://localhost:5173' });
+    expect(approvals).toEqual([]);
+    expect(driver.navigate).toHaveBeenCalledWith('http://localhost:5173/');
+    expect(res).toMatchObject({ title: 'App', note: expect.stringMatching(/untrusted/) });
+  });
+
+  it('asks before other sites, and before localhost when supervised', async () => {
+    const { approvals, run } = setup();
+    await run({ action: 'navigate', url: 'https://example.com/docs' });
+    expect(approvals[0].approvalReason).toBe('browser_open');
+    expect(approvals[0].suggestedRule).toEqual({ tool: 'web', pattern: 'example.com' });
+    await run({ action: 'navigate', url: 'http://127.0.0.1:3000' }, { ...base, autoPilot: false });
+    expect(approvals).toHaveLength(2);
+  });
+
+  it('honours web rules and refuses non-http URLs', async () => {
+    const deny = { id: 'd', action: 'deny' as const, tool: 'web' as const, pattern: 'localhost' };
+    const { approvals, driver, run } = setup('once', [deny]);
+    expect(await run({ action: 'navigate', url: 'http://localhost:5173' })).toMatchObject({ error: expect.stringContaining('localhost') });
+    expect(await run({ action: 'navigate', url: 'file:///C:/secret.txt' })).toMatchObject({ error: expect.stringContaining('http') });
+    expect(approvals).toEqual([]);
+    expect(driver.navigate).not.toHaveBeenCalled();
+  });
+
+  it('asks before running scripts outside localhost', async () => {
+    const local = setup();
+    await local.run({ action: 'evaluate', expression: '1' });
+    expect(local.approvals).toEqual([]);
+
+    const remote = setup('reject', [], 'https://bank.example/');
+    expect(await remote.run({ action: 'evaluate', expression: 'document.cookie' })).toMatchObject({ error: expect.stringMatching(/rejected/i) });
+    expect(remote.approvals[0].approvalReason).toBe('browser_script');
+    expect(remote.driver.cdp).not.toHaveBeenCalled();
+  });
+
+  it('only takes screenshots for models that can see images', async () => {
+    const { run } = setup();
+    expect((await run({ action: 'screenshot' }))[TOOL_IMAGES_KEY]).toEqual([{ mediaType: 'image/jpeg', data: 'SHOT' }]);
+    expect(await run({ action: 'screenshot' }, { ...base, provider: 'deepseek' })).toMatchObject({ error: expect.stringMatching(/snapshot/) });
+  });
+
+  it('rejects unknown actions', async () => {
+    expect(await setup().run({ action: 'hover' })).toMatchObject({ error: expect.stringContaining('Unknown browser action') });
   });
 });

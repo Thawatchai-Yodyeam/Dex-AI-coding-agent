@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Folder, TerminalSquare, Eraser, Zap, ShieldCheck } from 'lucide-react';
+import { Folder, TerminalSquare, Eraser, Zap, ShieldCheck, AppWindow } from 'lucide-react';
 import type { Translation } from '../utils/i18n';
 
 interface TopBarProps {
@@ -7,11 +7,13 @@ interface TopBarProps {
   cwd: string;
   autoPilot: boolean;
   terminalOpen: boolean;
+  browserOpen: boolean;
   hasMessages: boolean;
   t: Translation;
   onSelectWorkspace: () => void;
   onToggleAutoPilot: () => void;
   onToggleTerminal: () => void;
+  onToggleBrowser: () => void;
   onClearChat: () => void;
 }
 
@@ -20,11 +22,13 @@ export const TopBar: React.FC<TopBarProps> = ({
   cwd,
   autoPilot,
   terminalOpen,
+  browserOpen,
   hasMessages,
   t,
   onSelectWorkspace,
   onToggleAutoPilot,
   onToggleTerminal,
+  onToggleBrowser,
   onClearChat,
 }) => {
   const [confirmClear, setConfirmClear] = useState(false);
@@ -79,6 +83,16 @@ export const TopBar: React.FC<TopBarProps> = ({
           title={t.terminalToggle}
         >
           <TerminalSquare size={18} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className={`icon-btn ${browserOpen ? 'is-active' : ''}`}
+          onClick={onToggleBrowser}
+          aria-pressed={browserOpen}
+          aria-label={t.browserToggle}
+          title={t.browserToggle}
+        >
+          <AppWindow size={18} aria-hidden="true" />
         </button>
       </div>
     </header>

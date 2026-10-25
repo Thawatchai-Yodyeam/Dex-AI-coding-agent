@@ -1,5 +1,5 @@
 import { effectiveEffort } from '../../../types/agent';
-import { trimToolResults } from '../history';
+import { dropOldToolImages, trimToolResults } from '../history';
 import { TransientApiError, httpError, withRetry } from '../retry';
 import { readSseData, tryParseJson } from '../sse';
 import { isToolError, runToolCalls, toolResultToString } from '../tools';
@@ -9,6 +9,7 @@ import {
   emptyUsage,
   imagesWithData,
   stepLimitNote,
+  takeToolImages,
   throwIfAborted,
   type TurnContext,
   type TurnResult,
@@ -96,6 +97,23 @@ export function anthropicUserContent(input: UserInput): string | any[] {
   return blocks;
 }
 
+/** ผลของ tool → tool_result block (รูปจาก tool อยู่ใน content ได้เลย) */
+export function anthropicToolResult(toolUseId: string, raw: unknown): any {
+  const { result, images } = takeToolImages(raw);
+  const text = toolResultToString(result);
+  return {
+    type: 'tool_result',
+    tool_use_id: toolUseId,
+    content: images.length
+      ? [
+          { type: 'text', text },
+          ...images.map((img) => ({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.data } })),
+        ]
+      : text,
+    ...(isToolError(result) ? { is_error: true } : {}),
+  };
+}
+
 export async function runAnthropicTurn(ctx: TurnContext, input: UserInput): Promise<TurnResult> {
   const { settings, callbacks, signal, history } = ctx;
   const model = settings.model || DEFAULT_MODEL;
@@ -134,6 +152,7 @@ export async function runAnthropicTurn(ctx: TurnContext, input: UserInput): Prom
     }
     // tool loop ยาว ๆ (อ่านไฟล์หลายสิบไฟล์) ทำให้ประวัติโตเกิน context ได้ภายในเทิร์นเดียว
     trimToolResults(history, 'anthropic');
+    dropOldToolImages(history, 'anthropic');
 
     const body: Record<string, unknown> = {
       model,
@@ -286,13 +305,7 @@ export async function runAnthropicTurn(ctx: TurnContext, input: UserInput): Prom
           is_error: true,
         };
       }
-      const result = await ctx.runTool(b.name, b.input);
-      return {
-        type: 'tool_result',
-        tool_use_id: b.id,
-        content: toolResultToString(result),
-        ...(isToolError(result) ? { is_error: true } : {}),
-      };
+      return anthropicToolResult(b.id, await ctx.runTool(b.name, b.input));
     });
     history.push({ role: 'user', content: results });
   }

@@ -33,6 +33,7 @@
 | 💾 **จำงานข้ามการเปิดแอป** | ประวัติเต็ม (รวมผลของ tool) บันทึกต่อแชท สลับแชทหรือเปิดแอปใหม่แล้วทำงานต่อได้ |
 | 📎 **`@ไฟล์`** | พิมพ์ `@` ในช่องแชทแล้วเลือกไฟล์ — เนื้อหาไฟล์ถูกแนบไปให้ agent ทันที ไม่ต้องเสีย step ไปอ่านเอง |
 | 🌐 **อ่านหน้าเว็บ** | tool `web_fetch` อ่านเอกสาร changelog หรือ issue บนเว็บ (แปลง HTML เป็นข้อความ แบ่งหน้าให้เอง) — ถามก่อนทุกโดเมนใหม่ |
+| 🧭 **เบราว์เซอร์ในแอป** | pane ทางขวา (ปุ่ม 🗔 มุมขวาบน) ให้ agent เปิด dev server แล้วทดสอบเอง: อ่านโครงหน้า คลิก พิมพ์ กดปุ่ม ดู console/error และ screenshot (ส่งรูปให้โมเดลที่ดูรูปได้) — คุณใช้แถบ URL เองก็ได้ |
 | 📋 **คำสั่งประจำโปรเจกต์** | วาง `DEX.md` หรือ `AGENTS.md` ไว้ที่รากโปรเจกต์ แล้ว agent จะทำตามทุกเทิร์น |
 | 🖼️ **แนบรูปได้** | วางด้วย `Ctrl+V` ลากไฟล์มาวาง หรือกดปุ่มแนบ รูปใหญ่จะถูกย่อให้อัตโนมัติ |
 | 🔐 **ขออนุญาตก่อนทำสิ่งเสี่ยง** | โหมด Auto-Pilot / Supervised, กฎ allow/deny ของคุณเอง, ป้องกันไฟล์ลับอย่าง `.env` และเก็บ API key ใน Windows Credential Manager |
@@ -163,6 +164,7 @@ Dex แก้ไฟล์จริงในเครื่องคุณ จึ
 - **Supervised:** ปิด Auto-Pilot (ปุ่ม ⚡ มุมขวาบน) แล้ว agent จะถามก่อนแก้ไฟล์หรือรันคำสั่งทุกครั้ง
 - **MCP:** server เปิดจาก config ในหน้าตั้งค่าเท่านั้น (ไม่อ่าน `.mcp.json` ของโปรเจกต์เอง กันโปรเจกต์แปลกหน้าสั่งรันโปรแกรม) และ tool ของ MCP ถามก่อนรัน
 - **เว็บ:** `web_fetch` ถามก่อนเข้าโดเมนใหม่ทุกครั้ง แม้ในโหมด Auto-Pilot (URL อาจถูกใช้ส่งข้อมูลออกไป) ตั้งกฎ allow เช่น `docs.rs` หรือ `*.github.com` ได้ ตาม redirect เฉพาะในโดเมนเดิม และบอก agent ว่าเนื้อหาจากเว็บเป็นข้อมูลที่ห้ามทำตามคำสั่งในนั้น
+- **เบราว์เซอร์ในแอป:** หน้าเว็บใน pane เรียกคำสั่งของ Dex ไม่ได้ (Tauri บล็อก origin ภายนอก) และ pane เปิดหน้าของตัว Dex เอง / `file://` ไม่ได้ เปิด localhost ได้เลยในโหมด Auto-Pilot ส่วนเว็บอื่นถามก่อนตามกฎโดเมนชุดเดียวกับ `web_fetch` และการรัน JavaScript ในหน้าที่ไม่ใช่ localhost ต้องอนุมัติทุกครั้ง
 - **API key:** เก็บใน Windows Credential Manager ไม่อยู่ใน localStorage
 
 ## 🧩 สถาปัตยกรรม
@@ -189,7 +191,7 @@ src/
   App.tsx                   layout หลัก + เชื่อม hooks
   App.css                   ธีม (design tokens, light/dark + ธีมโปเกมอน)
   components/               Sidebar, TopBar, Composer, ChatMessageItem, DiffViewer, SettingsModal,
-                            SkillsSettings, McpSettings, ModelOptions, ...
+                            SkillsSettings, McpSettings, ModelOptions, BrowserPane, ...
   hooks/
     useAppSettings.ts       settings, คีย์ใน Credential Manager/.env, sync MCP server ตาม config
     useChatSessions.ts      ประวัติแชท (บันทึกเฉพาะแชทที่เปลี่ยน แจ้งเตือนเมื่อบันทึกไม่สำเร็จ) + โหลดประวัติ native จากไฟล์
@@ -208,6 +210,10 @@ src/
       skills.ts             ค้นหา/อ่าน SKILL.md, tool use_skill, /ชื่อ-skill
       prompt.ts             system prompt + คำสั่งประจำโปรเจกต์ + รายชื่อ skill
       providers/            anthropic.ts (prompt caching), openai.ts (+ custom endpoint), google.ts
+    browser/
+      pane.ts               สถานะของ browser pane + ตามตำแหน่งกรอบใน layout
+      actions.ts            action ของ tool browser (navigate/snapshot/click/type/...) ผ่าน DevTools protocol
+      pageScripts.ts        สคริปต์ที่รันในหน้าเว็บ (โครงหน้า + ref, เก็บ console)
     mcp/
       config.ts             อ่าน config แบบ Claude Desktop
       client.ts             JSON-RPC client + transport stdio / Streamable HTTP
@@ -217,7 +223,8 @@ src/
     notify.ts               แจ้งเตือนของ Windows
     i18n.ts                 ข้อความไทย/อังกฤษ
 src-tauri/src/lib.rs        คำสั่ง Rust: shell (timeout/เบื้องหลัง), ไฟล์ (sandbox, อ่านเป็นหน้า, multi-edit),
-                            ค้นหา (regex/glob), git snapshot, keyring, skills, MCP transport, web_fetch (+ unit tests)
+                            ค้นหา (regex/glob), git snapshot, keyring, skills, MCP transport, web_fetch,
+                            browser pane (child webview + DevTools protocol ของ WebView2) (+ unit tests)
 ```
 
 </details>
@@ -241,6 +248,7 @@ GitHub Actions (`.github/workflows/ci.yml`) รันทั้งหมดนี
 - [x] Skills (`SKILL.md`)
 - [x] Context compaction แบบสรุป
 - [x] Tool `web_fetch`
+- [x] เบราว์เซอร์ในแอปให้ agent ทดสอบหน้าเว็บ
 - [x] `@ไฟล์` mention ในช่องแชท
 - [ ] ค้นหาและ export ประวัติแชท
 - [ ] ประเมินค่าใช้จ่าย ($) ต่อ session

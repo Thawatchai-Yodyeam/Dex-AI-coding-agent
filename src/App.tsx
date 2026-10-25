@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useSyncExternalStore } from 'react';
+import { BrowserPane } from './components/BrowserPane';
 import { ChatHistorySidebar } from './components/ChatHistorySidebar';
 import { ChatMessageItem } from './components/ChatMessageItem';
 import { Composer } from './components/Composer';
@@ -9,6 +10,7 @@ import { TopBar } from './components/TopBar';
 import { Welcome } from './components/Welcome';
 import { tauriBridge } from './services/tauriBridge';
 import { loadStoredSessions, type StoredSessions } from './services/sessionStore';
+import { browserPane } from './services/browser/pane';
 import type { AppSettings, PokemonTheme, ShellOutputEventPayload } from './types/agent';
 import { POKEMON_THEMES } from './types/agent';
 import { translations } from './utils/i18n';
@@ -104,6 +106,16 @@ function AppShell({ stored }: { stored: StoredSessions }) {
     };
   }, [setActiveCommandId, removeBackgroundCommand]);
 
+  // browser pane: ตามสถานะจากฝั่ง Rust และซ่อน webview ตอนหน้าตั้งค่าเปิด (native webview จะบัง modal)
+  const browser = useSyncExternalStore(browserPane.subscribe, browserPane.getState);
+  useEffect(() => {
+    const unlisten = tauriBridge.onBrowserState(browserPane.handleEvent).catch(() => null);
+    return () => {
+      unlisten.then((fn) => fn?.());
+    };
+  }, []);
+  useEffect(() => browserPane.setObscured(settingsOpen), [settingsOpen]);
+
   // เลื่อนลงล่างอัตโนมัติ เฉพาะเมื่อผู้ใช้อยู่ใกล้ล่างอยู่แล้ว (ไม่แย่ง scroll ตอนกำลังอ่านข้อความเก่า)
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -185,11 +197,13 @@ function AppShell({ stored }: { stored: StoredSessions }) {
           cwd={settings.cwd}
           autoPilot={settings.autoPilot}
           terminalOpen={terminalOpen}
+          browserOpen={browser.visible}
           hasMessages={messages.length > 0}
           t={t}
           onSelectWorkspace={handleSelectWorkspace}
           onToggleAutoPilot={() => updateSettings({ autoPilot: !settings.autoPilot })}
           onToggleTerminal={() => setTerminalOpen((v) => !v)}
+          onToggleBrowser={() => browserPane.setVisible(!browser.visible)}
           onClearChat={sessions.handleClearChat}
         />
 
@@ -252,6 +266,8 @@ function AppShell({ stored }: { stored: StoredSessions }) {
           onResizeStart={layout.handleTerminalResizeStart}
         />
       </main>
+
+      {browser.visible && <BrowserPane t={t} />}
 
       <SettingsModal
         isOpen={settingsOpen}

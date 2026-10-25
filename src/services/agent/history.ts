@@ -6,6 +6,16 @@ import type { HistoryFormat, NeutralMessage } from './types';
  * จะแปลงเป็น text-only (NeutralMessage) เฉพาะตอนสลับ provider หรือโหลด session ที่บันทึกไว้
  */
 
+/** ข้อความ user ที่ driver แบบ OpenAI แทรกเพื่อส่งรูปจาก tool (Chat Completions ใส่รูปใน tool message ไม่ได้) */
+export const TOOL_IMAGES_NOTE = '[Images returned by the tool calls above]';
+const REMOVED_IMAGE_NOTE = '[Older screenshot removed to save context]';
+/** เก็บรูปจาก tool ไว้กี่รูปล่าสุด — รูปถูกส่งซ้ำทุก step จึงแพง */
+const KEEP_TOOL_IMAGES = 3;
+
+export function isToolImagesMessage(m: any): boolean {
+  return m?.role === 'user' && Array.isArray(m.content) && m.content[0]?.type === 'text' && m.content[0].text === TOOL_IMAGES_NOTE;
+}
+
 function textOfAnthropicContent(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -32,6 +42,7 @@ export function toNeutral(history: any[], format: HistoryFormat): NeutralMessage
       role = m.role === 'assistant' ? 'assistant' : 'user';
       text = textOfAnthropicContent(m.content);
     } else {
+      if (isToolImagesMessage(m)) continue;
       if (m.role === 'user' || m.role === 'assistant') role = m.role;
       // ข้อความที่มีรูปเป็น content parts — เก็บเฉพาะส่วน text
       text = typeof m.content === 'string' ? m.content : textOfAnthropicContent(m.content);
@@ -70,7 +81,7 @@ export function isUserTextTurn(m: any, format: HistoryFormat): boolean {
   if (format === 'anthropic') {
     return typeof m.content === 'string' || !(m.content ?? []).some((b: any) => b?.type === 'tool_result');
   }
-  return true;
+  return !isToolImagesMessage(m);
 }
 
 /**
@@ -115,7 +126,8 @@ interface ResultSlot {
 /** ผล tool ที่ยังไม่ถูกล้าง เรียงจากเก่าไปใหม่ — clear() แทนเนื้อหาด้วยข้อความสั้น (คู่ call/result ยังครบ) */
 function toolResultSlots(history: any[], format: HistoryFormat): ResultSlot[] {
   const slots: ResultSlot[] = [];
-  const sizeOf = (v: unknown) => (typeof v === 'string' ? v.length : JSON.stringify(v ?? '').length);
+  // ผลที่มีรูปต้องนับรูปแบบเดียวกับ estimateHistoryChars ไม่ใช่ความยาว base64 ไม่งั้นนับว่าล้างไปเยอะเกินจริง
+  const sizeOf = (v: unknown) => (typeof v === 'string' ? v.length : estimateHistoryChars([v ?? '']));
   for (const m of history) {
     if (format === 'openai') {
       if (m?.role === 'tool' && m.content !== CLEARED_TOOL_RESULT) {
@@ -138,6 +150,40 @@ function toolResultSlots(history: any[], format: HistoryFormat): ResultSlot[] {
     }
   }
   return slots;
+}
+
+/**
+ * เหลือรูปจาก tool (screenshot) แค่ KEEP_TOOL_IMAGES รูปล่าสุด รูปเก่ากว่านั้นแทนด้วยข้อความสั้น
+ * แก้ใน history ตรง ๆ โดยไม่ลบข้อความ คู่ call/result จึงยังครบ — คืนจำนวนรูปที่ถูกเอาออก
+ */
+export function dropOldToolImages(history: any[], format: HistoryFormat, keep = KEEP_TOOL_IMAGES): number {
+  const slots: (() => void)[] = [];
+  const replaceWithNote = (list: any[], index: number) => () => {
+    list[index] = { type: 'text', text: REMOVED_IMAGE_NOTE };
+  };
+  for (const m of history) {
+    if (format === 'anthropic') {
+      if (m?.role !== 'user' || !Array.isArray(m.content)) continue;
+      for (const b of m.content) {
+        if (b?.type !== 'tool_result' || !Array.isArray(b.content)) continue;
+        b.content.forEach((part: any, i: number) => {
+          if (part?.type === 'image') slots.push(replaceWithNote(b.content, i));
+        });
+      }
+    } else if (format === 'google') {
+      for (const p of m?.parts ?? []) {
+        const fr = p?.functionResponse;
+        if (fr && Array.isArray(fr.parts) && fr.parts.length > 0) slots.push(() => delete fr.parts);
+      }
+    } else if (isToolImagesMessage(m)) {
+      m.content.forEach((part: any, i: number) => {
+        if (part?.type === 'image_url') slots.push(replaceWithNote(m.content, i));
+      });
+    }
+  }
+  const drop = slots.slice(0, Math.max(0, slots.length - keep));
+  for (const remove of drop) remove();
+  return drop.length;
 }
 
 /**

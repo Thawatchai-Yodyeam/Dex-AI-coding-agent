@@ -34,6 +34,20 @@ export interface WebPage {
   redirect: string | null;
 }
 
+/** ตำแหน่งของ browser pane ในหน้าต่าง (CSS px) */
+export interface PaneBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface BrowserStateEvent {
+  url?: string;
+  title?: string;
+  loading?: boolean;
+}
+
 export interface FileEdit {
   target_content: string;
   replacement_content: string;
@@ -244,6 +258,38 @@ export const tauriBridge = {
   /** GET หน้าเว็บผ่าน Rust (ไม่ติด CORS) — HTML ถูกแปลงเป็นข้อความ */
   async webFetch(url: string): Promise<WebPage> {
     return await invoke('web_fetch', { url });
+  },
+
+  /** สร้าง browser pane (ครั้งแรก) หรือแสดงที่ตำแหน่งใหม่ — initScript รันก่อนสคริปต์ของทุกหน้า (ใช้ตอนสร้างเท่านั้น) */
+  async browserOpen(bounds: PaneBounds, initScript?: string): Promise<void> {
+    await invoke('browser_open', { bounds, initScript });
+  },
+
+  async browserSetBounds(bounds: PaneBounds): Promise<void> {
+    await invoke('browser_set_bounds', { bounds });
+  },
+
+  async browserSetVisible(visible: boolean): Promise<void> {
+    await invoke('browser_set_visible', { visible });
+  },
+
+  /** URL ปัจจุบันของ pane (null = ยังไม่ได้เปิด) */
+  async browserUrl(): Promise<string | null> {
+    return await invoke('browser_url');
+  },
+
+  /** Page.navigate — ผลมี errorText เมื่อโหลดไม่ได้ */
+  async browserNavigate(url: string): Promise<{ errorText?: string }> {
+    return JSON.parse(await invoke<string>('browser_navigate', { url }));
+  },
+
+  /** เรียก DevTools protocol ของ pane (เฉพาะ method ที่ฝั่ง Rust อนุญาต) */
+  async browserCdp(method: string, params: Record<string, unknown> = {}): Promise<any> {
+    return JSON.parse(await invoke<string>('browser_cdp', { method, params: JSON.stringify(params) }));
+  },
+
+  async onBrowserState(callback: (state: BrowserStateEvent) => void): Promise<UnlistenFn> {
+    return await listen<BrowserStateEvent>('browser-state', (e) => callback(e.payload));
   },
 
   async selectFolder(): Promise<string | null> {

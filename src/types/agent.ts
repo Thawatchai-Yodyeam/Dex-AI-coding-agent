@@ -276,7 +276,9 @@ export type ApprovalReason =
   | 'supervised'
   | 'step_limit'
   | 'mcp_tool'
-  | 'web_fetch';
+  | 'web_fetch'
+  | 'browser_open'
+  | 'browser_script';
 
 /** ผลการกดอนุมัติ: ครั้งนี้ / ตลอดแชทนี้ / บันทึกเป็นกฎถาวร */
 export type ApprovalDecision = 'reject' | 'once' | 'session' | 'always';

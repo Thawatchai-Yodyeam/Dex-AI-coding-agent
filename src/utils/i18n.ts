@@ -131,6 +131,7 @@ const th = {
     grep_search: 'ค้นหาในโค้ด',
     find_files: 'หาไฟล์',
     web_fetch: 'อ่านหน้าเว็บ',
+    browser: 'เบราว์เซอร์',
   } as Record<string, string>,
   approvalPrompt: 'Dex ขอทำสิ่งนี้ — อนุญาตไหม?',
   approveBtn: 'อนุญาต',
@@ -150,6 +151,8 @@ const th = {
     step_limit: 'Dex ทำงานมาหลายรอบแล้วในคำขอนี้ — ให้ทำต่อหรือหยุดตรงนี้?',
     mcp_tool: 'tool จาก MCP server ภายนอก — ตรวจ argument ก่อนอนุญาต',
     web_fetch: 'Dex จะเชื่อมต่ออินเทอร์เน็ตไปที่โดเมนนี้ — ตรวจว่า URL ไม่มีข้อมูลลับก่อนอนุญาต',
+    browser_open: 'Dex จะเปิดเว็บไซต์นี้ใน browser pane — ตรวจว่า URL ไม่มีข้อมูลลับก่อนอนุญาต',
+    browser_script: 'Dex จะรัน JavaScript ในหน้าเว็บที่เปิดอยู่ — script ส่งข้อมูลออกไปข้างนอกได้',
   } as Record<ApprovalReason, string>,
   stepsSoFar: (n: number) => `ทำไปแล้ว ${n} รอบ`,
   todoStatus: { pending: 'ยังไม่เริ่ม', in_progress: 'กำลังทำ', completed: 'เสร็จแล้ว' },
@@ -251,6 +254,19 @@ const th = {
   // Errors
   crashTitle: 'เกิดข้อผิดพลาดในหน้าจอ',
   crashReload: 'โหลดใหม่',
+
+  // Browser pane
+  browserToggle: 'เปิด/ปิดเบราว์เซอร์',
+  browserTitle: 'เบราว์เซอร์',
+  browserBack: 'ย้อนกลับ',
+  browserForward: 'ไปข้างหน้า',
+  browserReload: 'โหลดใหม่',
+  browserUrlLabel: 'ที่อยู่เว็บ',
+  browserUrlPlaceholder: 'พิมพ์ URL เช่น localhost:5173',
+  browserOpenExternal: 'เปิดในเบราว์เซอร์ของระบบ',
+  browserHide: 'ซ่อนเบราว์เซอร์',
+  browserEmpty: 'ยังไม่ได้เปิดหน้าเว็บ — พิมพ์ URL ด้านบน หรือให้ Dex เปิดเอง เช่น "รัน dev server แล้วทดสอบหน้าแรกให้หน่อย"',
+  browserLoadFailed: (err: string) => `เปิดหน้านี้ไม่ได้: ${err}`,
   chatSaveFailed: (err: string) => `บันทึกแชทลงเครื่องไม่สำเร็จ — ถ้าปิดแอปตอนนี้ข้อความล่าสุดอาจหาย (${err})`,
 };
 
@@ -377,6 +393,7 @@ const en: Translation = {
     grep_search: 'Search code',
     find_files: 'Find files',
     web_fetch: 'Fetch web page',
+    browser: 'Browser',
   },
   approvalPrompt: 'Dex wants to do this — allow?',
   approveBtn: 'Allow',
@@ -396,6 +413,8 @@ const en: Translation = {
     step_limit: 'Dex has taken many steps on this request — keep going or stop here?',
     mcp_tool: 'A tool from an external MCP server — check the arguments before allowing',
     web_fetch: 'Dex will connect to this domain over the internet — make sure the URL holds no secrets',
+    browser_open: 'Dex will open this site in the browser pane — make sure the URL holds no secrets',
+    browser_script: 'Dex will run JavaScript in the open page — a script can send data anywhere',
   },
   stepsSoFar: (n: number) => `${n} steps so far`,
   todoStatus: { pending: 'pending', in_progress: 'in progress', completed: 'done' },
@@ -493,6 +512,19 @@ const en: Translation = {
 
   crashTitle: 'Something went wrong in the UI',
   crashReload: 'Reload',
+
+  // Browser pane
+  browserToggle: 'Toggle browser',
+  browserTitle: 'Browser',
+  browserBack: 'Back',
+  browserForward: 'Forward',
+  browserReload: 'Reload',
+  browserUrlLabel: 'Address',
+  browserUrlPlaceholder: 'Enter a URL, e.g. localhost:5173',
+  browserOpenExternal: 'Open in system browser',
+  browserHide: 'Hide browser',
+  browserEmpty: 'No page open yet — type a URL above, or ask Dex, e.g. "start the dev server and test the home page".',
+  browserLoadFailed: (err: string) => `Could not open this page: ${err}`,
   chatSaveFailed: (err: string) => `Could not save this chat to disk — recent messages may be lost if you close the app (${err})`,
 };
 

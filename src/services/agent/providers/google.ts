@@ -1,6 +1,6 @@
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { effectiveEffort } from '../../../types/agent';
-import { trimToolResults } from '../history';
+import { dropOldToolImages, trimToolResults } from '../history';
 import { withRetry } from '../retry';
 import { runToolCalls } from '../tools';
 import {
@@ -9,6 +9,7 @@ import {
   emptyUsage,
   imagesWithData,
   stepLimitNote,
+  takeToolImages,
   throwIfAborted,
   type TurnContext,
   type TurnResult,
@@ -53,6 +54,18 @@ export function googleUserParts(input: UserInput): any[] {
   return parts;
 }
 
+/** ผลของ tool → functionResponse part — Gemini 3 รับรูปในผลของ function ได้ (multimodal function response) */
+export function googleFunctionResponse(name: string, raw: unknown): any {
+  const { result, images } = takeToolImages(raw);
+  return {
+    functionResponse: {
+      name,
+      response: result,
+      ...(images.length ? { parts: images.map((img) => ({ inlineData: { mimeType: img.mediaType, data: img.data } })) } : {}),
+    },
+  };
+}
+
 export async function runGoogleTurn(ctx: TurnContext, input: UserInput): Promise<TurnResult> {
   const { settings, callbacks, signal, history } = ctx;
   const ai = new GoogleGenAI({ apiKey: ctx.apiKey });
@@ -85,6 +98,7 @@ export async function runGoogleTurn(ctx: TurnContext, input: UserInput): Promise
     }
     // tool loop ยาว ๆ ทำให้ประวัติโตเกิน context ได้ภายในเทิร์นเดียว
     trimToolResults(history, 'google');
+    dropOldToolImages(history, 'google');
 
     // ล้มชั่วคราว (429/5xx/เน็ตหลุดกลางสตรีม) → ลองใหม่ทั้ง step และส่งข้อความ step นี้ให้ UI ใหม่ตั้งแต่ต้น
     const textBefore = fullText;
@@ -155,9 +169,9 @@ export async function runGoogleTurn(ctx: TurnContext, input: UserInput): Promise
     if (modelParts.length > 0) history.push({ role: 'model', parts: modelParts });
     if (calls.length === 0) return { text: fullText, usage };
 
-    const responses = await runToolCalls(calls, (c) => c.name, async (call) => ({
-      functionResponse: { name: call.name, response: await ctx.runTool(call.name, call.args) },
-    }));
+    const responses = await runToolCalls(calls, (c) => c.name, async (call) =>
+      googleFunctionResponse(call.name, await ctx.runTool(call.name, call.args))
+    );
     history.push({ role: 'user', parts: responses });
   }
 }
