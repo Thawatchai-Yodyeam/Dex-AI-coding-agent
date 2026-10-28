@@ -98,6 +98,31 @@ export async function fileToImageAttachment(file: File): Promise<ImageAttachment
   };
 }
 
+/** ขอบยาวสุดของภาพพื้นหลัง — พอสำหรับจอ 1440p โดยไม่หนัก localStorage */
+const WALLPAPER_MAX_EDGE_PX = 2560;
+
+/** แปลงไฟล์รูปเป็น data URL แบบ JPEG ที่ย่อแล้ว สำหรับใช้เป็นภาพพื้นหลัง */
+export async function fileToWallpaper(file: File): Promise<string> {
+  if (!SUPPORTED_IMAGE_TYPES.includes(file.type)) throw new ImageAttachError('unsupported');
+  if (file.size > MAX_SOURCE_BYTES) throw new ImageAttachError('too_large');
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    throw new ImageAttachError('decode');
+  }
+  const scale = Math.min(1, WALLPAPER_MAX_EDGE_PX / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new ImageAttachError('decode');
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  const blob = await canvasToBlob(canvas, 'image/jpeg', 0.85);
+  return `data:image/jpeg;base64,${await readAsBase64(blob)}`;
+}
+
 export function imageSrc(img: ImageAttachment): string | undefined {
   return img.data ? `data:${img.mediaType};base64,${img.data}` : undefined;
 }

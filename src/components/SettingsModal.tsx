@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { X, KeyRound, SlidersHorizontal, ShieldCheck, Puzzle } from 'lucide-react';
+import { X, KeyRound, SlidersHorizontal, ShieldCheck, Puzzle, ImagePlus, Ban } from 'lucide-react';
+import { fileToWallpaper } from '../utils/images';
+import { WALLPAPER_PRESETS, presetValue, resolveWallpaper } from '../utils/wallpapers';
 import { McpSettings } from './McpSettings';
 import { SkillsSettings } from './SkillsSettings';
 import type { AppSettings, AIProvider, PokemonTheme, ThemePreference } from '../types/agent';
@@ -22,13 +24,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
   const [draft, setDraft] = useState<AppSettings>(settings);
   const [tab, setTab] = useState<Tab>('general');
   const [saved, setSaved] = useState(false);
+  const [wallpaperError, setWallpaperError] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const wallpaperInputRef = useRef<HTMLInputElement>(null);
 
   // รีเซ็ตฟอร์มเมื่อเปิดใหม่เท่านั้น (เดิมรีเซ็ตทุกครั้งที่ settings เปลี่ยน ทำให้สิ่งที่พิมพ์ค้างหาย)
   useEffect(() => {
     if (isOpen) {
       setDraft(settings);
       setSaved(false);
+      setWallpaperError(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
@@ -47,6 +52,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
   const t = translations[draft.language];
   const patch = (p: Partial<AppSettings>) => setDraft((d) => ({ ...d, ...p }));
   const setKey = (id: AIProvider, value: string) => setDraft((d) => ({ ...d, apiKeys: { ...d.apiKeys, [id]: value } }));
+  const draftWallpaperUrl = resolveWallpaper(draft.wallpaper);
   const activeKeys = Object.values(draft.apiKeys).filter((k) => k.trim()).length;
 
   const handleSave = () => {
@@ -157,6 +163,101 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
                       </button>
                     ))}
                   </div>
+                </fieldset>
+
+                <fieldset className="field">
+                  <legend className="field-label">{t.wallpaperLabel}</legend>
+                  <div className="wallpaper-picker" role="group" aria-label={t.wallpaperLabel}>
+                    <button
+                      type="button"
+                      className={`wallpaper-thumb ${!draftWallpaperUrl ? 'is-active' : ''}`}
+                      aria-pressed={!draftWallpaperUrl}
+                      title={t.wallpaperNone}
+                      onClick={() => patch({ wallpaper: '' })}
+                    >
+                      <Ban size={18} aria-hidden="true" />
+                      <span className="sr-only">{t.wallpaperNone}</span>
+                    </button>
+                    {WALLPAPER_PRESETS.map((preset, i) => (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        className={`wallpaper-thumb ${draftWallpaperUrl === preset.url ? 'is-active' : ''}`}
+                        aria-pressed={draftWallpaperUrl === preset.url}
+                        aria-label={t.wallpaperPreset(i + 1)}
+                        style={{ backgroundImage: `url("${preset.url}")` }}
+                        onClick={() => patch({ wallpaper: presetValue(preset.id) })}
+                      />
+                    ))}
+                    {draft.wallpaper?.startsWith('data:') && (
+                      <button
+                        type="button"
+                        className="wallpaper-thumb is-active"
+                        aria-pressed="true"
+                        aria-label={t.wallpaperCustom}
+                        style={{ backgroundImage: `url("${draft.wallpaper}")` }}
+                      />
+                    )}
+                    <button
+                      type="button"
+                      className="wallpaper-thumb"
+                      title={t.wallpaperChoose}
+                      onClick={() => wallpaperInputRef.current?.click()}
+                    >
+                      <ImagePlus size={18} aria-hidden="true" />
+                      <span className="sr-only">{t.wallpaperChoose}</span>
+                    </button>
+                    <input
+                      ref={wallpaperInputRef}
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp,image/gif"
+                      hidden
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        e.target.value = '';
+                        if (!file) return;
+                        try {
+                          patch({ wallpaper: await fileToWallpaper(file) });
+                          setWallpaperError(false);
+                        } catch {
+                          setWallpaperError(true);
+                        }
+                      }}
+                    />
+                  </div>
+                  {wallpaperError ? (
+                    <p className="field-hint field-error" role="alert">
+                      {t.wallpaperError}
+                    </p>
+                  ) : (
+                    <p className="field-hint">{t.wallpaperHint}</p>
+                  )}
+                  {draftWallpaperUrl && (
+                    <div className="wallpaper-sliders">
+                      <label className="range-field">
+                        <span>{t.wallpaperDim}</span>
+                        <input
+                          type="range"
+                          min={0}
+                          max={90}
+                          value={draft.wallpaperDim ?? 55}
+                          onChange={(e) => patch({ wallpaperDim: Number(e.target.value) })}
+                        />
+                        <output>{draft.wallpaperDim ?? 55}%</output>
+                      </label>
+                      <label className="range-field">
+                        <span>{t.wallpaperBlur}</span>
+                        <input
+                          type="range"
+                          min={0}
+                          max={20}
+                          value={draft.wallpaperBlur ?? 0}
+                          onChange={(e) => patch({ wallpaperBlur: Number(e.target.value) })}
+                        />
+                        <output>{draft.wallpaperBlur ?? 0}px</output>
+                      </label>
+                    </div>
+                  )}
                 </fieldset>
 
                 <div className="field">

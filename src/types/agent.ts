@@ -250,6 +250,15 @@ export interface AppSettings {
   disabledSkills?: string[];
   /** การตั้งค่า MCP server เป็น JSON รูปแบบ `{ "mcpServers": { ... } }` แบบเดียวกับ Claude Desktop / .mcp.json */
   mcpConfig?: string;
+  /**
+   * ภาพพื้นหลัง: undefined = ภาพแรกที่มากับแอป, '' = ปิด, 'preset:<ไฟล์>' หรือ data URL ของภาพผู้ใช้ (ย่อแล้ว)
+   * บันทึกแยก key จาก settings เพราะขนาดใหญ่ — ดู resolveWallpaper
+   */
+  wallpaper?: string;
+  /** ความทึบของชั้นสีทับภาพพื้นหลัง 0–90 (%) */
+  wallpaperDim?: number;
+  /** ความเบลอของภาพพื้นหลัง 0–20 (px) */
+  wallpaperBlur?: number;
 }
 
 /** shell = คำสั่ง PowerShell, read = อ่าน/ค้นไฟล์, edit = เขียน/แก้ไฟล์, mcp = tool ของ MCP server, web = โดเมนที่ web_fetch อ่านได้ */

@@ -7,6 +7,22 @@ import { parseMcpConfig } from '../services/mcp/config';
 import { mcpManager } from '../services/mcp/manager';
 
 const LOCAL_STORAGE_KEY = 'dex_agent_settings_v2';
+/** ภาพพื้นหลังเก็บแยก — ไม่ต้องเขียนรูปหลายร้อย KB ซ้ำทุกครั้งที่ settings อื่นเปลี่ยน */
+const WALLPAPER_STORAGE_KEY = 'dex_agent_wallpaper_v1';
+
+function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;
+}
+
+function loadWallpaper(): string | undefined {
+  try {
+    const value = localStorage.getItem(WALLPAPER_STORAGE_KEY);
+    // '' = ผู้ใช้ปิดภาพพื้นหลังเอง (ต่างจาก null ที่ยังไม่เคยเลือก → ใช้ภาพที่มากับแอป)
+    return value === '' || value?.startsWith('preset:') || value?.startsWith('data:image/') ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 const EMPTY_KEYS: Record<AIProvider, string> = {
   google: '',
@@ -27,6 +43,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   cwd: '',
   apiKeys: { ...EMPTY_KEYS },
   permissionRules: [],
+  wallpaperDim: 55,
+  wallpaperBlur: 0,
 };
 
 /** กรองกฎที่เสียหาย/รูปแบบเก่าทิ้ง */
@@ -85,9 +103,12 @@ function loadSettings(): AppSettings {
       cwd: typeof parsed.cwd === 'string' ? parsed.cwd : '',
       apiKeys,
       permissionRules: sanitizeRules(parsed.permissionRules),
+      wallpaper: loadWallpaper(),
+      wallpaperDim: clampNumber(parsed.wallpaperDim, 0, 90, DEFAULT_SETTINGS.wallpaperDim!),
+      wallpaperBlur: clampNumber(parsed.wallpaperBlur, 0, 20, DEFAULT_SETTINGS.wallpaperBlur!),
     };
   } catch {
-    return DEFAULT_SETTINGS;
+    return { ...DEFAULT_SETTINGS, wallpaper: loadWallpaper() };
   }
 }
 
@@ -174,11 +195,20 @@ export function useAppSettings(): {
       // keyring พร้อมแล้ว → ไม่มีคีย์ใน localStorage อีก (ครั้งแรกคือการย้ายคีย์เดิมออก)
       // ระหว่าง pending ยังเก็บคีย์เดิมไว้ เผื่อ keyring ใช้ไม่ได้
       const persisted = store === 'keyring' ? { ...EMPTY_KEYS } : apiKeys;
-      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify({ ...settings, apiKeys: persisted }));
+      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify({ ...settings, wallpaper: undefined, apiKeys: persisted }));
     } catch (e) {
       console.error('Failed to save settings:', e);
     }
   }, [settings]);
+
+  useEffect(() => {
+    try {
+      if (settings.wallpaper !== undefined) localStorage.setItem(WALLPAPER_STORAGE_KEY, settings.wallpaper);
+      else localStorage.removeItem(WALLPAPER_STORAGE_KEY);
+    } catch (e) {
+      console.error('Failed to save wallpaper:', e);
+    }
+  }, [settings.wallpaper]);
 
   const handleSelectWorkspace = async () => {
     const selected = await tauriBridge.selectFolder();

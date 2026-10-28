@@ -3,6 +3,7 @@ import { BrowserPane } from './components/BrowserPane';
 import { ChatHistorySidebar } from './components/ChatHistorySidebar';
 import { ChatMessageItem } from './components/ChatMessageItem';
 import { Composer } from './components/Composer';
+import { DexMark } from './components/DexMark';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { SettingsModal } from './components/SettingsModal';
 import { TerminalDrawer } from './components/TerminalDrawer';
@@ -14,6 +15,7 @@ import { browserPane } from './services/browser/pane';
 import type { AppSettings, PokemonTheme, ShellOutputEventPayload } from './types/agent';
 import { POKEMON_THEMES } from './types/agent';
 import { translations } from './utils/i18n';
+import { resolveWallpaper } from './utils/wallpapers';
 import { useAppSettings } from './hooks/useAppSettings';
 import { useResizablePanel } from './hooks/useResizablePanel';
 import { useChatSessions } from './hooks/useChatSessions';
@@ -46,6 +48,12 @@ function AppShell({ stored }: { stored: StoredSessions }) {
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [terminalLogs, setTerminalLogs] = useState<ShellOutputEventPayload[]>([]);
+  // แอนิเมชันตอนเปิดแอป — เอา class ออกหลังเล่นจบ ไม่ให้ sidebar เล่นซ้ำตอนพับ/กาง
+  const [entering, setEntering] = useState(true);
+  useEffect(() => {
+    const timer = setTimeout(() => setEntering(false), 1400);
+    return () => clearTimeout(timer);
+  }, []);
 
   // useChatSessions ต้องใช้สถานะของ useAgentChat (ซึ่งต้องใช้ setter จาก useChatSessions)
   // จึงเชื่อมกันผ่าน ref ที่อ่านตอนถูกเรียก ไม่ใช่ตอน render
@@ -125,6 +133,7 @@ function AppShell({ stored }: { stored: StoredSessions }) {
     if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
+  const wallpaperUrl = resolveWallpaper(settings.wallpaper);
   const updateSettings = (patch: Partial<AppSettings>) => setSettings((prev) => ({ ...prev, ...patch }));
   const currentSession = sessions.sessions.find((s) => s.id === sessions.currentSessionId);
   const lastMessageId = messages[messages.length - 1]?.id;
@@ -162,9 +171,22 @@ function AppShell({ stored }: { stored: StoredSessions }) {
 
   return (
     <div
-      className={`app ${layout.isDraggingSidebar ? 'is-resizing-x' : ''} ${layout.isDraggingTerminal ? 'is-resizing-y' : ''}`}
+      className={`app ${entering ? 'is-entering' : ''} ${wallpaperUrl ? 'has-wallpaper' : ''} ${layout.isDraggingSidebar ? 'is-resizing-x' : ''} ${layout.isDraggingTerminal ? 'is-resizing-y' : ''}`}
       lang={settings.language}
     >
+      {wallpaperUrl && (
+        <div
+          className="app-wallpaper"
+          aria-hidden="true"
+          style={
+            {
+              backgroundImage: `url("${wallpaperUrl}")`,
+              '--wallpaper-dim': `${settings.wallpaperDim ?? 55}%`,
+              '--wallpaper-blur': `${settings.wallpaperBlur ?? 0}px`,
+            } as React.CSSProperties
+          }
+        />
+      )}
       <ChatHistorySidebar
         sessions={sessions.sessions}
         currentSessionId={sessions.currentSessionId}
@@ -279,16 +301,34 @@ function AppShell({ stored }: { stored: StoredSessions }) {
   );
 }
 
+/** splash ตอนเปิดแอปแสดงอย่างน้อยเท่านี้ ให้แอนิเมชันโลโก้เล่นจบ */
+const SPLASH_MIN_MS = 1100;
+/** เวลาที่ splash ค่อยๆ หายไป — ต้องตรงกับ animation ของ .splash.is-leaving ใน CSS */
+const SPLASH_FADE_MS = 500;
+
 export function App() {
-  // ภาษาของหน้าจอ error อ่านจาก localStorage ตรงๆ เพราะ boundary อยู่นอก state ของแอป
-  let language: 'th' | 'en' = 'th';
-  try {
-    language = JSON.parse(localStorage.getItem('dex_agent_settings_v2') || '{}').language === 'en' ? 'en' : 'th';
-  } catch {
-    // ใช้ค่า default
-  }
+  // ภาษา/ธีมของหน้าจอ error และ splash อ่านจาก localStorage ตรงๆ เพราะอยู่นอก state ของแอป
+  const [language] = useState<'th' | 'en'>(() => {
+    let saved: Partial<AppSettings> = {};
+    try {
+      saved = JSON.parse(localStorage.getItem('dex_agent_settings_v2') || '{}');
+    } catch {
+      // ใช้ค่า default
+    }
+    // ใส่ธีมก่อนวาดครั้งแรก ไม่งั้น splash จะเป็นธีมสว่างแวบหนึ่งก่อน AppShell มาเปลี่ยน
+    const theme = saved.theme;
+    const fixed = theme === 'light' || theme === 'dark' || POKEMON_THEMES.includes(theme as PokemonTheme);
+    document.documentElement.dataset.theme = fixed
+      ? theme
+      : window.matchMedia('(prefers-color-scheme: dark)').matches
+        ? 'dark'
+        : 'light';
+    return saved.language === 'en' ? 'en' : 'th';
+  });
   // แชทเก็บเป็นไฟล์ (อ่านแบบ async) — รอให้โหลดเสร็จก่อนค่อยวาด ไม่งั้นแชทใหม่ที่ว่างเปล่าจะโผล่มาแวบหนึ่ง
   const [stored, setStored] = useState<StoredSessions | null>(null);
+  const [minSplashDone, setMinSplashDone] = useState(false);
+  const [splashGone, setSplashGone] = useState(false);
   useEffect(() => {
     loadStoredSessions()
       .catch((e) => {
@@ -296,8 +336,30 @@ export function App() {
         return { sessions: [], activeId: null };
       })
       .then(setStored);
+    const timer = setTimeout(() => setMinSplashDone(true), SPLASH_MIN_MS);
+    return () => clearTimeout(timer);
   }, []);
-  return <ErrorBoundary language={language}>{stored && <AppShell stored={stored} />}</ErrorBoundary>;
+  // วาดแอปตอน splash เริ่มหาย — แอนิเมชันเข้าของแอปจะเล่นพร้อมกับที่ splash จางออก
+  const ready = stored !== null && minSplashDone;
+  useEffect(() => {
+    if (!ready) return;
+    const timer = setTimeout(() => setSplashGone(true), SPLASH_FADE_MS);
+    return () => clearTimeout(timer);
+  }, [ready]);
+  return (
+    <ErrorBoundary language={language}>
+      {ready && <AppShell stored={stored} />}
+      {!splashGone && (
+        <div className={`splash ${ready ? 'is-leaving' : ''}`} aria-hidden="true">
+          <div className="splash-logo">
+            <span className="splash-ring" />
+            <DexMark size={88} />
+          </div>
+          <div className="splash-word">Dex</div>
+        </div>
+      )}
+    </ErrorBoundary>
+  );
 }
 
 export default App;
