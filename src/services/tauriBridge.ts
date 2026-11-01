@@ -191,6 +191,27 @@ export const tauriBridge = {
     return await invoke('write_file', { path, content, workspace, allowSensitive });
   },
 
+  /** อ่านไฟล์ไบนารีเป็น base64 */
+  async readBinaryFile(path: string, workspace?: string, allowSensitive = false): Promise<string> {
+    return await invoke('read_binary_file', { path, workspace, allowSensitive });
+  },
+
+  /** เขียนไฟล์ไบนารีจาก base64 — backup = เก็บไฟล์เดิมไว้เป็น `<ชื่อ>.dex-backup.<นามสกุล>` ก่อน */
+  async writeBinaryFile(
+    path: string,
+    data: string,
+    workspace?: string,
+    allowSensitive = false,
+    backup = false
+  ): Promise<{ message: string; backup: string | null }> {
+    return await invoke('write_binary_file', { path, data, workspace, allowSensitive, backup });
+  },
+
+  /** URL ของ G-docx (ตัวแก้ไฟล์ Word ที่ฝังมากับแอป) */
+  async gdocxUrl(): Promise<string> {
+    return await invoke('gdocx_url');
+  },
+
   async listDir(path: string, workspace?: string): Promise<FileItem[]> {
     return await invoke('list_dir', { path, workspace });
   },

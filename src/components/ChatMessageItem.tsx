@@ -204,6 +204,7 @@ const TOOL_ICONS: Record<string, React.ComponentType<{ size?: number; 'aria-hidd
   use_skill: Sparkles,
   web_fetch: Globe,
   browser: AppWindow,
+  docx: FileText,
 };
 
 const ToolCard: React.FC<{
@@ -235,7 +236,9 @@ const ToolCard: React.FC<{
               .filter(Boolean)
               .join(' ')
               .slice(0, 160)
-          : tool.args.command ||
+          : tool.name === 'docx'
+            ? [tool.args.action, tool.args.path].filter(Boolean).join(' ').slice(0, 160)
+            : tool.args.command ||
           tool.args.path ||
           tool.args.url ||
           tool.args.query ||

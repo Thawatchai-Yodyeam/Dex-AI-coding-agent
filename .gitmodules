@@ -1,0 +1,3 @@
+[submodule "plugins/gdocx"]
+	path = plugins/gdocx
+	url = https://github.com/Thawatchai-Yodyeam/G-docx.git

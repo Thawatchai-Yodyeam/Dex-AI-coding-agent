@@ -36,6 +36,8 @@ export interface BrowserDriver {
   /** URL ของหน้าที่เปิดอยู่ (null = ยังไม่ได้เปิด pane) */
   currentUrl(): Promise<string | null>;
   sleep(ms: number): Promise<void>;
+  /** ให้ pane โผล่ขึ้นมา แม้ผู้ใช้จะซ่อนไว้ */
+  show?(): Promise<void>;
 }
 
 export const paneDriver: BrowserDriver = {
@@ -43,6 +45,7 @@ export const paneDriver: BrowserDriver = {
   cdp: (method, params) => tauriBridge.browserCdp(method, params),
   currentUrl: () => tauriBridge.browserUrl(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  show: () => browserPane.ensureOpen(),
 };
 
 const SNAPSHOT_MAX_CHARS = 15_000;
@@ -67,7 +70,7 @@ export interface BrowserResult {
 /** สัดส่วน px ของ screenshot ต่อ CSS px ล่าสุด — click {x, y} รับพิกัดจากรูป แล้วแปลงกลับ */
 let screenshotScale = 1;
 
-async function evaluate(driver: BrowserDriver, expression: string): Promise<unknown> {
+export async function evaluate(driver: BrowserDriver, expression: string): Promise<unknown> {
   const res = await driver.cdp('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
   if (res?.exceptionDetails) {
     const ex = res.exceptionDetails;

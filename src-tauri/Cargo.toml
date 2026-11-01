@@ -26,6 +26,8 @@ keyring = { version = "3", features = ["windows-native", "apple-native"] }
 ureq = "2"
 html2text = "0.17.4"
 url = "2"
+base64 = "0.22"
+include_dir = "0.7"
 
 # เรียก DevTools protocol ของ WebView2 ใน browser pane — ต้องเป็นเวอร์ชันเดียวกับที่ wry ใช้
 [target.'cfg(windows)'.dependencies]

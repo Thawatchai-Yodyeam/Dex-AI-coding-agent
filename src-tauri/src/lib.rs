@@ -837,6 +837,69 @@ fn write_file(
     Ok(format!("บันทึกไฟล์ {} สำเร็จ", valid_path.display()))
 }
 
+// 5.1 ไฟล์ไบนารี (.docx) — ส่งเป็น base64 เพราะ read_file/write_file รับเฉพาะข้อความ
+const MAX_BINARY_FILE_BYTES: u64 = 30 * 1024 * 1024;
+
+#[derive(Serialize)]
+pub struct BinaryWriteResult {
+    pub message: String,
+    /// สำเนาของไฟล์เดิมก่อนเขียนทับ (ถ้าขอไว้และมีไฟล์เดิม)
+    pub backup: Option<String>,
+}
+
+/// `รายงาน.docx` → `รายงาน.dex-backup.docx` (เปิดใน Word ได้เลย)
+fn backup_path(path: &Path) -> PathBuf {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let name = match path.extension() {
+        Some(ext) => format!("{}.dex-backup.{}", stem, ext.to_string_lossy()),
+        None => format!("{}.dex-backup", stem),
+    };
+    path.with_file_name(name)
+}
+
+#[tauri::command]
+fn read_binary_file(path: String, workspace: Option<String>, allow_sensitive: Option<bool>) -> Result<String, String> {
+    use base64::Engine;
+    let valid_path = validate_workspace_path(&path, workspace.as_deref())?;
+    ensure_not_sensitive(&valid_path, allow_sensitive)?;
+    let meta = fs::metadata(&valid_path).map_err(|e| format!("ไม่สามารถอ่านไฟล์ {}: {}", valid_path.display(), e))?;
+    if meta.len() > MAX_BINARY_FILE_BYTES {
+        return Err(format!("ไฟล์ใหญ่เกิน {} MB", MAX_BINARY_FILE_BYTES / 1024 / 1024));
+    }
+    let bytes = fs::read(&valid_path).map_err(|e| format!("ไม่สามารถอ่านไฟล์ {}: {}", valid_path.display(), e))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+#[tauri::command]
+fn write_binary_file(
+    path: String,
+    data: String,
+    workspace: Option<String>,
+    allow_sensitive: Option<bool>,
+    backup: Option<bool>,
+) -> Result<BinaryWriteResult, String> {
+    use base64::Engine;
+    let valid_path = validate_workspace_path(&path, workspace.as_deref())?;
+    ensure_not_sensitive(&valid_path, allow_sensitive)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|e| format!("ข้อมูล base64 ไม่ถูกต้อง: {}", e))?;
+    if let Some(parent) = valid_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(|e| format!("สร้างโฟลเดอร์ไม่สำเร็จ: {}", e))?;
+        }
+    }
+    let mut saved_backup = None;
+    if backup.unwrap_or(false) && valid_path.is_file() {
+        let target = backup_path(&valid_path);
+        fs::copy(&valid_path, &target).map_err(|e| format!("สำรองไฟล์เดิมไม่สำเร็จ: {}", e))?;
+        saved_backup = Some(target.to_string_lossy().to_string());
+    }
+    write_atomic(&valid_path, &bytes)
+        .map_err(|e| format!("เขียนไฟล์ไม่สำเร็จ (ไฟล์อาจเปิดอยู่ในโปรแกรมอื่น): {}", e))?;
+    Ok(BinaryWriteResult { message: format!("บันทึกไฟล์ {} สำเร็จ", valid_path.display()), backup: saved_backup })
+}
+
 // 6. ดูรายชื่อไฟล์ในโฟลเดอร์ พร้อมระบบ Workspace Sandboxing
 #[tauri::command]
 fn list_dir(path: String, workspace: Option<String>) -> Result<Vec<FileEntry>, String> {
@@ -2002,6 +2065,105 @@ async fn select_folder() -> Result<Option<String>, String> {
 // 9. Browser pane: child webview ในหน้าต่างหลัก ให้ agent เปิดเว็บ (เช่น dev server) แล้วทดสอบเอง
 // คุมผ่าน DevTools protocol ของ WebView2 — หน้าเว็บใน pane เป็น origin ภายนอก Tauri จึงไม่ให้เรียกคำสั่งของแอป
 // ยกเว้นหน้าของตัวแอปเอง (devUrl / *.localhost) ที่ Tauri ถือเป็น origin ภายใน — จึงห้ามเปิดหน้าเหล่านั้นใน pane
+// 7.x G-docx: เว็บแอปแก้ไฟล์ Word ที่ฝังมากับ Dex เปิดใน browser pane แล้วให้ tool `docx` สั่งงาน
+// ต้องเสิร์ฟจาก origin ธรรมดา ไม่ใช่ของแอป: หน้าใน pane ต้องไม่ได้สิทธิ์เรียกคำสั่งของ Tauri (ดู is_app_url)
+static GDOCX_FILES: include_dir::Dir<'static> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/../plugins/gdocx");
+/// พอร์ตคงที่ให้ค่าที่ G-docx จำไว้ (origin เดิม) อยู่ข้ามการเปิดแอป — ถ้าไม่ว่างค่อยให้ระบบเลือก
+const GDOCX_PORT: u16 = 17420;
+static GDOCX_SERVER: std::sync::OnceLock<Result<u16, String>> = std::sync::OnceLock::new();
+
+/// เอกสารใน pane เป็นข้อมูลที่ไม่น่าเชื่อถือ: ถึงมีช่องโหว่ใน reader ก็ส่งเนื้อหาออกเน็ตหรือโหลดของนอกไม่ได้
+const GDOCX_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' data: blob:; media-src 'self' blob:; form-action 'none'; base-uri 'none'";
+
+/// เฉพาะไฟล์ของตัวแอป — ใน submodule มีไฟล์อื่นอย่าง .git และ README ที่ไม่ต้องเสิร์ฟ
+fn gdocx_file(path: &str) -> Option<&'static [u8]> {
+    let allowed = path == "index.html" || ["css/", "js/", "fonts/", "vendor/"].iter().any(|dir| path.starts_with(dir));
+    if !allowed {
+        return None;
+    }
+    GDOCX_FILES.get_file(path).map(|f| f.contents())
+}
+
+/// คืน (สถานะ, content type, เนื้อหา) — แยกจาก socket เพื่อให้เทสต์ได้
+fn gdocx_response(request: &str, port: u16) -> (&'static str, &'static str, &'static [u8]) {
+    let mut parts = request.lines().next().unwrap_or("").split_whitespace();
+    let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    if method != "GET" && method != "HEAD" {
+        return ("405 Method Not Allowed", "text/plain", b"method not allowed");
+    }
+    // กัน DNS rebinding: เว็บอื่นที่ชี้ชื่อโดเมนมาที่ 127.0.0.1 จะส่ง Host เป็นชื่อของตัวเอง
+    let host = format!("127.0.0.1:{}", port);
+    let host_ok = request
+        .lines()
+        .any(|l| l.split_once(':').is_some_and(|(k, v)| k.eq_ignore_ascii_case("host") && v.trim() == host));
+    if !host_ok {
+        return ("403 Forbidden", "text/plain", b"forbidden");
+    }
+    let path = target.split(['?', '#']).next().unwrap_or("").trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    let content_type = match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+    match gdocx_file(path) {
+        Some(body) => ("200 OK", content_type, body),
+        None => ("404 Not Found", "text/plain", b"not found"),
+    }
+}
+
+fn gdocx_handle(mut stream: std::net::TcpStream, port: u16) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut buf = [0u8; 8192];
+    let mut len = 0;
+    while len < buf.len() && !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = stream.read(&mut buf[len..])?;
+        if n == 0 {
+            break;
+        }
+        len += n;
+    }
+    let request = String::from_utf8_lossy(&buf[..len]);
+    let (status, content_type, body) = gdocx_response(&request, port);
+    let head = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Security-Policy: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        status,
+        content_type,
+        body.len(),
+        GDOCX_CSP
+    );
+    stream.write_all(head.as_bytes())?;
+    if !request.starts_with("HEAD") {
+        stream.write_all(body)?;
+    }
+    Ok(())
+}
+
+fn gdocx_start_server() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", GDOCX_PORT))
+        .or_else(|_| std::net::TcpListener::bind(("127.0.0.1", 0)))
+        .map_err(|e| format!("เปิด G-docx ไม่สำเร็จ: {}", e))?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let _ = gdocx_handle(stream, port);
+            });
+        }
+    });
+    Ok(port)
+}
+
+/// URL ของ G-docx ในเครื่อง (เปิดเซิร์ฟเวอร์ตอนใช้ครั้งแรก)
+#[tauri::command]
+fn gdocx_url() -> Result<String, String> {
+    let port = GDOCX_SERVER.get_or_init(gdocx_start_server).clone()?;
+    Ok(format!("http://127.0.0.1:{}/index.html?embedded", port))
+}
+
 const BROWSER_LABEL: &str = "dex-browser";
 
 /// method ของ DevTools protocol ที่ UI เรียกได้ — ไม่เปิดทั้งหมด (Network/Storage/Target ฯลฯ)
@@ -2228,6 +2390,9 @@ pub fn run() {
             read_file,
             read_file_lines,
             write_file,
+            read_binary_file,
+            write_binary_file,
+            gdocx_url,
             list_dir,
             get_initial_env,
             load_api_keys,
@@ -2279,6 +2444,31 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gdocx_serves_only_its_own_files() {
+        let req = |target: &str| format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:17420\r\n\r\n", target);
+        let status = |target: &str| gdocx_response(&req(target), 17420).0;
+        assert!(status("/index.html?embedded").starts_with("200"));
+        assert!(status("/js/api.js").starts_with("200"));
+        assert_eq!(gdocx_response(&req("/js/api.js"), 17420).1, "text/javascript; charset=utf-8");
+        assert!(status("/README.md").starts_with("404"));
+        assert!(status("/../src/lib.rs").starts_with("404"));
+        assert!(status("/js/../../secret").starts_with("404"));
+    }
+
+    #[test]
+    fn gdocx_rejects_other_hosts_and_methods() {
+        let other = "GET /index.html HTTP/1.1\r\nHost: evil.example:17420\r\n\r\n";
+        assert!(gdocx_response(other, 17420).0.starts_with("403"));
+        let post = "POST /index.html HTTP/1.1\r\nHost: 127.0.0.1:17420\r\n\r\n";
+        assert!(gdocx_response(post, 17420).0.starts_with("405"));
+    }
+
+    #[test]
+    fn backup_keeps_the_extension_so_word_can_open_it() {
+        assert_eq!(backup_path(Path::new(r"D:\w\report.docx")), PathBuf::from(r"D:\w\report.dex-backup.docx"));
+    }
 
     #[test]
     fn workspace_prefix_is_component_based() {

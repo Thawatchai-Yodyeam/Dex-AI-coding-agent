@@ -54,7 +54,7 @@
 ### ติดตั้งและรัน
 
 ```bash
-git clone https://github.com/Thawatchai-Yodyeam/Dex-AI-coding-agent.git
+git clone --recursive https://github.com/Thawatchai-Yodyeam/Dex-AI-coding-agent.git
 cd Dex-AI-coding-agent
 npm install
 npm run tauri dev
@@ -213,6 +213,8 @@ src/
     browser/
       pane.ts               สถานะของ browser pane + ตามตำแหน่งกรอบใน layout
       actions.ts            action ของ tool browser (navigate/snapshot/click/type/...) ผ่าน DevTools protocol
+    docx/
+      editor.ts             tool docx คุยกับ G-docx (plugins/gdocx ซึ่งเป็น git submodule) ใน browser pane
       pageScripts.ts        สคริปต์ที่รันในหน้าเว็บ (โครงหน้า + ref, เก็บ console)
     mcp/
       config.ts             อ่าน config แบบ Claude Desktop
