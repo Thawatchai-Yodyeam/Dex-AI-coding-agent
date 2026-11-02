@@ -15,11 +15,16 @@ const bridge = vi.hoisted(() => ({
     { name: 'css', path: 'x', is_dir: true, size: 0 },
   ]),
   writeFile: vi.fn(async () => 'saved'),
+  readFile: vi.fn(async (): Promise<string> => '[]'),
+  restoreFile: vi.fn(async () => 'restored'),
   editFile: vi.fn(async () => ({ success: true, message: 'edited', occurrences: 1 })),
   snapshotFile: vi.fn(async (): Promise<string | null> => null),
 }));
 vi.mock('../tauriBridge', () => ({ tauriBridge: bridge }));
-const canvas = vi.hoisted(() => ({ open: vi.fn(async (): Promise<string | null> => null) }));
+const canvas = vi.hoisted(() => ({
+  open: vi.fn(async (): Promise<string | null> => null),
+  reloadComments: vi.fn(async () => {}),
+}));
 vi.mock('../design/canvas', () => ({ designCanvas: canvas }));
 
 import { TOOL_DEFINITIONS, executeTool } from './tools';
@@ -72,7 +77,7 @@ describe('design tool', () => {
 
   it('rejects an unknown action', async () => {
     const { run } = setup();
-    expect((await run({ action: 'delete' })).error).toMatch(/Unknown design action/);
+    expect((await run({ action: 'destroy' })).error).toMatch(/Unknown design action/);
   });
 
   it('create returns the project and its guidelines', async () => {
@@ -106,7 +111,7 @@ describe('design tool', () => {
     expect(checkpoints).toEqual([INDEX, 'D:\\proj/.dex/designs/cafe/css/site.css']);
     expect(bridge.designCommit).toHaveBeenCalledTimes(1);
     expect(bridge.designCommit).toHaveBeenCalledWith('D:\\proj', 'cafe', 'First draft');
-    expect(canvas.open).toHaveBeenCalledWith('cafe');
+    expect(canvas.open).toHaveBeenCalledWith('cafe', { page: 'index.html' });
     expect(res.version).toBe(3);
     // หน้าจอแชทไม่ต้องเก็บ HTML ทั้งก้อน
     expect(JSON.stringify(records.at(-1)?.args)).not.toContain('<h1>');
@@ -120,7 +125,78 @@ describe('design tool', () => {
     expect(records.at(-1)?.status).toBe('completed');
   });
 
-  it.each(['../evil.html', 'a/../../evil.html', '/abs.html', 'C:\\x.html', '.hidden.html', 'design.json', 'run.exe', 'a b.html', 'หน้า.html'])(
+  it('write shows the first page it wrote, so variants appear straight away', async () => {
+    const { run } = setup();
+    await run({
+      action: 'write',
+      project: 'cafe',
+      files: [
+        { path: 'css/a.css', content: 'a{}' },
+        { path: 'variant-b.html', content: 'x' },
+        { path: 'variant-c.html', content: 'x' },
+      ],
+    });
+    expect(canvas.open).toHaveBeenCalledWith('cafe', { page: 'variant-b.html' });
+  });
+
+  it('write keeps the current page when it only changes other files', async () => {
+    const { run } = setup();
+    await run({ action: 'write', project: 'cafe', files: [{ path: 'css/a.css', content: 'a{}' }] });
+    expect(canvas.open).toHaveBeenCalledWith('cafe', {});
+  });
+
+  it('delete removes files as one new version and can be undone', async () => {
+    const { run, checkpoints } = setup();
+    const res = await run({ action: 'delete', project: 'cafe', paths: ['variant-b.html'] });
+    expect(bridge.restoreFile).toHaveBeenCalledWith('D:\\proj/.dex/designs/cafe/variant-b.html', null, 'D:\\proj');
+    expect(checkpoints).toEqual(['D:\\proj/.dex/designs/cafe/variant-b.html']);
+    expect(bridge.designCommit).toHaveBeenCalledTimes(1);
+    expect(res.version).toBe(3);
+  });
+
+  it.each(['../x.html', 'comments.json', 'design.json', '.versions/1/index.html'])('delete refuses %s', async (path) => {
+    const { run } = setup();
+    expect((await run({ action: 'delete', project: 'cafe', paths: [path] })).error).toMatch(/Invalid file path/);
+    expect(bridge.restoreFile).not.toHaveBeenCalled();
+  });
+
+  it('delete asks first in Supervised mode', async () => {
+    const { run, approvals } = setup('reject');
+    const res = await run({ action: 'delete', project: 'cafe', paths: ['a.html'] }, { ...base, autoPilot: false });
+    expect(approvals).toHaveLength(1);
+    expect(res.error).toMatch(/rejected/);
+    expect(bridge.restoreFile).not.toHaveBeenCalled();
+  });
+
+  const COMMENT = { id: 'c1', note: 'bigger', page: 'index.html', selector: '#a', tag: 'button', text: 'Buy', html: '<button>', width: 1440, device: 'desktop', at: 1, sent: true };
+
+  it('comments lists the open comments as data', async () => {
+    bridge.readFile.mockResolvedValueOnce(JSON.stringify([COMMENT]));
+    const { run } = setup();
+    const res = await run({ action: 'comments', project: 'cafe' });
+    expect(res.comments).toEqual([{ id: 'c1', note: 'bigger', page: 'index.html', selector: '#a', tag: 'button', text: 'Buy', screen_width: 1440 }]);
+    expect(res.note).toMatch(/only if the user asked/);
+  });
+
+  it('resolve removes the comments and refreshes the pins', async () => {
+    bridge.readFile.mockResolvedValueOnce(JSON.stringify([COMMENT, { ...COMMENT, id: 'c2' }]));
+    const { run } = setup();
+    const res = await run({ action: 'resolve', project: 'cafe', comment_ids: ['c1'] });
+    expect(res).toEqual({ project: 'cafe', resolved: 1, open: 1 });
+    const [path, text] = bridge.writeFile.mock.calls[0] as unknown as [string, string];
+    expect(path).toBe('.dex/designs/cafe/comments.json');
+    expect(JSON.parse(text).map((c: { id: string }) => c.id)).toEqual(['c2']);
+    expect(canvas.reloadComments).toHaveBeenCalledWith('cafe');
+  });
+
+  it('resolve validates the project before writing', async () => {
+    bridge.designVersions.mockRejectedValueOnce(new Error('bad project id'));
+    const { run } = setup();
+    expect((await run({ action: 'resolve', project: '../..', comment_ids: ['c1'] })).error).toBe('bad project id');
+    expect(bridge.writeFile).not.toHaveBeenCalled();
+  });
+
+  it.each(['../evil.html', 'a/../../evil.html', '/abs.html', 'C:\\x.html', '.hidden.html', 'design.json', 'comments.json', 'run.exe', 'a b.html', 'หน้า.html'])(
     'write refuses the path %s',
     async (path) => {
       const { run } = setup();
