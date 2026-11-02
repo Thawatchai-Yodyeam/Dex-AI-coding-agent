@@ -3,7 +3,7 @@ import { ArrowLeft, ArrowRight, RotateCw, ExternalLink, PanelRightClose, AppWind
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { browserPane } from '../services/browser/pane';
 import { designCanvas } from '../services/design/canvas';
-import { DesignNotices, DesignStage, DesignToolbar } from './DesignCanvas';
+import { DesignComments, DesignNotices, DesignPages, DesignStage, DesignToolbar } from './DesignCanvas';
 import type { Translation } from '../utils/i18n';
 
 const WIDTH_KEY = 'dex_browser_width';
@@ -36,7 +36,12 @@ function loadWidth(): number {
  * pane เบราว์เซอร์ทางขวา — ตัวหน้าเว็บเป็น native webview ที่ลอยทับกรอบ `.browser-viewport`
  * component นี้จึงคอยรายงานตำแหน่งของกรอบให้ webview ตามทุกครั้งที่ layout ขยับ
  */
-export const BrowserPane: React.FC<{ t: Translation; onStartDesign: () => void }> = ({ t, onStartDesign }) => {
+export const BrowserPane: React.FC<{
+  t: Translation;
+  onStartDesign: () => void;
+  agentRunning: boolean;
+  onSendDesignComments: (prompt: string) => boolean;
+}> = ({ t, onStartDesign, agentRunning, onSendDesignComments }) => {
   const state = useSyncExternalStore(browserPane.subscribe, browserPane.getState);
   const design = useSyncExternalStore(designCanvas.subscribe, designCanvas.getState);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -119,7 +124,9 @@ export const BrowserPane: React.FC<{ t: Translation; onStartDesign: () => void }
         <div className="resize-x" onMouseDown={startResize} title={t.dragToResize} aria-hidden="true" />
         <aside className="browser-pane" style={{ width }} aria-label={t.designTitle}>
           <DesignToolbar state={design} t={t} onStartDesign={onStartDesign} />
+          <DesignPages state={design} t={t} />
           <DesignNotices state={design} t={t} />
+          <DesignComments state={design} t={t} agentRunning={agentRunning} onSend={onSendDesignComments} />
           <DesignStage state={design} t={t} frameRef={viewportRef} onStartDesign={onStartDesign} />
         </aside>
       </>

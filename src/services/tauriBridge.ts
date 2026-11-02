@@ -338,6 +338,11 @@ export const tauriBridge = {
     await invoke('browser_set_bounds', { bounds });
   },
 
+  /** ดึง keyboard จาก webview ของ pane กลับมาที่หน้าแอป */
+  async browserFocusApp(): Promise<void> {
+    await invoke('browser_focus_app');
+  },
+
   async browserSetVisible(visible: boolean): Promise<void> {
     await invoke('browser_set_visible', { visible });
   },

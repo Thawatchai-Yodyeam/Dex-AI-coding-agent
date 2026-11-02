@@ -2177,8 +2177,11 @@ fn gdocx_url() -> Result<String, String> {
 // เสิร์ฟจาก origin ธรรมดาเหมือน G-docx — HTML ที่ AI เขียนต้องไม่ได้สิทธิ์เรียกคำสั่งของ Tauri (ดู is_app_url)
 const DESIGNS_DIR: &str = ".dex/designs";
 const DESIGN_META_FILE: &str = "design.json";
+/// ไฟล์ของแอปในโปรเจกต์ ไม่ใช่ส่วนของดีไซน์: ไม่เข้าเวอร์ชัน ไม่ถูก export และไม่เสิร์ฟ
+const DESIGN_APP_FILES: [&str; 2] = [DESIGN_META_FILE, "comments.json"];
 const DESIGN_VERSIONS_DIR: &str = ".versions";
 const DESIGN_VERSIONS_INDEX: &str = "index.json";
+const DESIGN_COMPARE_PAGE: &str = "__compare";
 const DESIGN_MAX_VERSIONS: usize = 30;
 
 static DESIGN_SERVER: std::sync::OnceLock<Result<u16, String>> = std::sync::OnceLock::new();
@@ -2248,13 +2251,14 @@ fn design_dir(workspace: Option<&str>, id: &str) -> Result<PathBuf, String> {
     if dir.is_dir() { Ok(dir) } else { Err(format!("ไม่พบโปรเจกต์ดีไซน์: {}", id)) }
 }
 
-/// ไฟล์ของดีไซน์ (พาธสัมพัทธ์) — ไม่รวม design.json, dotfile และ symlink ที่อาจชี้ออกนอกโปรเจกต์
+/// ไฟล์ของดีไซน์ (พาธสัมพัทธ์) — ไม่รวมไฟล์ของแอป, dotfile และ symlink ที่อาจชี้ออกนอกโปรเจกต์
 fn design_files(root: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else { return };
         for entry in entries.flatten() {
             let name = entry.file_name();
-            if name.to_string_lossy().starts_with('.') || (rel.as_os_str().is_empty() && name == DESIGN_META_FILE) {
+            let name_text = name.to_string_lossy();
+            if name_text.starts_with('.') || (rel.as_os_str().is_empty() && DESIGN_APP_FILES.contains(&&*name_text)) {
                 continue;
             }
             let Ok(kind) = entry.file_type() else { continue };
@@ -2441,6 +2445,58 @@ async fn design_preview_url(workspace: Option<String>, id: String, version: Opti
     Ok(format!("http://127.0.0.1:{}/{}/{}{}", port, token, prefix, page))
 }
 
+/// หน้าเทียบหลายแบบ: ทุกไฟล์ HTML ที่รากโปรเจกต์ใน iframe วางเคียงกัน ย่อให้พอดีช่อง
+/// ชื่อไฟล์ผ่าน is_design_segment แล้ว (ตัวอักษรปลอดภัย) และความกว้างเป็นตัวเลข จึงใส่ลง HTML ได้ตรง ๆ
+fn design_compare_page(root: &Path, target: &str) -> String {
+    let width = target
+        .split_once('?')
+        .and_then(|(_, query)| query.split('&').find_map(|pair| pair.strip_prefix("width=")))
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1440)
+        .clamp(200, 3000);
+    let mut pages: Vec<String> = design_files(root)
+        .iter()
+        .filter(|rel| rel.components().count() == 1)
+        .map(|rel| rel.to_string_lossy().to_string())
+        .filter(|name| is_design_segment(name) && (name.to_ascii_lowercase().ends_with(".html") || name.to_ascii_lowercase().ends_with(".htm")))
+        .collect();
+    pages.sort_by_key(|name| name != "index.html");
+    let cells: String = pages
+        .iter()
+        .map(|name| format!(r#"<figure><figcaption>{0}</figcaption><div class="f"><iframe src="{0}" title="{0}"></iframe></div></figure>"#, name))
+        .collect();
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>Compare</title><style>
+html,body{{margin:0;height:100%;background:#2a2926}}
+body{{display:grid;grid-template-columns:repeat(var(--cols),1fr);gap:12px;padding:12px;box-sizing:border-box;overflow-y:auto}}
+figure{{margin:0;min-width:0;display:flex;flex-direction:column;gap:8px}}
+figcaption{{color:#e8e4da;font:600 26px/1.3 system-ui,sans-serif;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.f{{overflow:hidden;background:#fff;border-radius:8px}}
+iframe{{display:block;border:0;transform-origin:0 0}}
+</style></head><body>{cells}<script>
+const WIDTH={width};
+const COUNT=document.querySelectorAll('figure').length;
+const COLS=Math.max(1,Math.min(COUNT,4));
+document.body.style.setProperty('--cols',COLS);
+function fit(){{
+  const cellWidth=(document.documentElement.clientWidth-24-12*(COLS-1))/COLS;
+  const cellHeight=Math.max(200,innerHeight-24-44);
+  const scale=cellWidth/WIDTH;
+  for(const box of document.querySelectorAll('.f')){{
+    box.style.width=cellWidth+'px';
+    box.style.height=cellHeight+'px';
+    const frame=box.firstElementChild;
+    frame.style.width=WIDTH+'px';
+    frame.style.height=(cellHeight/scale)+'px';
+    frame.style.transform='scale('+scale+')';
+  }}
+}}
+addEventListener('resize',fit);
+fit();
+</script></body></html>"#
+    )
+}
+
 /// คืน (สถานะ, content type, เนื้อหา) — แยกจาก socket เพื่อให้เทสต์ได้
 fn design_response(request: &str, port: u16, root_of: impl Fn(&str) -> Option<PathBuf>) -> (&'static str, &'static str, Vec<u8>) {
     let not_found = || ("404 Not Found", "text/plain", b"not found".to_vec());
@@ -2463,7 +2519,9 @@ fn design_response(request: &str, port: u16, root_of: impl Fn(&str) -> Option<Pa
             _ => return not_found(),
         }
         segments.drain(..2);
-    } else if segments == [DESIGN_META_FILE] {
+    } else if segments == [DESIGN_COMPARE_PAGE] {
+        return ("200 OK", "text/html; charset=utf-8", design_compare_page(&root, target).into_bytes());
+    } else if segments.len() == 1 && DESIGN_APP_FILES.contains(&segments[0]) {
         return not_found();
     }
     if segments.is_empty() || segments == [""] {
@@ -2658,6 +2716,13 @@ async fn browser_set_bounds(app: AppHandle, bounds: PaneBounds) -> Result<(), St
     }
 }
 
+/// หลังคลิกใน pane keyboard จะอยู่ที่ webview นั้น — ใช้ตอนต้องให้พิมพ์ต่อในหน้าแอป
+#[tauri::command]
+async fn browser_focus_app(app: AppHandle) -> Result<(), String> {
+    let webview = app.get_webview("main").ok_or_else(|| "ไม่พบหน้าต่างหลัก".to_string())?;
+    webview.set_focus().map_err(|e| e.to_string())
+}
+
 /// ซ่อนตอนมีหน้าต่างของแอปมาทับ (webview อยู่บนสุดเสมอ จะบัง modal) หรือตอนผู้ใช้ปิด pane — หน้าเว็บยังอยู่
 #[tauri::command]
 async fn browser_set_visible(app: AppHandle, visible: bool) -> Result<(), String> {
@@ -2776,6 +2841,7 @@ pub fn run() {
             browser_open,
             browser_set_bounds,
             browser_set_visible,
+            browser_focus_app,
             browser_url,
             browser_navigate,
             browser_cdp,
@@ -2882,6 +2948,45 @@ mod tests {
             assert!(get(blocked).0.starts_with("404"), "{} should be blocked", blocked);
         }
         let _ = fs::remove_file(outside);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn design_comments_stay_out_of_versions_exports_and_the_server() {
+        let root = design_temp_dir("comments");
+        fs::write(root.join("index.html"), "one").unwrap();
+        fs::write(root.join("comments.json"), "[]").unwrap();
+        assert_eq!(design_commit_files(&root, "first").unwrap().version, 1);
+        assert!(!root.join(".versions/1/comments.json").exists());
+        // แก้แค่คอมเมนต์ไม่ใช่เวอร์ชันใหม่ และ restore ไม่ลบคอมเมนต์
+        fs::write(root.join("comments.json"), "[{}]").unwrap();
+        assert_eq!(design_commit_files(&root, "again").unwrap().version, 1);
+        design_restore_files(&root, 1).unwrap();
+        assert_eq!(fs::read_to_string(root.join("comments.json")).unwrap(), "[{}]");
+        let req = "GET /t/comments.json HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\n";
+        assert!(design_response(req, 9000, |_| Some(root.clone())).0.starts_with("404"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn design_compare_page_lists_only_root_html_files() {
+        let root = design_temp_dir("compare");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        for name in ["index.html", "variant-a.html", "site.css", "sub/deep.html", "a b.html"] {
+            fs::write(root.join(name), "x").unwrap();
+        }
+        let get = |target: &str| {
+            let req = format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\n", target);
+            let (status, _, body) = design_response(&req, 9000, |_| Some(root.clone()));
+            (status, String::from_utf8(body).unwrap())
+        };
+        let (status, page) = get("/t/__compare?width=390");
+        assert!(status.starts_with("200"));
+        assert!(page.contains(r#"src="index.html""#) && page.contains(r#"src="variant-a.html""#));
+        assert!(!page.contains("site.css") && !page.contains("deep.html") && !page.contains("a b.html"));
+        assert!(page.contains("WIDTH=390"));
+        assert!(get("/t/__compare?width=<script>").1.contains("WIDTH=1440"));
+        assert!(get("/t/__compare?width=999999").1.contains("WIDTH=3000"));
         let _ = fs::remove_dir_all(root);
     }
 

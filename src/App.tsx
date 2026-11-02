@@ -14,7 +14,7 @@ import { loadStoredSessions, type StoredSessions } from './services/sessionStore
 import { browserPane } from './services/browser/pane';
 import { designCanvas } from './services/design/canvas';
 import type { AppSettings, PokemonTheme, ShellOutputEventPayload } from './types/agent';
-import { POKEMON_THEMES } from './types/agent';
+import { POKEMON_THEMES, requiresApiKey } from './types/agent';
 import { translations } from './utils/i18n';
 import { resolveWallpaper } from './utils/wallpapers';
 import { useAppSettings } from './hooks/useAppSettings';
@@ -301,7 +301,22 @@ function AppShell({ stored }: { stored: StoredSessions }) {
         />
       </main>
 
-      {browser.visible && <BrowserPane t={t} onStartDesign={() => chat.setInputPrompt(t.designStarterPrompt)} />}
+      {browser.visible && (
+        <BrowserPane
+          t={t}
+          onStartDesign={() => chat.setInputPrompt(t.designStarterPrompt)}
+          agentRunning={chat.isRunning}
+          onSendDesignComments={(prompt) => {
+            // handleSendMessage ไม่บอกว่าส่งไปจริงไหม จึงเช็กเงื่อนไขเดียวกันก่อน — ไม่มีคีย์ก็ให้ไปตั้งค่า
+            if (!settings.apiKeys[settings.provider]?.trim() && requiresApiKey(settings.provider)) {
+              setSettingsOpen(true);
+              return false;
+            }
+            void chat.handleSendMessage(prompt);
+            return true;
+          }}
+        />
+      )}
 
       <SettingsModal
         isOpen={settingsOpen}
