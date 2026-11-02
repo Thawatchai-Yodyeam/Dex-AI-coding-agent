@@ -2084,6 +2084,14 @@ fn gdocx_file(path: &str) -> Option<&'static [u8]> {
     GDOCX_FILES.get_file(path).map(|f| f.contents())
 }
 
+/// กัน DNS rebinding ของเซิร์ฟเวอร์ใน 127.0.0.1: เว็บอื่นที่ชี้ชื่อโดเมนมาที่นี่จะส่ง Host เป็นชื่อของตัวเอง
+fn http_host_ok(request: &str, port: u16) -> bool {
+    let host = format!("127.0.0.1:{}", port);
+    request
+        .lines()
+        .any(|l| l.split_once(':').is_some_and(|(k, v)| k.eq_ignore_ascii_case("host") && v.trim() == host))
+}
+
 /// คืน (สถานะ, content type, เนื้อหา) — แยกจาก socket เพื่อให้เทสต์ได้
 fn gdocx_response(request: &str, port: u16) -> (&'static str, &'static str, &'static [u8]) {
     let mut parts = request.lines().next().unwrap_or("").split_whitespace();
@@ -2091,12 +2099,7 @@ fn gdocx_response(request: &str, port: u16) -> (&'static str, &'static str, &'st
     if method != "GET" && method != "HEAD" {
         return ("405 Method Not Allowed", "text/plain", b"method not allowed");
     }
-    // กัน DNS rebinding: เว็บอื่นที่ชี้ชื่อโดเมนมาที่ 127.0.0.1 จะส่ง Host เป็นชื่อของตัวเอง
-    let host = format!("127.0.0.1:{}", port);
-    let host_ok = request
-        .lines()
-        .any(|l| l.split_once(':').is_some_and(|(k, v)| k.eq_ignore_ascii_case("host") && v.trim() == host));
-    if !host_ok {
+    if !http_host_ok(request, port) {
         return ("403 Forbidden", "text/plain", b"forbidden");
     }
     let path = target.split(['?', '#']).next().unwrap_or("").trim_start_matches('/');
@@ -2114,7 +2117,12 @@ fn gdocx_response(request: &str, port: u16) -> (&'static str, &'static str, &'st
     }
 }
 
-fn gdocx_handle(mut stream: std::net::TcpStream, port: u16) -> std::io::Result<()> {
+/// อ่าน request หนึ่งตัวจาก socket แล้วตอบด้วยผลของ `respond` (เซิร์ฟเวอร์ของ G-docx และ Dex Design)
+fn http_serve<B: AsRef<[u8]>>(
+    mut stream: std::net::TcpStream,
+    csp: &str,
+    respond: impl FnOnce(&str) -> (&'static str, &'static str, B),
+) -> std::io::Result<()> {
     use std::io::{Read, Write};
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut buf = [0u8; 8192];
@@ -2127,13 +2135,14 @@ fn gdocx_handle(mut stream: std::net::TcpStream, port: u16) -> std::io::Result<(
         len += n;
     }
     let request = String::from_utf8_lossy(&buf[..len]);
-    let (status, content_type, body) = gdocx_response(&request, port);
+    let (status, content_type, body) = respond(&request);
+    let body = body.as_ref();
     let head = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Security-Policy: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         status,
         content_type,
         body.len(),
-        GDOCX_CSP
+        csp
     );
     stream.write_all(head.as_bytes())?;
     if !request.starts_with("HEAD") {
@@ -2150,7 +2159,7 @@ fn gdocx_start_server() -> Result<u16, String> {
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             std::thread::spawn(move || {
-                let _ = gdocx_handle(stream, port);
+                let _ = http_serve(stream, GDOCX_CSP, |request| gdocx_response(request, port));
             });
         }
     });
@@ -2164,11 +2173,364 @@ fn gdocx_url() -> Result<String, String> {
     Ok(format!("http://127.0.0.1:{}/index.html?embedded", port))
 }
 
+// 7.y Dex Design: โปรเจกต์ดีไซน์อยู่ที่ <workspace>/.dex/designs/<id>/ และเปิดใน browser pane
+// เสิร์ฟจาก origin ธรรมดาเหมือน G-docx — HTML ที่ AI เขียนต้องไม่ได้สิทธิ์เรียกคำสั่งของ Tauri (ดู is_app_url)
+const DESIGNS_DIR: &str = ".dex/designs";
+const DESIGN_META_FILE: &str = "design.json";
+const DESIGN_VERSIONS_DIR: &str = ".versions";
+const DESIGN_VERSIONS_INDEX: &str = "index.json";
+const DESIGN_MAX_VERSIONS: usize = 30;
+
+static DESIGN_SERVER: std::sync::OnceLock<Result<u16, String>> = std::sync::OnceLock::new();
+/// token ใน URL → โฟลเดอร์ของโปรเจกต์ (สุ่มใหม่ทุกครั้งที่เปิดแอป โปรแกรมอื่นในเครื่องเดา URL ไม่ได้)
+static DESIGN_ROOTS: std::sync::LazyLock<Mutex<HashMap<String, PathBuf>>> = std::sync::LazyLock::new(Default::default);
+
+/// หน้าดีไซน์รัน script ของตัวเองและโหลดฟอนต์/ไลบรารีจาก CDN ได้ แต่ส่งข้อมูลออกด้วย fetch หรือ form ไม่ได้
+const DESIGN_CSP: &str = "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com; img-src 'self' data: blob: https:; font-src 'self' data: https://fonts.gstatic.com https://cdn.jsdelivr.net; media-src 'self' data: blob: https:; connect-src 'self'; form-action 'none'; base-uri 'self'";
+
+#[derive(Serialize, Deserialize)]
+struct DesignMeta {
+    title: String,
+    created_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct DesignVersion {
+    version: u32,
+    summary: String,
+    at: u64,
+}
+
+#[derive(Serialize)]
+struct DesignInfo {
+    id: String,
+    title: String,
+    created_at: u64,
+    updated_at: u64,
+    /// เวอร์ชันล่าสุด (0 = ยังไม่มี)
+    version: u32,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+fn is_design_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// ส่วนของพาธที่เสิร์ฟได้ — ไม่ต้องถอด %xx และตัด `..`, dotfile, ตัวคั่นแบบ Windows ทิ้งไปในตัว
+fn is_design_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.starts_with('.')
+        && segment.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn design_slug(title: &str) -> String {
+    let mut slug = String::new();
+    for c in title.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.truncate(40);
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() { "design".to_string() } else { slug.to_string() }
+}
+
+fn design_dir(workspace: Option<&str>, id: &str) -> Result<PathBuf, String> {
+    if !is_design_id(id) {
+        return Err(format!("ชื่อโปรเจกต์ดีไซน์ไม่ถูกต้อง: {}", id));
+    }
+    let dir = validate_workspace_path(&format!("{}/{}", DESIGNS_DIR, id), workspace)?;
+    if dir.is_dir() { Ok(dir) } else { Err(format!("ไม่พบโปรเจกต์ดีไซน์: {}", id)) }
+}
+
+/// ไฟล์ของดีไซน์ (พาธสัมพัทธ์) — ไม่รวม design.json, dotfile และ symlink ที่อาจชี้ออกนอกโปรเจกต์
+fn design_files(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') || (rel.as_os_str().is_empty() && name == DESIGN_META_FILE) {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                walk(&entry.path(), &rel.join(&name), out);
+            } else if kind.is_file() {
+                out.push(rel.join(&name));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, Path::new(""), &mut out);
+    out.sort();
+    out
+}
+
+fn design_copy_files(from: &Path, to: &Path) -> Result<(), String> {
+    for rel in design_files(from) {
+        let target = to.join(&rel);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("สร้างโฟลเดอร์ไม่สำเร็จ: {}", e))?;
+        }
+        fs::copy(from.join(&rel), &target).map_err(|e| format!("คัดลอก {} ไม่สำเร็จ: {}", rel.display(), e))?;
+    }
+    Ok(())
+}
+
+fn design_same_files(a: &Path, b: &Path) -> bool {
+    let files = design_files(a);
+    files == design_files(b)
+        && files.iter().all(|rel| match (fs::read(a.join(rel)), fs::read(b.join(rel))) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        })
+}
+
+fn design_read_versions(root: &Path) -> Vec<DesignVersion> {
+    fs::read_to_string(root.join(DESIGN_VERSIONS_DIR).join(DESIGN_VERSIONS_INDEX))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// เก็บสภาพปัจจุบันเป็นเวอร์ชันใหม่ — ไฟล์ไม่ต่างจากเวอร์ชันล่าสุดก็คืนเวอร์ชันเดิม
+fn design_commit_files(root: &Path, summary: &str) -> Result<DesignVersion, String> {
+    let versions_dir = root.join(DESIGN_VERSIONS_DIR);
+    let mut versions = design_read_versions(root);
+    if let Some(last) = versions.last() {
+        if design_same_files(root, &versions_dir.join(last.version.to_string())) {
+            return Ok(last.clone());
+        }
+    }
+    let entry = DesignVersion {
+        version: versions.last().map(|v| v.version).unwrap_or(0) + 1,
+        summary: summary.trim().chars().take(200).collect(),
+        at: now_ms(),
+    };
+    let snapshot = versions_dir.join(entry.version.to_string());
+    fs::create_dir_all(&snapshot).map_err(|e| format!("บันทึกเวอร์ชันไม่สำเร็จ: {}", e))?;
+    design_copy_files(root, &snapshot)?;
+    versions.push(entry.clone());
+    while versions.len() > DESIGN_MAX_VERSIONS {
+        let oldest = versions.remove(0);
+        let _ = fs::remove_dir_all(versions_dir.join(oldest.version.to_string()));
+    }
+    let index = serde_json::to_string_pretty(&versions).map_err(|e| e.to_string())?;
+    write_atomic(&versions_dir.join(DESIGN_VERSIONS_INDEX), index.as_bytes()).map_err(|e| format!("บันทึกเวอร์ชันไม่สำเร็จ: {}", e))?;
+    Ok(entry)
+}
+
+/// เอาเวอร์ชันเก่ากลับมา — สภาพปัจจุบันถูกเก็บเป็นเวอร์ชันไว้ก่อนเสมอ จึงย้อนกลับได้อีก
+fn design_restore_files(root: &Path, version: u32) -> Result<DesignVersion, String> {
+    let source = root.join(DESIGN_VERSIONS_DIR).join(version.to_string());
+    if !source.is_dir() {
+        return Err(format!("ไม่พบเวอร์ชัน {}", version));
+    }
+    design_commit_files(root, &format!("Before restoring v{}", version))?;
+    for rel in design_files(root) {
+        fs::remove_file(root.join(&rel)).map_err(|e| format!("ลบ {} ไม่สำเร็จ: {}", rel.display(), e))?;
+    }
+    design_copy_files(&source, root)?;
+    design_commit_files(root, &format!("Restored v{}", version))
+}
+
+fn design_info(root: &Path, id: &str) -> Option<DesignInfo> {
+    let meta: DesignMeta = serde_json::from_str(&fs::read_to_string(root.join(DESIGN_META_FILE)).ok()?).ok()?;
+    let last = design_read_versions(root).pop();
+    Some(DesignInfo {
+        id: id.to_string(),
+        title: meta.title,
+        created_at: meta.created_at,
+        updated_at: last.as_ref().map(|v| v.at).unwrap_or(meta.created_at),
+        version: last.map(|v| v.version).unwrap_or(0),
+    })
+}
+
+#[tauri::command]
+async fn design_list(workspace: Option<String>) -> Result<Vec<DesignInfo>, String> {
+    let dir = validate_workspace_path(DESIGNS_DIR, workspace.as_deref())?;
+    let Ok(entries) = fs::read_dir(&dir) else { return Ok(Vec::new()) };
+    let mut list: Vec<DesignInfo> = entries
+        .flatten()
+        .filter_map(|e| design_info(&e.path(), &e.file_name().to_string_lossy()))
+        .filter(|info| is_design_id(&info.id))
+        .collect();
+    list.sort_by_key(|info| std::cmp::Reverse(info.updated_at));
+    Ok(list)
+}
+
+#[tauri::command]
+async fn design_create(workspace: Option<String>, title: String) -> Result<DesignInfo, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("ต้องตั้งชื่อโปรเจกต์ดีไซน์".to_string());
+    }
+    let parent = validate_workspace_path(DESIGNS_DIR, workspace.as_deref())?;
+    let slug = design_slug(title);
+    let id = (1..)
+        .map(|n| if n == 1 { slug.clone() } else { format!("{}-{}", slug, n) })
+        .find(|candidate| !parent.join(candidate).exists())
+        .unwrap();
+    let root = parent.join(&id);
+    fs::create_dir_all(&root).map_err(|e| format!("สร้างโปรเจกต์ไม่สำเร็จ: {}", e))?;
+    let meta = serde_json::to_string_pretty(&DesignMeta { title: title.to_string(), created_at: now_ms() }).map_err(|e| e.to_string())?;
+    write_atomic(&root.join(DESIGN_META_FILE), meta.as_bytes()).map_err(|e| format!("สร้างโปรเจกต์ไม่สำเร็จ: {}", e))?;
+    // สำเนาเวอร์ชันเก่าไม่ต้องเข้า git ของผู้ใช้
+    write_atomic(&root.join(".gitignore"), format!("{}/\n", DESIGN_VERSIONS_DIR).as_bytes()).map_err(|e| format!("สร้างโปรเจกต์ไม่สำเร็จ: {}", e))?;
+    design_info(&root, &id).ok_or_else(|| "สร้างโปรเจกต์ไม่สำเร็จ".to_string())
+}
+
+#[tauri::command]
+async fn design_commit(workspace: Option<String>, id: String, summary: String) -> Result<DesignVersion, String> {
+    design_commit_files(&design_dir(workspace.as_deref(), &id)?, &summary)
+}
+
+#[tauri::command]
+async fn design_versions(workspace: Option<String>, id: String) -> Result<Vec<DesignVersion>, String> {
+    Ok(design_read_versions(&design_dir(workspace.as_deref(), &id)?))
+}
+
+#[tauri::command]
+async fn design_restore(workspace: Option<String>, id: String, version: u32) -> Result<DesignVersion, String> {
+    design_restore_files(&design_dir(workspace.as_deref(), &id)?, version)
+}
+
+/// คัดลอกไฟล์ดีไซน์ไปโฟลเดอร์ที่ผู้ใช้เลือกจากกล่อง dialog (อยู่นอก workspace ได้) ไม่ทับของเดิม
+#[tauri::command]
+async fn design_export(workspace: Option<String>, id: String, destination: String) -> Result<String, String> {
+    let root = design_dir(workspace.as_deref(), &id)?;
+    let parent = PathBuf::from(destination);
+    if !parent.is_dir() {
+        return Err("ไม่พบโฟลเดอร์ปลายทาง".to_string());
+    }
+    let target = (1..)
+        .map(|n| parent.join(if n == 1 { id.clone() } else { format!("{}-{}", id, n) }))
+        .find(|candidate| !candidate.exists())
+        .unwrap();
+    design_copy_files(&root, &target)?;
+    Ok(target.to_string_lossy().to_string())
+}
+
+/// URL ของหน้าดีไซน์ — `version` ว่าง = สภาพปัจจุบัน
+#[tauri::command]
+async fn design_preview_url(workspace: Option<String>, id: String, version: Option<u32>, page: Option<String>) -> Result<String, String> {
+    let root = fs::canonicalize(design_dir(workspace.as_deref(), &id)?).map_err(|e| e.to_string())?;
+    let page = page.filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "index.html".to_string());
+    if !page.split('/').all(is_design_segment) {
+        return Err(format!("ชื่อหน้าไม่ถูกต้อง: {}", page));
+    }
+    let prefix = version.map(|v| format!("{}/{}/", DESIGN_VERSIONS_DIR, v)).unwrap_or_default();
+    if !root.join(&prefix).join(&page).is_file() {
+        return Err(format!("โปรเจกต์นี้ยังไม่มีไฟล์ {}{}", prefix, page));
+    }
+    let port = DESIGN_SERVER.get_or_init(design_start_server).clone()?;
+    let mut roots = DESIGN_ROOTS.lock().unwrap();
+    let token = match roots.iter().find(|(_, r)| **r == root) {
+        Some((token, _)) => token.clone(),
+        None => {
+            let token = uuid::Uuid::new_v4().simple().to_string();
+            roots.insert(token.clone(), root);
+            token
+        }
+    };
+    Ok(format!("http://127.0.0.1:{}/{}/{}{}", port, token, prefix, page))
+}
+
+/// คืน (สถานะ, content type, เนื้อหา) — แยกจาก socket เพื่อให้เทสต์ได้
+fn design_response(request: &str, port: u16, root_of: impl Fn(&str) -> Option<PathBuf>) -> (&'static str, &'static str, Vec<u8>) {
+    let not_found = || ("404 Not Found", "text/plain", b"not found".to_vec());
+    let mut parts = request.lines().next().unwrap_or("").split_whitespace();
+    let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    if method != "GET" && method != "HEAD" {
+        return ("405 Method Not Allowed", "text/plain", b"method not allowed".to_vec());
+    }
+    if !http_host_ok(request, port) {
+        return ("403 Forbidden", "text/plain", b"forbidden".to_vec());
+    }
+    let path = target.split(['?', '#']).next().unwrap_or("").trim_start_matches('/');
+    let mut segments: Vec<&str> = path.split('/').collect();
+    let Some(root) = root_of(segments.remove(0)) else { return not_found() };
+    let mut file = root.clone();
+    // dotfile เดียวที่เปิดได้: สำเนาเวอร์ชันเก่า .versions/<เลข>/
+    if segments.first() == Some(&DESIGN_VERSIONS_DIR) {
+        match segments.get(1) {
+            Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => file = file.join(DESIGN_VERSIONS_DIR).join(n),
+            _ => return not_found(),
+        }
+        segments.drain(..2);
+    } else if segments == [DESIGN_META_FILE] {
+        return not_found();
+    }
+    if segments.is_empty() || segments == [""] {
+        segments = vec!["index.html"];
+    }
+    if !segments.iter().all(|s| is_design_segment(s)) {
+        return not_found();
+    }
+    let name = segments[segments.len() - 1];
+    if is_sensitive_name(name) {
+        return not_found();
+    }
+    let content_type = match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "txt" | "md" => "text/plain; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        _ => return not_found(),
+    };
+    for segment in &segments {
+        file.push(segment);
+    }
+    // canonicalize ตาม symlink แล้วเทียบอีกที กันลิงก์ในโปรเจกต์ที่ชี้ออกไปนอก
+    let Ok(real) = fs::canonicalize(&file) else { return not_found() };
+    if !is_within(&real, &root) || !real.is_file() {
+        return not_found();
+    }
+    match fs::read(&real) {
+        Ok(body) => ("200 OK", content_type, body),
+        Err(_) => not_found(),
+    }
+}
+
+fn design_start_server() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("เปิดเซิร์ฟเวอร์ของ Dex Design ไม่สำเร็จ: {}", e))?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let _ = http_serve(stream, DESIGN_CSP, |request| {
+                    design_response(request, port, |token| DESIGN_ROOTS.lock().unwrap().get(token).cloned())
+                });
+            });
+        }
+    });
+    Ok(port)
+}
+
 const BROWSER_LABEL: &str = "dex-browser";
 
 /// method ของ DevTools protocol ที่ UI เรียกได้ — ไม่เปิดทั้งหมด (Network/Storage/Target ฯลฯ)
 const BROWSER_CDP_METHODS: &[&str] = &[
     "Runtime.evaluate",
+    "Emulation.setDeviceMetricsOverride",
+    "Emulation.clearDeviceMetricsOverride",
     "Page.captureScreenshot",
     "Page.reload",
     "Page.getNavigationHistory",
@@ -2393,6 +2755,13 @@ pub fn run() {
             read_binary_file,
             write_binary_file,
             gdocx_url,
+            design_list,
+            design_create,
+            design_commit,
+            design_versions,
+            design_restore,
+            design_export,
+            design_preview_url,
             list_dir,
             get_initial_env,
             load_api_keys,
@@ -2463,6 +2832,115 @@ mod tests {
         assert!(gdocx_response(other, 17420).0.starts_with("403"));
         let post = "POST /index.html HTTP/1.1\r\nHost: 127.0.0.1:17420\r\n\r\n";
         assert!(gdocx_response(post, 17420).0.starts_with("405"));
+    }
+
+    fn design_temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dex-design-test-{}-{}", name, uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::canonicalize(dir).unwrap()
+    }
+
+    #[test]
+    fn design_server_serves_only_project_files_to_the_right_token() {
+        let root = design_temp_dir("serve");
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::create_dir_all(root.join(".versions/2")).unwrap();
+        fs::write(root.join("index.html"), "<h1>now</h1>").unwrap();
+        fs::write(root.join("assets/app.css"), "a{}").unwrap();
+        fs::write(root.join("design.json"), "{}").unwrap();
+        fs::write(root.join(".gitignore"), ".versions/").unwrap();
+        fs::write(root.join("server.key"), "secret").unwrap();
+        fs::write(root.join("data.bin"), "x").unwrap();
+        fs::write(root.join(".versions/2/index.html"), "<h1>old</h1>").unwrap();
+        fs::write(root.join(".versions/index.json"), "[]").unwrap();
+        let outside = root.parent().unwrap().join(format!("{}-outside.html", root.file_name().unwrap().to_string_lossy()));
+        fs::write(&outside, "secret").unwrap();
+
+        let get = |target: &str| {
+            let req = format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\n", target);
+            design_response(&req, 9000, |token| (token == "tok").then(|| root.clone()))
+        };
+        assert_eq!(get("/tok/").2, b"<h1>now</h1>");
+        assert_eq!(get("/tok").2, b"<h1>now</h1>");
+        assert_eq!(get("/tok/index.html?x=1").1, "text/html; charset=utf-8");
+        assert_eq!(get("/tok/assets/app.css").1, "text/css; charset=utf-8");
+        assert_eq!(get("/tok/.versions/2/index.html").2, b"<h1>old</h1>");
+        for blocked in [
+            "/wrong/index.html",
+            "/index.html",
+            "/tok/design.json",
+            "/tok/.gitignore",
+            "/tok/server.key",
+            "/tok/data.bin",
+            "/tok/.versions/index.json",
+            "/tok/.versions/x/index.html",
+            "/tok/../outside.html",
+            "/tok/%2e%2e/outside.html",
+            "/tok/assets/../../outside.html",
+            "/tok/..\\outside.html",
+        ] {
+            assert!(get(blocked).0.starts_with("404"), "{} should be blocked", blocked);
+        }
+        let _ = fs::remove_file(outside);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn design_server_rejects_other_hosts_and_methods() {
+        let root = |_: &str| Some(PathBuf::from("."));
+        assert!(design_response("GET /t/ HTTP/1.1\r\nHost: evil.example:9000\r\n\r\n", 9000, root).0.starts_with("403"));
+        assert!(design_response("POST /t/ HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\n", 9000, root).0.starts_with("405"));
+    }
+
+    #[test]
+    fn design_versions_round_trip_and_keep_the_state_before_restore() {
+        let root = design_temp_dir("versions");
+        fs::write(root.join("design.json"), "{}").unwrap();
+        fs::write(root.join("index.html"), "one").unwrap();
+        assert_eq!(design_commit_files(&root, "first").unwrap().version, 1);
+        // ไฟล์ไม่เปลี่ยน = ไม่สร้างเวอร์ชันใหม่
+        assert_eq!(design_commit_files(&root, "again").unwrap().version, 1);
+        fs::write(root.join("index.html"), "two").unwrap();
+        fs::write(root.join("extra.css"), "b{}").unwrap();
+        assert_eq!(design_commit_files(&root, "second").unwrap().version, 2);
+        // แก้ค้างไว้โดยยังไม่ commit — ต้องไม่หายตอน restore
+        fs::write(root.join("index.html"), "unsaved").unwrap();
+
+        let restored = design_restore_files(&root, 1).unwrap();
+        assert_eq!(restored.version, 4);
+        assert_eq!(fs::read_to_string(root.join("index.html")).unwrap(), "one");
+        assert!(!root.join("extra.css").exists(), "files added after v1 are gone");
+        assert_eq!(fs::read_to_string(root.join(".versions/3/index.html")).unwrap(), "unsaved");
+        assert!(design_restore_files(&root, 99).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn design_versions_are_capped() {
+        let root = design_temp_dir("cap");
+        for n in 0..DESIGN_MAX_VERSIONS + 2 {
+            fs::write(root.join("index.html"), n.to_string()).unwrap();
+            design_commit_files(&root, "edit").unwrap();
+        }
+        let versions = design_read_versions(&root);
+        assert_eq!(versions.len(), DESIGN_MAX_VERSIONS);
+        assert_eq!(versions[0].version, 3);
+        assert!(!root.join(".versions/2").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn design_names_cannot_escape_the_project() {
+        assert_eq!(design_slug("Landing Page: V2!"), "landing-page-v2");
+        assert_eq!(design_slug("หน้าแรก"), "design");
+        assert!(is_design_id("landing-page-2"));
+        for id in ["", "..", "../x", "a/b", "a\\b", "A", ".hidden"] {
+            assert!(!is_design_id(id), "{:?}", id);
+        }
+        assert!(is_design_segment("index.html"));
+        for segment in ["", ".", "..", ".env", "a b", "a%2fb", "a\\b", "หน้า.html"] {
+            assert!(!is_design_segment(segment), "{:?}", segment);
+        }
     }
 
     #[test]

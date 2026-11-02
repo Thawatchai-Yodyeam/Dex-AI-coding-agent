@@ -12,6 +12,8 @@ import {
   type DocxAction,
   type DocxInfo,
 } from '../docx/editor';
+import { designCanvas } from '../design/canvas';
+import { DESIGN_GUIDELINES } from '../design/guidelines';
 import { readSkill } from './skills';
 import { evaluateRules, isSensitiveFileError, relativeToWorkspace, suggestShellPattern } from './permissions';
 import { supportsImages } from '../../types/agent';
@@ -31,6 +33,12 @@ const READ_FILE_MAX_CHARS = 32_000;
 const WEB_PAGE_CHARS = 20_000;
 const WEB_CACHE_TTL_MS = 15 * 60_000;
 const WEB_CACHE_MAX_PAGES = 20;
+
+const DESIGN_ACTIONS = ['list', 'create', 'write', 'edit', 'open', 'versions', 'restore'] as const;
+type DesignAction = (typeof DESIGN_ACTIONS)[number];
+
+/** ไฟล์ที่ agent เขียนลงโปรเจกต์ดีไซน์ได้ — ชื่อต้องเป็นแบบที่เซิร์ฟเวอร์ฝั่ง Rust เสิร์ฟ (ดู is_design_segment) */
+const DESIGN_FILE_PATH = /^[A-Za-z0-9_-][A-Za-z0-9._-]*(\/[A-Za-z0-9_-][A-Za-z0-9._-]*)*\.(html|htm|css|js|mjs|json|svg|txt|md)$/i;
 
 /**
  * แหล่งเดียวของ tool schema (JSON Schema) — provider ทุกตัวแปลงจากตรงนี้
@@ -293,6 +301,57 @@ export const TOOL_DEFINITIONS = [
             required: ['op'],
           },
         },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'design',
+    description:
+      'Dex Design: create visual design projects (websites, app screens, landing pages, prototypes, posters, slides as HTML) that the user sees live on a canvas beside the chat, with device sizes and version history. ' +
+      'Use it when the user asks to design or mock up something visual, not when changing their existing app. ' +
+      'Actions: list shows the projects in this workspace. create {title} starts a project and returns design guidelines: read them. ' +
+      'write {project, files: [{path, content}], summary} creates or overwrites files in one saved version and shows the result; index.html is the entry point. ' +
+      'edit {project, path, edits: [{target_content, replacement_content, replace_all}], summary} changes part of a file, with the same matching rules as multi_edit_file; prefer it for small changes. ' +
+      'open {project, version, page} shows a project and returns its guidelines and files; call it before continuing an existing project. ' +
+      'versions {project} lists saved versions. restore {project, version} brings an old version back as a new version. ' +
+      'Read project files with read_file at .dex/designs/<project>/, but always change them with this tool so that versions are kept. ' +
+      'After writing, the page is open in the browser pane, so use the browser tool to check it.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: [...DESIGN_ACTIONS] },
+        title: { type: 'string', description: 'create: project name' },
+        project: { type: 'string', description: 'Project id returned by create or list' },
+        files: {
+          type: 'array',
+          description: 'write: files to save',
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'Relative to the project, e.g. index.html or css/site.css' },
+              content: { type: 'string', description: 'Complete file contents' },
+            },
+            required: ['path', 'content'],
+          },
+        },
+        path: { type: 'string', description: 'edit: file to change, relative to the project' },
+        edits: {
+          type: 'array',
+          description: 'edit: changes to apply in order',
+          items: {
+            type: 'object',
+            properties: {
+              target_content: { type: 'string', description: 'Existing text to replace' },
+              replacement_content: { type: 'string', description: 'New text' },
+              replace_all: { type: 'boolean', description: 'Replace every occurrence. Default false' },
+            },
+            required: ['target_content', 'replacement_content'],
+          },
+        },
+        summary: { type: 'string', description: 'write/edit: a few words on what changed, shown in the version list' },
+        version: { type: 'number', description: 'open/restore: version number' },
+        page: { type: 'string', description: 'open: file to show (default index.html)' },
       },
       required: ['action'],
     },
@@ -718,6 +777,164 @@ const DOCX_HANDLERS: Record<DocxAction, ToolHandler> = {
   },
 };
 
+/** `index.html` → `D:/ws/.dex/designs/<id>/index.html` หรือ null ถ้าชื่อไฟล์ใช้ไม่ได้ */
+function designFilePath(env: ToolEnv, project: string, file: string): string | null {
+  const rel = file.trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!DESIGN_FILE_PATH.test(rel) || rel.toLowerCase() === 'design.json') return null;
+  return resolveWorkspacePath(env.settings.cwd, `.dex/designs/${project}/${rel}`);
+}
+
+const INVALID_DESIGN_FILE =
+  'Invalid file path. Use a relative path with letters, digits, ".", "_" and "-" only, ending in .html, .css, .js, .json, .svg, .txt or .md. To add images or fonts, copy them into the project with run_shell_command.';
+
+/** ผลที่บอกโมเดลหลังบันทึกเวอร์ชัน + เปิดหน้าให้ผู้ใช้เห็น */
+async function saveDesignVersion(env: ToolEnv, project: string, summary: string) {
+  const saved = await tauriBridge.designCommit(env.settings.cwd, project, summary);
+  // ยังไม่มี index.html (เช่น เพิ่งเขียนแค่ CSS) ไม่ถือว่า tool ล้มเหลว ไฟล์บันทึกแล้ว
+  const previewError = await designCanvas.open(project);
+  env.record.status = 'completed';
+  env.record.output = `v${saved.version}`;
+  return {
+    project,
+    version: saved.version,
+    ...(previewError
+      ? { note: `Saved, but the page could not be shown: ${previewError}` }
+      : { note: 'Saved and shown on the canvas. Check it with the browser tool (console, snapshot, screenshot).' }),
+  };
+}
+
+/** tool `design`: ตรวจสิทธิ์เหมือนการแก้ไฟล์ปกติ แล้วเก็บเวอร์ชันและเปิดหน้าบน canvas */
+const DESIGN_HANDLERS: Record<DesignAction, ToolHandler> = {
+  async list(_args, env) {
+    markRunning(env);
+    const projects = await tauriBridge.designList(env.settings.cwd);
+    env.record.status = 'completed';
+    env.record.output = `${projects.length} projects`;
+    return { projects };
+  },
+
+  async create(args, env) {
+    const title = str(args.title ?? args.name).trim();
+    if (!title) return failTool(env, 'create needs a title');
+    const guard = checkFileRules(env, 'edit', resolveWorkspacePath(env.settings.cwd, '.dex/designs'));
+    if (guard.denied) return guard.denied;
+    if (!guard.allowed && !env.settings.autoPilot) {
+      const rejected = await requireApproval(env, 'User rejected creating the design project', 'supervised');
+      if (rejected) return rejected;
+    }
+    markRunning(env);
+    const info = await tauriBridge.designCreate(env.settings.cwd, title);
+    env.record.args.project = info.id;
+    env.record.status = 'completed';
+    env.record.output = info.id;
+    return { project: info.id, title: info.title, folder: `.dex/designs/${info.id}`, guidelines: DESIGN_GUIDELINES };
+  },
+
+  async write(args, env) {
+    const project = str(args.project ?? args.id).trim();
+    let files = args.files;
+    if (typeof files === 'string') {
+      try {
+        files = JSON.parse(files);
+      } catch {
+        files = null;
+      }
+    }
+    if (!Array.isArray(files) && args.path !== undefined) files = [{ path: args.path, content: args.content }];
+    if (!project || !Array.isArray(files) || files.length === 0) {
+      return failTool(env, 'write needs project and a non-empty files array of { path, content }');
+    }
+    const targets: { path: string; rel: string; content: string }[] = [];
+    for (const file of files) {
+      const path = designFilePath(env, project, str(file?.path));
+      if (!path) return failTool(env, `${INVALID_DESIGN_FILE} Got: ${str(file?.path)}`);
+      const guard = checkFileRules(env, 'edit', path);
+      if (guard.denied) return guard.denied;
+      targets.push({ path, rel: guard.rel, content: str(file.content) });
+    }
+    // เนื้อหาไฟล์เก็บในประวัติของโมเดลอยู่แล้ว ไม่ต้องบันทึกซ้ำในแชทที่แสดงผล
+    env.record.args = { action: 'write', project, path: targets.map((t) => t.rel).join(', ') };
+    // ฝั่ง Rust ตรวจว่า id ถูกรูปแบบและโปรเจกต์มีจริง (กัน `../..` ใน project) ก่อนจะเขียนอะไร
+    await tauriBridge.designVersions(env.settings.cwd, project);
+    const allowedByRule = targets.every((t) => checkFileRules(env, 'edit', t.path).allowed);
+    if (!allowedByRule && !env.settings.autoPilot) {
+      const rejected = await requireApproval(env, 'User rejected writing the design files', 'supervised');
+      if (rejected) return rejected;
+    }
+    markRunning(env);
+    for (const target of targets) {
+      await checkpointBeforeWrite(env, target.path, false);
+      await tauriBridge.writeFile(target.path, target.content, env.settings.cwd, false);
+    }
+    return saveDesignVersion(env, project, str(args.summary, 'Update files'));
+  },
+
+  async edit(args, env) {
+    const project = str(args.project ?? args.id).trim();
+    const file = str(args.path ?? args.file);
+    const path = project ? designFilePath(env, project, file) : null;
+    if (!project) return failTool(env, 'edit needs project');
+    if (!path) return failTool(env, `${INVALID_DESIGN_FILE} Got: ${file}`);
+    const edits = parseEdits(args.edits ?? (args.target_content !== undefined ? [args] : undefined));
+    if (edits.length === 0) return failTool(env, 'edits must be a non-empty array of { target_content, replacement_content }');
+    // ตรวจ id เหมือน write
+    await tauriBridge.designVersions(env.settings.cwd, project);
+    env.record.args = { action: 'edit', project, path: file };
+    const res = await applyFileEdits(env, path, edits);
+    if (env.record.status !== 'completed') return res;
+    return saveDesignVersion(env, project, str(args.summary, 'Edit files'));
+  },
+
+  async open(args, env) {
+    const project = str(args.project ?? args.id).trim();
+    if (!project) return failTool(env, 'open needs project');
+    const version = num(args.version, 0) || undefined;
+    const page = str(args.page).trim() || undefined;
+    markRunning(env);
+    const versions = await tauriBridge.designVersions(env.settings.cwd, project);
+    const entries = await tauriBridge.listDir(resolveWorkspacePath(env.settings.cwd, `.dex/designs/${project}`), env.settings.cwd);
+    const files = entries.filter((e) => !e.name.startsWith('.') && e.name !== 'design.json').map((e) => (e.is_dir ? `${e.name}/` : e.name));
+    const previewError = await designCanvas.open(project, { version, page });
+    env.record.status = 'completed';
+    env.record.output = version ? `v${version}` : project;
+    return {
+      project,
+      files,
+      version: version ?? versions[versions.length - 1]?.version ?? 0,
+      guidelines: DESIGN_GUIDELINES,
+      ...(previewError ? { note: `Nothing to show yet: ${previewError}` } : {}),
+    };
+  },
+
+  async versions(args, env) {
+    const project = str(args.project ?? args.id).trim();
+    if (!project) return failTool(env, 'versions needs project');
+    markRunning(env);
+    const versions = await tauriBridge.designVersions(env.settings.cwd, project);
+    env.record.status = 'completed';
+    env.record.output = `${versions.length} versions`;
+    return { project, versions };
+  },
+
+  async restore(args, env) {
+    const project = str(args.project ?? args.id).trim();
+    const version = num(args.version, 0);
+    if (!project || !version) return failTool(env, 'restore needs project and version');
+    const guard = checkFileRules(env, 'edit', resolveWorkspacePath(env.settings.cwd, `.dex/designs/${project}`));
+    if (guard.denied) return guard.denied;
+    if (!guard.allowed && !env.settings.autoPilot) {
+      const rejected = await requireApproval(env, 'User rejected restoring the design version', 'supervised');
+      if (rejected) return rejected;
+    }
+    markRunning(env);
+    const saved = await tauriBridge.designRestore(env.settings.cwd, project, version);
+    await designCanvas.open(project);
+    env.record.status = 'completed';
+    env.record.output = `v${version} → v${saved.version}`;
+    return { project, version: saved.version, note: `Restored v${version} as v${saved.version}. Re-read files before editing them.` };
+  },
+};
+
 const HANDLERS: Record<ToolName, ToolHandler> = {
   async run_shell_command(args, env) {
     const cmd = str(args.command);
@@ -1065,6 +1282,14 @@ const HANDLERS: Record<ToolName, ToolHandler> = {
       return failTool(env, `Unknown docx action "${action}". Use one of: ${DOCX_ACTIONS.join(', ')}`);
     }
     return DOCX_HANDLERS[action](args, env);
+  },
+
+  async design(args, env) {
+    const action = str(args.action).trim() as DesignAction;
+    if (!DESIGN_ACTIONS.includes(action)) {
+      return failTool(env, `Unknown design action "${action}". Use one of: ${DESIGN_ACTIONS.join(', ')}`);
+    }
+    return DESIGN_HANDLERS[action](args, env);
   },
 
   async find_files(args, env) {

@@ -13,6 +13,15 @@ export interface BrowserPaneState {
   error: string | null;
 }
 
+/** ค่าที่ส่งให้ Emulation.setDeviceMetricsOverride */
+export interface DeviceEmulation {
+  width: number;
+  height: number;
+  deviceScaleFactor: number;
+  mobile: boolean;
+  scale: number;
+}
+
 const VIEWPORT_TIMEOUT_MS = 5000;
 
 /**
@@ -24,7 +33,9 @@ class BrowserPaneController {
   private listeners = new Set<() => void>();
   private viewport: PaneBounds | null = null;
   private waiters: ((bounds: PaneBounds) => void)[] = [];
-  private obscured = false;
+  private obscuredBy = new Set<string>();
+  /** ขนาดจอจำลองของ canvas ดีไซน์ — null = หน้าเว็บเต็ม webview ตามปกติ */
+  private emulation: DeviceEmulation | null = null;
 
   getState = (): BrowserPaneState => this.state;
 
@@ -46,6 +57,33 @@ class BrowserPaneController {
     if (!visible) {
       this.viewport = null;
       if (this.state.created) void tauriBridge.browserSetVisible(false).catch(() => {});
+    } else if (this.state.created) {
+      void this.ensureOpen().catch(() => {});
+    }
+  }
+
+  /** ให้หน้าเว็บคิดว่าจอกว้างเท่าอุปกรณ์ แล้วย่อภาพลงตาม scale (null = เลิกจำลอง) */
+  async setEmulation(emulation: DeviceEmulation | null) {
+    this.emulation = emulation;
+    if (!this.state.created) return;
+    if (emulation) await tauriBridge.browserCdp('Emulation.setDeviceMetricsOverride', { ...emulation });
+    else await tauriBridge.browserCdp('Emulation.clearDeviceMetricsOverride');
+  }
+
+  /** input ของ DevTools ใช้พิกัดบนจอหลังย่อ ส่วนตำแหน่งในหน้าเว็บเป็นพิกัดก่อนย่อ */
+  inputScale(): number {
+    return this.emulation?.scale ?? 1;
+  }
+
+  /** ระหว่างถูกย่อ screenshot จะได้ภาพแค่มุมเดียวของหน้า จึงเลิกย่อชั่วคราว (ขนาดหน้าเท่าเดิม ไม่จัดวางใหม่) */
+  async withoutPageScale<T>(run: () => Promise<T>): Promise<T> {
+    const emulation = this.emulation;
+    if (!emulation || emulation.scale === 1) return run();
+    await tauriBridge.browserCdp('Emulation.setDeviceMetricsOverride', { ...emulation, scale: 1 });
+    try {
+      return await run();
+    } finally {
+      if (this.emulation) await tauriBridge.browserCdp('Emulation.setDeviceMetricsOverride', { ...this.emulation });
     }
   }
 
@@ -57,10 +95,11 @@ class BrowserPaneController {
     if (this.state.created) void tauriBridge.browserSetBounds(bounds).catch(() => {});
   }
 
-  /** modal ของแอป (เช่นหน้าตั้งค่า) ทับ pane — webview อยู่บนสุดเสมอ จึงต้องซ่อนชั่วคราว */
-  setObscured(obscured: boolean) {
-    this.obscured = obscured;
-    if (this.state.created && this.state.visible) void tauriBridge.browserSetVisible(!obscured).catch(() => {});
+  /** มีของของแอปทับ pane (หน้าตั้งค่า, การลากขอบ, แกลเลอรีดีไซน์) — webview อยู่บนสุดเสมอ จึงต้องซ่อนชั่วคราว */
+  setObscured(obscured: boolean, reason = 'modal') {
+    if (obscured) this.obscuredBy.add(reason);
+    else this.obscuredBy.delete(reason);
+    if (this.state.created && this.state.visible) void tauriBridge.browserSetVisible(this.obscuredBy.size === 0).catch(() => {});
   }
 
   private waitForViewport(): Promise<PaneBounds> {
@@ -81,7 +120,7 @@ class BrowserPaneController {
     // ตัวเก็บ console/error ติดตั้งตอนสร้าง webview ให้ทำงานก่อนสคริปต์ของทุกหน้า
     await tauriBridge.browserOpen(bounds, PAGE_HOOK);
     if (!this.state.created) this.set({ created: true });
-    if (this.obscured) await tauriBridge.browserSetVisible(false);
+    if (this.obscuredBy.size > 0) await tauriBridge.browserSetVisible(false);
   }
 
   /** เปิด URL — คืนข้อความ error ของการโหลด (เช่น net::ERR_CONNECTION_REFUSED) หรือ null */
