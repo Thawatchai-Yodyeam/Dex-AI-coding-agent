@@ -38,6 +38,10 @@ export interface BrowserDriver {
   sleep(ms: number): Promise<void>;
   /** ให้ pane โผล่ขึ้นมา แม้ผู้ใช้จะซ่อนไว้ */
   show?(): Promise<void>;
+  /** สัดส่วนที่หน้าเว็บถูกย่อบนจอจำลองของ canvas (ไม่มี = 1) */
+  inputScale?(): number;
+  /** รัน fn โดยหน้าเว็บไม่ถูกย่อ — ใช้กับ screenshot */
+  withoutPageScale?<T>(run: () => Promise<T>): Promise<T>;
 }
 
 export const paneDriver: BrowserDriver = {
@@ -46,6 +50,8 @@ export const paneDriver: BrowserDriver = {
   currentUrl: () => tauriBridge.browserUrl(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   show: () => browserPane.ensureOpen(),
+  inputScale: () => browserPane.inputScale(),
+  withoutPageScale: (run) => browserPane.withoutPageScale(run),
 };
 
 const SNAPSHOT_MAX_CHARS = 15_000;
@@ -117,7 +123,10 @@ const number = (v: unknown): number | undefined => {
 };
 
 /** คลิกซ้ายแบบเดียวกับ Puppeteer — ต้องมี `buttons` ด้วย ไม่งั้นลิงก์ target=_blank ไม่เปิด */
-async function mouseClick(driver: BrowserDriver, x: number, y: number) {
+async function mouseClick(driver: BrowserDriver, pageX: number, pageY: number) {
+  const inputScale = driver.inputScale?.() ?? 1;
+  const x = pageX * inputScale;
+  const y = pageY * inputScale;
   await driver.cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 });
   await driver.cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
   await driver.cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 });
@@ -221,13 +230,15 @@ export async function runBrowserAction(
       const dpr = view.dpr || 1;
       // รูปยาวเกิน MAX_SCREENSHOT_PX โมเดลจะถูกย่อรูปให้ (พิกัดที่ตอบมาจะเพี้ยน) จึงย่อเองให้รู้สเกลแน่นอน
       const scale = Math.min(dpr, MAX_SCREENSHOT_PX / view.width, MAX_SCREENSHOT_PX / view.height);
-      const shot = await driver.cdp('Page.captureScreenshot', {
-        format: 'jpeg',
-        quality: 70,
-        ...(scale < dpr
-          ? { clip: { x: view.scrollX, y: view.scrollY, width: view.width, height: view.height, scale: scale / dpr } }
-          : {}),
-      });
+      const capture = () =>
+        driver.cdp('Page.captureScreenshot', {
+          format: 'jpeg',
+          quality: 70,
+          ...(scale < dpr
+            ? { clip: { x: view.scrollX, y: view.scrollY, width: view.width, height: view.height, scale: scale / dpr } }
+            : {}),
+        });
+      const shot = await (driver.withoutPageScale ? driver.withoutPageScale(capture) : capture());
       screenshotScale = scale;
       const page = await pageInfo(driver);
       const width = Math.round(view.width * scale);

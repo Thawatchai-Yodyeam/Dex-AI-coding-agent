@@ -2,11 +2,15 @@ import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { ArrowLeft, ArrowRight, RotateCw, ExternalLink, PanelRightClose, AppWindow } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { browserPane } from '../services/browser/pane';
+import { designCanvas } from '../services/design/canvas';
+import { DesignNotices, DesignStage, DesignToolbar } from './DesignCanvas';
 import type { Translation } from '../utils/i18n';
 
 const WIDTH_KEY = 'dex_browser_width';
 const DEFAULT_WIDTH = 560;
 const MIN_WIDTH = 320;
+/** canvas ของดีไซน์ต้องการที่มากกว่าเบราว์เซอร์ */
+const DESIGN_MIN_OPEN_WIDTH = 720;
 /** ให้แชทเหลือที่อย่างน้อยเท่านี้ (ต้องตรงกับ min-width ของ .main) — ที่ไม่พอ pane จะหดเอง */
 const MIN_CHAT_WIDTH = 380;
 
@@ -32,13 +36,21 @@ function loadWidth(): number {
  * pane เบราว์เซอร์ทางขวา — ตัวหน้าเว็บเป็น native webview ที่ลอยทับกรอบ `.browser-viewport`
  * component นี้จึงคอยรายงานตำแหน่งของกรอบให้ webview ตามทุกครั้งที่ layout ขยับ
  */
-export const BrowserPane: React.FC<{ t: Translation }> = ({ t }) => {
+export const BrowserPane: React.FC<{ t: Translation; onStartDesign: () => void }> = ({ t, onStartDesign }) => {
   const state = useSyncExternalStore(browserPane.subscribe, browserPane.getState);
+  const design = useSyncExternalStore(designCanvas.subscribe, designCanvas.getState);
   const viewportRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(loadWidth);
   const [draft, setDraft] = useState('');
   // กำลังพิมพ์อยู่ = อย่าเอา URL ที่หน้าเว็บเปลี่ยนไปทับ
   const editingRef = useRef(false);
+
+  // ขยายให้เมื่อเข้าโหมดดีไซน์ แต่ไม่จำลง localStorage (ความกว้างที่ผู้ใช้ลากเองเท่านั้นที่จำ)
+  useEffect(() => {
+    if (design.active) {
+      setWidth((w) => Math.max(w, Math.min(DESIGN_MIN_OPEN_WIDTH, window.innerWidth - MIN_CHAT_WIDTH)));
+    }
+  }, [design.active]);
 
   useEffect(() => {
     if (!editingRef.current) setDraft(state.url === 'about:blank' ? '' : state.url);
@@ -71,7 +83,7 @@ export const BrowserPane: React.FC<{ t: Translation }> = ({ t }) => {
   // ลากขอบซ้ายเพื่อปรับความกว้าง — ซ่อน webview ระหว่างลาก ไม่งั้นมันกิน mouse event ตอนเมาส์ผ่าน
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
-    browserPane.setObscured(true);
+    browserPane.setObscured(true, 'resize');
     let latest = width;
     const onMove = (ev: MouseEvent) => {
       latest = Math.min(Math.max(window.innerWidth - ev.clientX, MIN_WIDTH), window.innerWidth - MIN_CHAT_WIDTH);
@@ -80,7 +92,7 @@ export const BrowserPane: React.FC<{ t: Translation }> = ({ t }) => {
     const onUp = () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
-      browserPane.setObscured(false);
+      browserPane.setObscured(false, 'resize');
       try {
         localStorage.setItem(WIDTH_KEY, String(Math.round(latest)));
       } catch {
@@ -100,6 +112,19 @@ export const BrowserPane: React.FC<{ t: Translation }> = ({ t }) => {
   };
 
   const hasPage = state.created && !!state.url && state.url !== 'about:blank';
+
+  if (design.active) {
+    return (
+      <>
+        <div className="resize-x" onMouseDown={startResize} title={t.dragToResize} aria-hidden="true" />
+        <aside className="browser-pane" style={{ width }} aria-label={t.designTitle}>
+          <DesignToolbar state={design} t={t} onStartDesign={onStartDesign} />
+          <DesignNotices state={design} t={t} />
+          <DesignStage state={design} t={t} frameRef={viewportRef} onStartDesign={onStartDesign} />
+        </aside>
+      </>
+    );
+  }
 
   return (
     <>

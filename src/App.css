@@ -2742,6 +2742,160 @@ pre,
 }
 
 /* ============================================================
+   Dex Design — canvas ใช้ webview ตัวเดียวกับ browser pane (ลอยทับ .design-frame)
+   ============================================================ */
+.design-toolbar-title {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 6px;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.design-toolbar-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.design-devices {
+  display: flex;
+  flex-shrink: 0;
+  gap: 2px;
+  margin: 0 4px;
+  padding: 2px;
+  border-radius: var(--radius);
+  background: var(--surface-muted);
+}
+
+.design-version {
+  flex-shrink: 1;
+  min-width: 72px;
+  max-width: 132px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 2px;
+  color: var(--text-muted);
+}
+
+.design-version svg {
+  flex-shrink: 0;
+}
+
+.design-version select {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.design-version select:focus-visible {
+  outline: none;
+  border-color: var(--accent-border);
+  box-shadow: var(--focus);
+}
+
+.design-notice {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--accent-soft);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.design-stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  justify-content: center;
+  overflow: hidden;
+  position: relative;
+  background: var(--bg);
+}
+
+.design-stage.is-tablet,
+.design-stage.is-mobile {
+  padding: 12px;
+  background: var(--surface-hover);
+}
+
+.design-frame {
+  flex-shrink: 0;
+  background: var(--surface);
+}
+
+.design-gallery {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  align-content: start;
+  gap: 12px;
+  margin: 0;
+  padding: 16px;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.design-card {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.design-card:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.design-card:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+}
+
+.design-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.design-card-meta {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.tool-design-action {
+  padding: 0 12px 10px;
+}
+
+/* ============================================================
    Wallpaper
    ============================================================ */
 .app.has-wallpaper {

@@ -26,7 +26,9 @@ import {
   FoldVertical,
   Globe,
   AppWindow,
+  Palette,
 } from 'lucide-react';
+import { designCanvas } from '../services/design/canvas';
 import type { ApprovalDecision, ChatMessage, ToolCallRecord } from '../types/agent';
 import type { Translation } from '../utils/i18n';
 import { buildMessageSegments } from '../utils/messageSegments';
@@ -205,7 +207,11 @@ const TOOL_ICONS: Record<string, React.ComponentType<{ size?: number; 'aria-hidd
   web_fetch: Globe,
   browser: AppWindow,
   docx: FileText,
+  design: Palette,
 };
+
+/** action ของ tool design ที่มีหน้าให้เปิดดู */
+const DESIGN_VIEW_ACTIONS = ['write', 'edit', 'open', 'restore'];
 
 const ToolCard: React.FC<{
   tool: ToolCallRecord;
@@ -238,6 +244,8 @@ const ToolCard: React.FC<{
               .slice(0, 160)
           : tool.name === 'docx'
             ? [tool.args.action, tool.args.path].filter(Boolean).join(' ').slice(0, 160)
+            : tool.name === 'design'
+              ? [tool.args.action, tool.args.project ?? tool.args.title, tool.args.path].filter(Boolean).join(' ').slice(0, 160)
             : tool.args.command ||
           tool.args.path ||
           tool.args.url ||
@@ -282,6 +290,15 @@ const ToolCard: React.FC<{
         </span>
         {open ? <ChevronDown size={15} aria-hidden="true" /> : <ChevronRight size={15} aria-hidden="true" />}
       </button>
+
+      {tool.name === 'design' && tool.status === 'completed' && DESIGN_VIEW_ACTIONS.includes(tool.args.action) && tool.args.project && (
+        <div className="tool-design-action">
+          <button type="button" className="chip-btn chip-outline" onClick={() => void designCanvas.open(String(tool.args.project))}>
+            <Palette size={14} aria-hidden="true" />
+            {t.designOpenOnCanvas}
+          </button>
+        </div>
+      )}
 
       {todos.length > 0 && (
         <ul className="todo-list" aria-label={t.toolNames.update_todos}>

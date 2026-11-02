@@ -48,6 +48,23 @@ export interface BrowserStateEvent {
   loading?: boolean;
 }
 
+/** โปรเจกต์ของ Dex Design */
+export interface DesignInfo {
+  /** ชื่อโฟลเดอร์ใน .dex/designs */
+  id: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+  /** เวอร์ชันล่าสุด (0 = ยังไม่มี) */
+  version: number;
+}
+
+export interface DesignVersion {
+  version: number;
+  summary: string;
+  at: number;
+}
+
 export interface FileEdit {
   target_content: string;
   replacement_content: string;
@@ -210,6 +227,37 @@ export const tauriBridge = {
   /** URL ของ G-docx (ตัวแก้ไฟล์ Word ที่ฝังมากับแอป) */
   async gdocxUrl(): Promise<string> {
     return await invoke('gdocx_url');
+  },
+
+  async designList(workspace?: string): Promise<DesignInfo[]> {
+    return await invoke('design_list', { workspace });
+  },
+
+  async designCreate(workspace: string | undefined, title: string): Promise<DesignInfo> {
+    return await invoke('design_create', { workspace, title });
+  },
+
+  /** เก็บสภาพปัจจุบันเป็นเวอร์ชันใหม่ (ไฟล์ไม่เปลี่ยน = คืนเวอร์ชันเดิม) */
+  async designCommit(workspace: string | undefined, id: string, summary: string): Promise<DesignVersion> {
+    return await invoke('design_commit', { workspace, id, summary });
+  },
+
+  async designVersions(workspace: string | undefined, id: string): Promise<DesignVersion[]> {
+    return await invoke('design_versions', { workspace, id });
+  },
+
+  async designRestore(workspace: string | undefined, id: string, version: number): Promise<DesignVersion> {
+    return await invoke('design_restore', { workspace, id, version });
+  },
+
+  /** คัดลอกไฟล์ดีไซน์ไปโฟลเดอร์ปลายทาง คืนพาธที่สร้าง */
+  async designExport(workspace: string | undefined, id: string, destination: string): Promise<string> {
+    return await invoke('design_export', { workspace, id, destination });
+  },
+
+  /** URL ของหน้าดีไซน์บนเซิร์ฟเวอร์ในเครื่อง (throw ถ้ายังไม่มีไฟล์นั้น) */
+  async designPreviewUrl(workspace: string | undefined, id: string, version?: number, page?: string): Promise<string> {
+    return await invoke('design_preview_url', { workspace, id, version, page });
   },
 
   async listDir(path: string, workspace?: string): Promise<FileItem[]> {

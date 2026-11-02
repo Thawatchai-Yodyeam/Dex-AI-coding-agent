@@ -82,6 +82,36 @@ describe('snapshot', () => {
   });
 });
 
+describe('page scaled on the design canvas', () => {
+  it('clicks where the scaled page is drawn', async () => {
+    const { driver, of } = fakeDriver(
+      scripted((expr) => (expr.startsWith(LOCATE_REF) ? JSON.stringify({ x: 120, y: 40, covered: null }) : undefined))
+    );
+    await runBrowserAction('click', { ref: 'e3' }, { ...driver, inputScale: () => 0.5 });
+    expect(of('Input.dispatchMouseEvent').map((p) => [p.type, p.x, p.y])).toEqual([
+      ['mouseMoved', 60, 20],
+      ['mousePressed', 60, 20],
+      ['mouseReleased', 60, 20],
+    ]);
+  });
+
+  it('captures the screenshot with the scaling lifted', async () => {
+    const { driver, of } = fakeDriver(
+      scripted((expr) => (expr === VIEWPORT ? JSON.stringify({ width: 1440, height: 900, dpr: 1, scrollX: 0, scrollY: 0 }) : undefined))
+    );
+    let capturesInside = -1;
+    await runBrowserAction('screenshot', {}, {
+      ...driver,
+      withoutPageScale: async (run) => {
+        const result = await run();
+        capturesInside = of('Page.captureScreenshot').length;
+        return result;
+      },
+    });
+    expect(capturesInside).toBe(1);
+  });
+});
+
 describe('click', () => {
   it('clicks the middle of a ref with real mouse events', async () => {
     const { driver, of } = fakeDriver(

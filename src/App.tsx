@@ -12,6 +12,7 @@ import { Welcome } from './components/Welcome';
 import { tauriBridge } from './services/tauriBridge';
 import { loadStoredSessions, type StoredSessions } from './services/sessionStore';
 import { browserPane } from './services/browser/pane';
+import { designCanvas } from './services/design/canvas';
 import type { AppSettings, PokemonTheme, ShellOutputEventPayload } from './types/agent';
 import { POKEMON_THEMES } from './types/agent';
 import { translations } from './utils/i18n';
@@ -123,6 +124,8 @@ function AppShell({ stored }: { stored: StoredSessions }) {
     };
   }, []);
   useEffect(() => browserPane.setObscured(settingsOpen), [settingsOpen]);
+  const design = useSyncExternalStore(designCanvas.subscribe, designCanvas.getState);
+  useEffect(() => designCanvas.setWorkspace(settings.cwd), [settings.cwd]);
 
   // เลื่อนลงล่างอัตโนมัติ เฉพาะเมื่อผู้ใช้อยู่ใกล้ล่างอยู่แล้ว (ไม่แย่ง scroll ตอนกำลังอ่านข้อความเก่า)
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -219,13 +222,22 @@ function AppShell({ stored }: { stored: StoredSessions }) {
           cwd={settings.cwd}
           autoPilot={settings.autoPilot}
           terminalOpen={terminalOpen}
-          browserOpen={browser.visible}
+          browserOpen={browser.visible && !design.active}
+          designOpen={browser.visible && design.active}
           hasMessages={messages.length > 0}
           t={t}
           onSelectWorkspace={handleSelectWorkspace}
           onToggleAutoPilot={() => updateSettings({ autoPilot: !settings.autoPilot })}
           onToggleTerminal={() => setTerminalOpen((v) => !v)}
-          onToggleBrowser={() => browserPane.setVisible(!browser.visible)}
+          onToggleBrowser={() => {
+            // canvas เปิดอยู่ = pane โผล่แล้ว ปุ่มนี้แค่สลับเป็นเบราว์เซอร์
+            if (browser.visible && design.active) designCanvas.exit();
+            else browserPane.setVisible(!browser.visible);
+          }}
+          onToggleDesign={() => {
+            if (browser.visible && design.active) browserPane.setVisible(false);
+            else void designCanvas.show();
+          }}
           onClearChat={sessions.handleClearChat}
         />
 
@@ -289,7 +301,7 @@ function AppShell({ stored }: { stored: StoredSessions }) {
         />
       </main>
 
-      {browser.visible && <BrowserPane t={t} />}
+      {browser.visible && <BrowserPane t={t} onStartDesign={() => chat.setInputPrompt(t.designStarterPrompt)} />}
 
       <SettingsModal
         isOpen={settingsOpen}
