@@ -151,6 +151,11 @@ export const tauriBridge = {
     return await invoke('mcp_secrets_present', { names });
   },
 
+  /** โปรแกรมนี้อยู่ใน PATH ของแอปไหม — แค่ดูไฟล์ ไม่รันอะไร */
+  async commandAvailable(program: string): Promise<boolean> {
+    return await invoke('command_available', { program });
+  },
+
   /** ประวัติแบบ native ของแชท (JSON) เก็บเป็นไฟล์ใน app data */
   async saveSessionHistory(sessionId: string, data: string): Promise<void> {
     await invoke('save_session_history', { sessionId, data });

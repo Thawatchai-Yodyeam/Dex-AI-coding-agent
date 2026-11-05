@@ -1704,6 +1704,22 @@ fn spawn_mcp(command: &str, args: &[String], env: &HashMap<String, String>, cwd:
     }
 }
 
+/// หาโปรแกรมใน PATH ด้วยนามสกุลเดียวกับที่ spawn_mcp ลอง — แค่ดูไฟล์ ไม่รันอะไร
+fn find_on_path(program: &str, path: &std::ffi::OsStr) -> bool {
+    let names: Vec<String> = if cfg!(windows) {
+        ["exe", "cmd", "bat"].iter().map(|ext| format!("{}.{}", program, ext)).collect()
+    } else {
+        vec![program.to_string()]
+    };
+    std::env::split_paths(path).any(|dir| names.iter().any(|name| dir.join(name).is_file()))
+}
+
+#[tauri::command]
+fn command_available(program: String) -> bool {
+    // ชื่อล้วนเท่านั้น กัน `..\` ออกไปดูไฟล์นอก PATH
+    valid_provider_id(&program) && std::env::var_os("PATH").is_some_and(|path| find_on_path(&program, &path))
+}
+
 #[tauri::command]
 async fn mcp_start(
     app: AppHandle,
@@ -2917,6 +2933,7 @@ pub fn run() {
             install_user_skill,
             uninstall_user_skill,
             mcp_secrets_present,
+            command_available,
             mcp_start,
             mcp_send,
             mcp_stop,
@@ -3048,6 +3065,28 @@ mod tests {
             assert!(uninstall_skill_in(&skills, name).is_err(), "uninstall {:?}", name);
         }
         assert!(victim.exists());
+    }
+
+    #[test]
+    fn find_on_path_uses_the_extensions_spawn_mcp_tries() {
+        let dir = design_temp_dir("find-on-path");
+        let tool = if cfg!(windows) { "tool.cmd" } else { "tool" };
+        fs::write(dir.join(tool), "").unwrap();
+        let other = design_temp_dir("find-on-path-other");
+        let path = std::env::join_paths([other, dir.clone()]).unwrap();
+
+        assert!(find_on_path("tool", &path));
+        assert!(!find_on_path("missing", &path));
+        // โฟลเดอร์ชื่อเดียวกันไม่ใช่โปรแกรม
+        fs::create_dir(dir.join(if cfg!(windows) { "folder.exe" } else { "folder" })).unwrap();
+        assert!(!find_on_path("folder", &path));
+    }
+
+    #[test]
+    fn command_available_only_accepts_plain_names() {
+        for name in ["../evil", "..\\evil", "C:\\Windows\\notepad", "", "a b"] {
+            assert!(!command_available(name.to_string()), "{:?}", name);
+        }
     }
 
     #[test]

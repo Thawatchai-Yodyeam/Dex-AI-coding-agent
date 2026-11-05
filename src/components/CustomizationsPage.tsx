@@ -11,12 +11,17 @@ import {
   customSkills,
   enabledPatch,
   installPatch,
+  installedTarget,
   matchesQuery,
+  pluginHasUpdate,
   pluginState,
+  pluginTarget,
   prepareInstall,
   prepareUninstall,
+  readManagedSkillFiles,
   saveSecrets,
   uninstallPatch,
+  updatePatch,
   type PluginSettings,
 } from '../services/marketplace/plugins';
 import type { SkillInfo } from '../services/tauriBridge';
@@ -74,10 +79,15 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
   const [query, setQuery] = useState('');
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const [skillFiles, setSkillFiles] = useState<Record<string, string>>({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
 
-  const refreshSkills = useCallback(() => loadSkills(settings.cwd).then(setSkills), [settings.cwd]);
+  const refreshSkills = useCallback(async () => {
+    const found = await loadSkills(settings.cwd);
+    setSkills(found);
+    setSkillFiles(await readManagedSkillFiles(found, settings.cwd));
+  }, [settings.cwd]);
   useEffect(() => {
     void refreshSkills();
   }, [refreshSkills]);
@@ -91,6 +101,7 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
   const configBroken = readMcpEntries(settings.mcpConfig) === null;
   const statusOf = (name: string) => statuses.find((s) => s.name === name);
   const stateOf = (plugin: MarketplacePlugin) => pluginState(plugin, settings, skills);
+  const hasUpdate = (plugin: MarketplacePlugin) => pluginHasUpdate(plugin, settings, skillFiles);
 
   const installed = MARKETPLACE_PLUGINS.filter((plugin) => stateOf(plugin) !== 'available');
   const customServers = customMcpNames(settings);
@@ -242,6 +253,8 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
                               </span>
                             ) : state === 'disabled' ? (
                               <span className="plugin-badge">{t.pluginDisabled}</span>
+                            ) : hasUpdate(plugin) ? (
+                              <span className="plugin-badge is-update">{t.pluginUpdateAvailable}</span>
                             ) : (
                               <span className="plugin-badge is-on">
                                 <Check size={12} aria-hidden="true" />
@@ -301,6 +314,16 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
                           title={t.mcpRestart}
                         >
                           <RotateCcw size={14} aria-hidden="true" />
+                        </button>
+                      )}
+                      {hasUpdate(plugin) && (
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => setSelectedId(plugin.id)}
+                          aria-label={`${t.pluginUpdate}: ${plugin.name}`}
+                        >
+                          {t.pluginUpdate}
                         </button>
                       )}
                       <button
@@ -408,11 +431,23 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
           state={stateOf(selected)}
           status={stateOf(selected) === 'enabled' ? statusOf(selected.id) : undefined}
           uninstallable={canUninstall(selected, skills)}
+          hasUpdate={hasUpdate(selected)}
+          currentTarget={(() => {
+            // ถ้าตรงกับของใหม่ (เช่น เปลี่ยนแค่ env) แสดงซ้ำจะดูเหมือนไม่มีอะไรเปลี่ยน
+            const current = installedTarget(selected, settings);
+            return current !== pluginTarget(selected) ? current : null;
+          })()}
           language={language}
           t={t}
           onInstall={async (values) => {
             await prepareInstall(selected, values, settings);
             applyPatch((prev) => installPatch(selected, prev));
+            await refreshSkills();
+          }}
+          onUpdate={async (values) => {
+            // config เปลี่ยน sync จึงเปิด server ใหม่ให้เอง (ถ้าผู้ใช้ปิดไว้ก็ยังปิดอยู่)
+            await prepareInstall(selected, values, settings);
+            applyPatch((prev) => updatePatch(selected, prev));
             await refreshSkills();
           }}
           onUninstall={async () => {
