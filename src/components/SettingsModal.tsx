@@ -11,16 +11,19 @@ import { tauriBridge } from '../services/tauriBridge';
 import { translations } from '../utils/i18n';
 import { PermissionRulesEditor } from './PermissionRulesEditor';
 
+export type SettingsTab = 'general' | 'keys' | 'permissions' | 'extensions';
+type Tab = SettingsTab;
+
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   settings: AppSettings;
   onSave: (newSettings: AppSettings) => void;
+  /** แท็บที่จะเปิดไปหา ไม่ระบุ = แท็บล่าสุด */
+  initialTab?: SettingsTab;
 }
 
-type Tab = 'general' | 'keys' | 'permissions' | 'extensions';
-
-export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, settings, onSave }) => {
+export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, settings, onSave, initialTab }) => {
   const [draft, setDraft] = useState<AppSettings>(settings);
   const [tab, setTab] = useState<Tab>('general');
   const [saved, setSaved] = useState(false);
@@ -34,6 +37,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
       setDraft(settings);
       setSaved(false);
       setWallpaperError(false);
+      if (initialTab) setTab(initialTab);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);

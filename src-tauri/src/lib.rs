@@ -1436,9 +1436,13 @@ pub struct SkillInfo {
     pub dir: String,
     /// "workspace" | "user"
     pub source: String,
+    /// ติดตั้งจาก Marketplace (ถอนการติดตั้งได้) — skill ที่ผู้ใช้เขียนเองเป็น false
+    pub managed: bool,
 }
 
 const MAX_SKILL_FILE_BYTES: u64 = 256 * 1024;
+/// ไฟล์ว่างในโฟลเดอร์ skill ที่ Marketplace สร้าง — ไม่มีไฟล์นี้ = ของผู้ใช้ ห้ามเขียนทับหรือลบ
+const MANAGED_SKILL_MARKER: &str = ".dex-plugin";
 
 fn user_home() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from)
@@ -1527,6 +1531,7 @@ fn scan_skills(roots: &[(PathBuf, &'static str)]) -> Vec<SkillInfo> {
                 description,
                 dir: dir.to_string_lossy().to_string(),
                 source: source.to_string(),
+                managed: *source == "user" && dir.join(MANAGED_SKILL_MARKER).is_file(),
             });
         }
     }
@@ -1536,6 +1541,57 @@ fn scan_skills(roots: &[(PathBuf, &'static str)]) -> Vec<SkillInfo> {
 #[tauri::command]
 fn list_skills(workspace: Option<String>) -> Vec<SkillInfo> {
     scan_skills(&skill_roots(workspace.as_deref()))
+}
+
+/// เขียน skill จาก Marketplace ลง `<root>/<name>/` — ไม่เขียนทับโฟลเดอร์ที่ผู้ใช้สร้างเอง
+fn install_skill_in(root: &Path, name: &str, content: &str) -> Result<PathBuf, String> {
+    if !valid_provider_id(name) {
+        return Err(format!("ชื่อ skill ไม่ถูกต้อง: {}", name));
+    }
+    if content.len() as u64 > MAX_SKILL_FILE_BYTES {
+        return Err("skill ใหญ่เกินไป".to_string());
+    }
+    let dir = root.join(name);
+    if dir.exists() && !dir.join(MANAGED_SKILL_MARKER).is_file() {
+        return Err(format!("มี skill ชื่อ {} ของคุณอยู่แล้วที่ {} — ไม่เขียนทับ", name, dir.display()));
+    }
+    fs::create_dir_all(&dir).map_err(|e| format!("สร้างโฟลเดอร์ skill ไม่สำเร็จ: {}", e))?;
+    fs::write(dir.join(MANAGED_SKILL_MARKER), "").map_err(|e| format!("ติดตั้ง skill ไม่สำเร็จ: {}", e))?;
+    fs::write(dir.join("SKILL.md"), content).map_err(|e| format!("ติดตั้ง skill ไม่สำเร็จ: {}", e))?;
+    Ok(dir)
+}
+
+/// ลบเฉพาะ skill ที่ Marketplace ติดตั้ง (โฟลเดอร์จริงที่มี marker) — ไม่มีอยู่แล้วถือว่าสำเร็จ
+fn uninstall_skill_in(root: &Path, name: &str) -> Result<(), String> {
+    if !valid_provider_id(name) {
+        return Err(format!("ชื่อ skill ไม่ถูกต้อง: {}", name));
+    }
+    let dir = root.join(name);
+    let meta = match fs::symlink_metadata(&dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("อ่านโฟลเดอร์ skill ไม่สำเร็จ: {}", e)),
+    };
+    if !meta.is_dir() || !dir.join(MANAGED_SKILL_MARKER).is_file() {
+        return Err(format!("{} ไม่ได้ติดตั้งจาก Marketplace จึงไม่ลบให้ — ลบโฟลเดอร์เองถ้าต้องการ", dir.display()));
+    }
+    fs::remove_dir_all(&dir).map_err(|e| format!("ลบ skill ไม่สำเร็จ: {}", e))
+}
+
+fn user_skill_root() -> Result<PathBuf, String> {
+    user_home()
+        .map(|home| home.join(".dex").join("skills"))
+        .ok_or_else(|| "หาโฟลเดอร์ผู้ใช้ไม่พบ".to_string())
+}
+
+#[tauri::command]
+fn install_user_skill(name: String, content: String) -> Result<String, String> {
+    install_skill_in(&user_skill_root()?, &name, &content).map(|dir| dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn uninstall_user_skill(name: String) -> Result<(), String> {
+    uninstall_skill_in(&user_skill_root()?, &name)
 }
 
 /// อ่านไฟล์ในโฟลเดอร์ของ skill (ค่าเริ่มต้น SKILL.md) — โฟลเดอร์ต้องอยู่ใต้ skill root จริง
@@ -1564,7 +1620,32 @@ fn read_skill_file(dir: String, file: Option<String>, workspace: Option<String>)
 // stdio: spawn server แล้วส่ง/รับข้อความทีละบรรทัด (newline-delimited JSON) ผ่าน event `mcp-message`
 // http: POST ผ่าน Rust เพราะ fetch ของ webview ติด CORS กับ server ส่วนใหญ่
 
-/// แทน `${NAME}` ด้วยค่า environment variable — ให้เก็บ token ไว้ใน env แทนการพิมพ์ลง settings
+/// คีย์ของ plugin อยู่ใน Credential Manager ชื่อ `mcp-secret-<NAME>` — แยก namespace จาก API key ของค่าย AI
+/// config ที่อ้าง `${anthropic}` จึงอ่าน API key ของแอปไม่ได้
+const MCP_SECRET_PREFIX: &str = "mcp-secret-";
+
+/// ค่าของ `${NAME}`: ที่ผู้ใช้กรอกในหน้า Customizations ก่อน แล้วค่อย environment variable
+fn lookup_secret(name: &str) -> Option<String> {
+    keyring_entry(&format!("{}{}", MCP_SECRET_PREFIX, name))
+        .ok()
+        .and_then(|entry| entry.get_password().ok())
+        .or_else(|| std::env::var(name).ok())
+        .filter(|value| !value.is_empty())
+}
+
+/// บอกแค่ว่ามีค่าหรือไม่ — ไม่ส่งค่าจริงกลับไปที่ webview
+#[tauri::command]
+fn mcp_secrets_present(names: Vec<String>) -> HashMap<String, bool> {
+    names
+        .into_iter()
+        .map(|name| {
+            let present = lookup_secret(&name).is_some();
+            (name, present)
+        })
+        .collect()
+}
+
+/// แทน `${NAME}` ด้วยคีย์ใน Credential Manager หรือ environment variable — ไม่ต้องพิมพ์ token ลง settings
 fn expand_env(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
@@ -1573,7 +1654,7 @@ fn expand_env(value: &str) -> String {
         match rest[start + 2..].find('}') {
             Some(end) => {
                 let name = &rest[start + 2..start + 2 + end];
-                out.push_str(&std::env::var(name).unwrap_or_default());
+                out.push_str(&lookup_secret(name).unwrap_or_default());
                 rest = &rest[start + 3 + end..];
             }
             None => {
@@ -2833,6 +2914,9 @@ pub fn run() {
             save_api_key,
             list_skills,
             read_skill_file,
+            install_user_skill,
+            uninstall_user_skill,
+            mcp_secrets_present,
             mcp_start,
             mcp_send,
             mcp_stop,
@@ -2904,6 +2988,77 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dex-design-test-{}-{}", name, uuid::Uuid::new_v4().simple()));
         fs::create_dir_all(&dir).unwrap();
         fs::canonicalize(dir).unwrap()
+    }
+
+    const SAMPLE_SKILL: &str = "---\nname: sample\ndescription: A sample skill\n---\n\nDo the thing.\n";
+
+    #[test]
+    fn marketplace_skill_installs_and_uninstalls() {
+        let root = design_temp_dir("skill-install");
+        let dir = install_skill_in(&root, "sample", SAMPLE_SKILL).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("SKILL.md")).unwrap(), SAMPLE_SKILL);
+
+        let found = scan_skills(&[(root.clone(), "user")]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "sample");
+        assert!(found[0].managed);
+
+        // ติดตั้งซ้ำ = อัปเดตของเดิมได้
+        install_skill_in(&root, "sample", "---\nname: sample\ndescription: New\n---\n").unwrap();
+        assert_eq!(scan_skills(&[(root.clone(), "user")])[0].description, "New");
+
+        uninstall_skill_in(&root, "sample").unwrap();
+        assert!(!dir.exists());
+        // ไม่มีอยู่แล้วก็ไม่ error (เช่น ผู้ใช้ลบโฟลเดอร์เองไปก่อน)
+        uninstall_skill_in(&root, "sample").unwrap();
+    }
+
+    #[test]
+    fn marketplace_never_touches_a_skill_the_user_wrote() {
+        let root = design_temp_dir("skill-own");
+        let dir = root.join("mine");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), SAMPLE_SKILL).unwrap();
+
+        assert!(install_skill_in(&root, "mine", "overwrite").is_err());
+        assert!(uninstall_skill_in(&root, "mine").is_err());
+        assert_eq!(fs::read_to_string(dir.join("SKILL.md")).unwrap(), SAMPLE_SKILL);
+        assert!(!scan_skills(&[(root.clone(), "user")])[0].managed);
+    }
+
+    #[test]
+    fn workspace_skill_with_a_marker_is_not_managed() {
+        // repo ที่ไม่รู้จักใส่ marker มาเอง ก็ต้องไม่ถูกนับว่าเป็นของ Marketplace
+        let root = design_temp_dir("skill-workspace");
+        install_skill_in(&root, "sample", SAMPLE_SKILL).unwrap();
+        assert!(!scan_skills(&[(root.clone(), "workspace")])[0].managed);
+    }
+
+    #[test]
+    fn skill_names_cannot_escape_the_skill_root() {
+        let root = design_temp_dir("skill-traversal");
+        let victim = root.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join(MANAGED_SKILL_MARKER), "").unwrap();
+        let skills = root.join("skills");
+        fs::create_dir_all(&skills).unwrap();
+
+        for name in ["../victim", "..\\victim", "a/b", "", ".."] {
+            assert!(install_skill_in(&skills, name, SAMPLE_SKILL).is_err(), "install {:?}", name);
+            assert!(uninstall_skill_in(&skills, name).is_err(), "uninstall {:?}", name);
+        }
+        assert!(victim.exists());
+    }
+
+    #[test]
+    fn expand_env_reads_environment_variables() {
+        std::env::set_var("DEX_TEST_EXPAND_ENV", "value");
+        assert_eq!(expand_env("Bearer ${DEX_TEST_EXPAND_ENV}"), "Bearer value");
+        assert_eq!(expand_env("a${DEX_TEST_MISSING_VAR}b"), "ab");
+        assert_eq!(expand_env("no vars"), "no vars");
+        let present = mcp_secrets_present(vec!["DEX_TEST_EXPAND_ENV".into(), "DEX_TEST_MISSING_VAR".into()]);
+        assert_eq!(present["DEX_TEST_EXPAND_ENV"], true);
+        assert_eq!(present["DEX_TEST_MISSING_VAR"], false);
     }
 
     #[test]

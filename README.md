@@ -28,6 +28,7 @@ Works with many providers (Claude · GPT · Gemini · DeepSeek · Qwen · Ollama
 | 🛠️ **Works on real files** | Reads long files in pages with line numbers, makes several edits at once, searches with regex or glob, and runs PowerShell, with a diff to review before you approve. |
 | ⏱️ **Long and background commands** | Timeouts of up to 30 minutes, and dev servers can run in the background (stop them from the Terminal). |
 | 🧩 **Skills and MCP** | Loads specialised instructions from `SKILL.md` and connects to MCP servers (stdio or HTTP) using a Claude Desktop style config. |
+| 🛍️ **Customizations** | A marketplace in the sidebar for installing ready-made MCP servers and skills, with their keys kept in Credential Manager. |
 | ↩️ **Undo file edits** | The **Undo file changes** button (or `/undo`) reverts files changed by tools and, if the workspace is a git repo, by shell commands too. |
 | 🔁 **Regenerate and edit** | Regenerate an answer, or edit an earlier message and resend from there. The agent still remembers the tools it used in earlier turns. |
 | 💾 **Picks up where you left off** | Full history, including tool results, is saved per chat, so you can switch chats or reopen the app and keep working. |
@@ -121,9 +122,21 @@ Go to ⚙️ Settings → Skills and MCP and paste a config in the same format a
 }
 ```
 
-- `${NAME}` in args, env, url and headers is replaced by an environment variable, so tokens need not be kept in settings.
+- `${NAME}` in args, env, url and headers is replaced by a key saved in Customizations or by an environment variable, so tokens need not be kept in settings.
 - MCP tools are named `mcp__<server>__<tool>` and **always ask before running**, except those that declare `readOnlyHint` in Auto-Pilot mode or have an allow rule of type *MCP tool*.
 - stdio and Streamable HTTP are supported (the older SSE transport is not). Connection status and errors appear on the settings page.
+
+### Customizations
+
+Open **Customizations** in the sidebar to browse the **Marketplace** and manage what is **Installed**.
+
+- **Before you install**, each plugin shows the exact command or URL it uses, who publishes it, and whether it comes from the community rather than the service's owner.
+- **MCP plugins** add an entry to the same config as ⚙️ Settings → Skills and MCP, so you can still edit them there. Their tools ask before running under the usual rules.
+- **Skill plugins** write `~/.dex/skills/<name>/SKILL.md`. They contain instructions only, and nothing runs. Dex never overwrites or deletes a skill you wrote yourself.
+- **Keys** go to Windows Credential Manager as `mcp-secret-<NAME>`, and the config stores only `${NAME}`. A saved key takes priority over an environment variable of the same name. Uninstalling a plugin deletes its keys.
+- **Requirements:** `npx` plugins need [Node.js](https://nodejs.org/) and `uvx` plugins need [uv](https://docs.astral.sh/uv/getting-started/installation/). Remote plugins and skills need neither.
+
+To add a plugin, add it to `src/services/marketplace/catalog.ts`. `marketplace.test.ts` checks that its config parses and that it declares the keys it uses. Pass keys through `env` or `headers`, never `args`, because other programs on the computer can read process arguments.
 
 ### Project instructions (`DEX.md`)
 
@@ -204,7 +217,8 @@ src/
   App.tsx                   main layout + wires the hooks together
   App.css                   themes (design tokens, light/dark + Pokémon themes)
   components/               Sidebar, TopBar, Composer, ChatMessageItem, DiffViewer, SettingsModal,
-                            SkillsSettings, McpSettings, ModelOptions, BrowserPane, DesignCanvas, ...
+                            SkillsSettings, McpSettings, ModelOptions, BrowserPane, DesignCanvas,
+                            CustomizationsPage, PluginDialog, ...
   hooks/
     useAppSettings.ts       settings, keys in Credential Manager/.env, keeps MCP servers in sync with config
     useChatSessions.ts      chat history (saves only changed chats, warns when saving fails) + loads native history from file
@@ -238,6 +252,10 @@ src/
       config.ts             reads Claude Desktop style config
       client.ts             JSON-RPC client + stdio / Streamable HTTP transports
       manager.ts            starts/stops servers, merges tools as mcp__server__tool
+    marketplace/
+      catalog.ts            the plugins in the Marketplace (data only)
+      skillPacks.ts         instructions of the skills that ship with the Marketplace
+      plugins.ts            install state read from the real config/folders, install/uninstall/enable
   utils/
     images.ts               reads/resizes images before attaching
     notify.ts               Windows notifications

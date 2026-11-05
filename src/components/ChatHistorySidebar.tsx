@@ -9,6 +9,7 @@ import {
   PanelLeft,
   Folder,
   Settings,
+  Blocks,
 } from 'lucide-react';
 import type { ChatSession } from '../types/agent';
 import type { Translation } from '../utils/i18n';
@@ -30,6 +31,11 @@ interface ChatHistorySidebarProps {
   workspace: string;
   autoPilot: boolean;
   onInsertPrompt: (text: string) => void;
+  /** คอลัมน์หลักกำลังแสดงหน้า Customizations */
+  customizationsOpen: boolean;
+  onOpenCustomizations: () => void;
+  /** กลับมาแสดงแชทในคอลัมน์หลัก */
+  onShowChat: () => void;
 }
 
 export const ChatHistorySidebar: React.FC<ChatHistorySidebarProps> = ({
@@ -47,6 +53,9 @@ export const ChatHistorySidebar: React.FC<ChatHistorySidebarProps> = ({
   workspace,
   autoPilot,
   onInsertPrompt,
+  customizationsOpen,
+  onOpenCustomizations,
+  onShowChat,
 }) => {
   const [view, setView] = useState<'chats' | 'files'>('chats');
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -85,6 +94,7 @@ export const ChatHistorySidebar: React.FC<ChatHistorySidebarProps> = ({
           className="icon-btn"
           onClick={() => {
             setView('chats');
+            onShowChat();
             onToggleCollapse();
           }}
           aria-label={t.chats}
@@ -97,12 +107,23 @@ export const ChatHistorySidebar: React.FC<ChatHistorySidebarProps> = ({
           className="icon-btn"
           onClick={() => {
             setView('files');
+            onShowChat();
             onToggleCollapse();
           }}
           aria-label={t.files}
           title={t.files}
         >
           <Folder size={18} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className={`icon-btn ${customizationsOpen ? 'is-active' : ''}`}
+          onClick={onOpenCustomizations}
+          aria-pressed={customizationsOpen}
+          aria-label={t.customizations}
+          title={t.customizations}
+        >
+          <Blocks size={18} aria-hidden="true" />
         </button>
         <button type="button" className="icon-btn rail-bottom" onClick={onOpenSettings} aria-label={t.settings} title={t.settings}>
           <Settings size={18} aria-hidden="true" />
@@ -134,21 +155,36 @@ export const ChatHistorySidebar: React.FC<ChatHistorySidebarProps> = ({
         </button>
         <button
           type="button"
-          className={`nav-item ${view === 'chats' ? 'is-active' : ''}`}
-          aria-pressed={view === 'chats'}
-          onClick={() => setView('chats')}
+          className={`nav-item ${view === 'chats' && !customizationsOpen ? 'is-active' : ''}`}
+          aria-pressed={view === 'chats' && !customizationsOpen}
+          onClick={() => {
+            setView('chats');
+            onShowChat();
+          }}
         >
           <MessageSquare size={18} aria-hidden="true" />
           {t.chats}
         </button>
         <button
           type="button"
-          className={`nav-item ${view === 'files' ? 'is-active' : ''}`}
-          aria-pressed={view === 'files'}
-          onClick={() => setView('files')}
+          className={`nav-item ${view === 'files' && !customizationsOpen ? 'is-active' : ''}`}
+          aria-pressed={view === 'files' && !customizationsOpen}
+          onClick={() => {
+            setView('files');
+            onShowChat();
+          }}
         >
           <Folder size={18} aria-hidden="true" />
           {t.files}
+        </button>
+        <button
+          type="button"
+          className={`nav-item ${customizationsOpen ? 'is-active' : ''}`}
+          aria-pressed={customizationsOpen}
+          onClick={onOpenCustomizations}
+        >
+          <Blocks size={18} aria-hidden="true" />
+          {t.customizations}
         </button>
       </nav>
 
