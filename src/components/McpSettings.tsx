@@ -1,5 +1,6 @@
-import React, { useMemo, useSyncExternalStore } from 'react';
+import React, { useMemo } from 'react';
 import { Plug, RotateCcw } from 'lucide-react';
+import { useMcpStatuses } from '../hooks/useMcpStatuses';
 import { MCP_CONFIG_EXAMPLE, parseMcpConfig } from '../services/mcp/config';
 import { mcpManager } from '../services/mcp/manager';
 import type { Translation } from '../utils/i18n';
@@ -11,17 +12,9 @@ interface McpSettingsProps {
   t: Translation;
 }
 
-const subscribe = (cb: () => void) => mcpManager.subscribe(cb);
-// statuses() สร้าง array ใหม่ทุกครั้ง — เก็บ snapshot ไว้ให้ useSyncExternalStore เทียบได้
-let snapshot = mcpManager.statuses();
-mcpManager.subscribe(() => {
-  snapshot = mcpManager.statuses();
-});
-const getSnapshot = () => snapshot;
-
 /** แก้ config ของ MCP server (JSON แบบ Claude Desktop) และดูสถานะการเชื่อมต่อจริง */
 export const McpSettings: React.FC<McpSettingsProps> = ({ value, onChange, t }) => {
-  const statuses = useSyncExternalStore(subscribe, getSnapshot);
+  const statuses = useMcpStatuses();
   const parsed = useMemo(() => parseMcpConfig(value), [value]);
 
   return (

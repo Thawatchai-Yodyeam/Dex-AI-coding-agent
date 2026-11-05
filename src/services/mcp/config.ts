@@ -6,7 +6,8 @@
  *     "remote": { "type": "http", "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer ${TOKEN}" } }
  * } }
  *
- * `${NAME}` ใน args/env/url/headers ถูกแทนด้วย environment variable ฝั่ง Rust (ไม่ต้องเก็บ token ไว้ใน settings)
+ * `${NAME}` ใน args/env/url/headers ถูกแทนฝั่ง Rust ด้วยคีย์ใน Credential Manager (กรอกในหน้า Customizations)
+ * หรือ environment variable — ไม่ต้องเก็บ token ไว้ใน settings
  */
 
 export interface McpServerConfig {
@@ -123,4 +124,55 @@ export function parseMcpConfig(text: string | undefined): ParsedMcpConfig {
     usedKeys.add(key);
   }
   return { servers, errors };
+}
+
+const isPlainObject = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v);
+
+/** เปิด config มาแก้ — ตำแหน่งของรายการ server ต้องตรงกับที่ parseMcpConfig อ่าน (throw ถ้า config เสีย) */
+function openMcpConfig(text: string | undefined): { root: Record<string, any>; entries: Record<string, any> } {
+  if (!text?.trim()) {
+    const entries = {};
+    return { root: { mcpServers: entries }, entries };
+  }
+  const root = JSON.parse(text);
+  if (!isPlainObject(root)) throw new Error('Expected an object like { "mcpServers": { ... } }');
+  if (Object.keys(root).length === 0) {
+    const entries = {};
+    return { root: { mcpServers: entries }, entries };
+  }
+  const entries = root.mcpServers ?? root.servers ?? root;
+  if (!isPlainObject(entries)) throw new Error('Expected an object like { "mcpServers": { ... } }');
+  return { root, entries };
+}
+
+/** ทุก server ใน config รวมตัวที่ปิดไว้ (null = config เสีย ห้ามแก้ทับ) */
+export function readMcpEntries(text: string | undefined): Record<string, any> | null {
+  try {
+    return openMcpConfig(text).entries;
+  } catch {
+    return null;
+  }
+}
+
+/** เพิ่ม/แทนที่ server (entry = null คือลบ) — server อื่นและรูปแบบของ config คงเดิม */
+export function withMcpEntry(text: string | undefined, name: string, entry: Record<string, unknown> | null): string {
+  const { root, entries } = openMcpConfig(text);
+  if (entry) entries[name] = entry;
+  else delete entries[name];
+  return JSON.stringify(root, null, 2);
+}
+
+export function isMcpEntryDisabled(entry: unknown): boolean {
+  return isPlainObject(entry) && (entry.disabled === true || entry.enabled === false);
+}
+
+/** เปิด/ปิด server โดยไม่ลบ config ของมัน */
+export function withMcpEntryDisabled(text: string | undefined, name: string, disabled: boolean): string {
+  const { root, entries } = openMcpConfig(text);
+  const entry = entries[name];
+  if (!isPlainObject(entry)) return JSON.stringify(root, null, 2);
+  delete entry.enabled;
+  if (disabled) entry.disabled = true;
+  else delete entry.disabled;
+  return JSON.stringify(root, null, 2);
 }

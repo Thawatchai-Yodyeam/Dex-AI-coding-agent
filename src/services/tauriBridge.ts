@@ -18,6 +18,8 @@ export interface SkillInfo {
   /** โฟลเดอร์ของ skill */
   dir: string;
   source: 'workspace' | 'user';
+  /** ติดตั้งจาก Marketplace (ถอนการติดตั้งได้) */
+  managed?: boolean;
 }
 
 export interface WebPage {
@@ -128,6 +130,25 @@ export const tauriBridge = {
   /** file ว่าง = SKILL.md */
   async readSkillFile(dir: string, file?: string, workspace?: string): Promise<string> {
     return await invoke('read_skill_file', { dir, file, workspace });
+  },
+
+  /** เขียน skill จาก Marketplace ลง ~/.dex/skills/<name> — ไม่เขียนทับ skill ที่ผู้ใช้สร้างเอง */
+  async installUserSkill(name: string, content: string): Promise<string> {
+    return await invoke('install_user_skill', { name, content });
+  },
+
+  async uninstallUserSkill(name: string): Promise<void> {
+    await invoke('uninstall_user_skill', { name });
+  },
+
+  /** คีย์ของ plugin (`${NAME}` ใน config) เก็บใน Credential Manager — value ว่าง = ลบ */
+  async saveMcpSecret(name: string, value: string): Promise<void> {
+    await invoke('save_api_key', { provider: `mcp-secret-${name}`, key: value });
+  },
+
+  /** ตัวแปรไหนมีค่าแล้วบ้าง (ใน Credential Manager หรือ environment) — ไม่คืนค่าจริง */
+  async mcpSecretsPresent(names: string[]): Promise<Record<string, boolean>> {
+    return await invoke('mcp_secrets_present', { names });
   },
 
   /** ประวัติแบบ native ของแชท (JSON) เก็บเป็นไฟล์ใน app data */

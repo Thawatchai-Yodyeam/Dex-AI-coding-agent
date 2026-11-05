@@ -3,9 +3,10 @@ import { BrowserPane } from './components/BrowserPane';
 import { ChatHistorySidebar } from './components/ChatHistorySidebar';
 import { ChatMessageItem } from './components/ChatMessageItem';
 import { Composer } from './components/Composer';
+import { CustomizationsPage } from './components/CustomizationsPage';
 import { DexMark } from './components/DexMark';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { SettingsModal } from './components/SettingsModal';
+import { SettingsModal, type SettingsTab } from './components/SettingsModal';
 import { TerminalDrawer } from './components/TerminalDrawer';
 import { TopBar } from './components/TopBar';
 import { Welcome } from './components/Welcome';
@@ -48,6 +49,9 @@ function AppShell({ stored }: { stored: StoredSessions }) {
   const layout = useResizablePanel();
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab | undefined>();
+  const [customizing, setCustomizing] = useState(false);
+  const showChat = useCallback(() => setCustomizing(false), []);
   const [terminalLogs, setTerminalLogs] = useState<ShellOutputEventPayload[]>([]);
   // แอนิเมชันตอนเปิดแอป — เอา class ออกหลังเล่นจบ ไม่ให้ sidebar เล่นซ้ำตอนพับ/กาง
   const [entering, setEntering] = useState(true);
@@ -133,8 +137,9 @@ function AppShell({ stored }: { stored: StoredSessions }) {
   const { messages } = sessions;
   useEffect(() => {
     const el = scrollRef.current;
+    // รวม customizing ด้วย: ข้อความที่มาตอนแชทถูกซ่อนอยู่จะเลื่อนไม่ได้ ต้องเลื่อนตอนกลับมา
     if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight;
-  }, [messages]);
+  }, [messages, customizing]);
 
   const wallpaperUrl = resolveWallpaper(settings.wallpaper);
   const updateSettings = (patch: Partial<AppSettings>) => setSettings((prev) => ({ ...prev, ...patch }));
@@ -193,18 +198,33 @@ function AppShell({ stored }: { stored: StoredSessions }) {
       <ChatHistorySidebar
         sessions={sessions.sessions}
         currentSessionId={sessions.currentSessionId}
-        onSelectSession={sessions.handleSelectSession}
-        onNewChat={sessions.handleNewChat}
+        onSelectSession={(id) => {
+          showChat();
+          void sessions.handleSelectSession(id);
+        }}
+        onNewChat={() => {
+          showChat();
+          sessions.handleNewChat();
+        }}
         onDeleteSession={sessions.handleDeleteSession}
         onRenameSession={sessions.handleRenameSession}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSettings={() => {
+          setSettingsTab(undefined);
+          setSettingsOpen(true);
+        }}
         t={t}
         width={layout.sidebarWidth}
         collapsed={layout.sidebarCollapsed}
         onToggleCollapse={layout.toggleSidebarCollapse}
         workspace={settings.cwd}
         autoPilot={settings.autoPilot}
-        onInsertPrompt={chat.setInputPrompt}
+        onInsertPrompt={(text) => {
+          showChat();
+          chat.setInputPrompt(text);
+        }}
+        customizationsOpen={customizing}
+        onOpenCustomizations={() => setCustomizing(true)}
+        onShowChat={showChat}
       />
 
       {!layout.sidebarCollapsed && (
@@ -216,7 +236,7 @@ function AppShell({ stored }: { stored: StoredSessions }) {
         />
       )}
 
-      <main className="main">
+      <main className={`main ${customizing ? 'is-customizing' : ''}`}>
         <TopBar
           title={currentSession?.title || t.untitledChat}
           cwd={settings.cwd}
@@ -224,7 +244,8 @@ function AppShell({ stored }: { stored: StoredSessions }) {
           terminalOpen={terminalOpen}
           browserOpen={browser.visible && !design.active}
           designOpen={browser.visible && design.active}
-          hasMessages={messages.length > 0}
+          // มองไม่เห็นแชทอยู่ — ซ่อนชื่อและปุ่มล้างแชท กันล้างโดยไม่รู้ตัว
+          hasMessages={messages.length > 0 && !customizing}
           t={t}
           onSelectWorkspace={handleSelectWorkspace}
           onToggleAutoPilot={() => updateSettings({ autoPilot: !settings.autoPilot })}
@@ -247,6 +268,21 @@ function AppShell({ stored }: { stored: StoredSessions }) {
           </div>
         )}
 
+        {customizing && (
+          <CustomizationsPage
+            settings={settings}
+            setSettings={setSettings}
+            t={t}
+            agentRunning={chat.isRunning}
+            onBackToChat={showChat}
+            onEditConfig={() => {
+              setSettingsTab('extensions');
+              setSettingsOpen(true);
+            }}
+          />
+        )}
+
+        {/* แชทยังอยู่ใน DOM ตอนเปิด Customizations (ซ่อนด้วย CSS) ตำแหน่ง scroll และ tool ที่กางไว้จึงไม่หาย */}
         {messages.length === 0 ? (
           <div className="main-scroll is-centered">
             <Welcome t={t} composer={composer(true)} onQuickPrompt={(p) => chat.handleSendMessage(p)} />
@@ -304,7 +340,10 @@ function AppShell({ stored }: { stored: StoredSessions }) {
       {browser.visible && (
         <BrowserPane
           t={t}
-          onStartDesign={() => chat.setInputPrompt(t.designStarterPrompt)}
+          onStartDesign={() => {
+            showChat();
+            chat.setInputPrompt(t.designStarterPrompt);
+          }}
           agentRunning={chat.isRunning}
           onSendDesignComments={(prompt) => {
             // handleSendMessage ไม่บอกว่าส่งไปจริงไหม จึงเช็กเงื่อนไขเดียวกันก่อน — ไม่มีคีย์ก็ให้ไปตั้งค่า
@@ -312,6 +351,7 @@ function AppShell({ stored }: { stored: StoredSessions }) {
               setSettingsOpen(true);
               return false;
             }
+            showChat();
             void chat.handleSendMessage(prompt);
             return true;
           }}
@@ -323,6 +363,7 @@ function AppShell({ stored }: { stored: StoredSessions }) {
         onClose={closeSettings}
         settings={settings}
         onSave={setSettings}
+        initialTab={settingsTab}
       />
     </div>
   );
