@@ -9,18 +9,21 @@ import {
   customSkills,
   enabledPatch,
   installPatch,
+  installedTarget,
   matchesQuery,
   needsOauthMigration,
-  oauthMigrationPatch,
+  pluginHasUpdate,
   pluginRuntime,
   pluginState,
   pluginTarget,
   prepareInstall,
   prepareRemoveCustomServer,
   prepareUninstall,
+  readManagedSkillFiles,
   removeLegacySecrets,
   renderSkillFile,
   uninstallPatch,
+  updatePatch,
   usesOauth,
 } from './plugins';
 
@@ -29,6 +32,7 @@ const bridge = vi.hoisted(() => ({
   installUserSkill: vi.fn(async () => 'dir'),
   uninstallUserSkill: vi.fn(async () => {}),
   mcpOauthLogout: vi.fn(async () => {}),
+  readSkillFile: vi.fn(async (_dir: string, _file?: string, _workspace?: string) => ''),
 }));
 vi.mock('../tauriBridge', () => ({ tauriBridge: bridge }));
 
@@ -98,6 +102,20 @@ describe('catalog', () => {
       for (const secret of plugin.secrets ?? []) expect(secret.helpUrl).toMatch(/^https:\/\//);
     }
   );
+
+  it.each(
+    MARKETPLACE_PLUGINS.filter((p) => p.install.kind === 'mcp' && p.install.server.command).map((p) => [p.id, p] as const)
+  )('%s pins an exact package version and names a runtime', (_id, plugin) => {
+    if (plugin.install.kind !== 'mcp') throw new Error('unreachable');
+    const { command, args } = plugin.install.server as { command: string; args: string[] };
+    // คำสั่งอื่นต้องเพิ่มใน pluginRuntime ด้วย ไม่งั้นผู้ใช้ไม่รู้ว่าเครื่องขาดอะไร
+    expect(['npx', 'uvx']).toContain(command);
+    expect(pluginRuntime(plugin)?.command).toBe(command);
+    const spec = command === 'npx' ? args[1] : args[0];
+    if (command === 'npx') expect(args[0]).toBe('-y');
+    // ไม่ pin = เปิดแอปครั้งถัดไปอาจได้โค้ดเวอร์ชันใหม่มารันโดยไม่มีใครถาม
+    expect(spec).toMatch(/^(@[\w-]+\/)?[\w.-]+@\d+(\.\d+)+$/);
+  });
 
   it('sends remote servers over https only', () => {
     for (const plugin of MARKETPLACE_PLUGINS) {
@@ -234,6 +252,90 @@ describe('plugin state', () => {
   });
 });
 
+describe('plugin updates', () => {
+  const pinned = byId('sequential-thinking');
+  const server = (pinned.install as { server: Record<string, any> }).server;
+  const configWith = (entry: Record<string, unknown>) => JSON.stringify({ mcpServers: { [pinned.id]: entry } });
+
+  it('finds nothing to update right after install', () => {
+    const settings = installPatch(pinned, {});
+    expect(pluginHasUpdate(pinned, settings, {})).toBe(false);
+    expect(pluginHasUpdate(mcpPlugin, installPatch(mcpPlugin, {}), {})).toBe(false);
+  });
+
+  it('finds nothing when the plugin is not installed or the config is broken', () => {
+    expect(pluginHasUpdate(pinned, {}, {})).toBe(false);
+    expect(pluginHasUpdate(pinned, { mcpConfig: '{ broken' }, {})).toBe(false);
+  });
+
+  it('flags an older version and an entry installed before versions were pinned', () => {
+    const older = { ...server, args: ['-y', '@modelcontextprotocol/server-sequential-thinking@1.0.0'] };
+    expect(pluginHasUpdate(pinned, { mcpConfig: configWith(older) }, {})).toBe(true);
+    const unpinned = { ...server, args: ['-y', '@modelcontextprotocol/server-sequential-thinking'] };
+    const settings = { mcpConfig: configWith(unpinned) };
+    expect(pluginHasUpdate(pinned, settings, {})).toBe(true);
+    expect(installedTarget(pinned, settings)).toBe('npx -y @modelcontextprotocol/server-sequential-thinking');
+    expect(pluginTarget(pinned)).toMatch(/server-sequential-thinking@\d/);
+  });
+
+  it('flags a key that was renamed in the catalog', () => {
+    const sentry = byId('sentry');
+    const entry = (sentry.install as { server: Record<string, any> }).server;
+    const old = JSON.stringify({ mcpServers: { sentry: { ...entry, env: { SENTRY_AUTH_TOKEN: '${SENTRY_AUTH_TOKEN}' } } } });
+    expect(pluginHasUpdate(sentry, { mcpConfig: old }, {})).toBe(true);
+  });
+
+  it('does not treat turning a plugin off as an update', () => {
+    const off = enabledPatch(pinned, false, installPatch(pinned, {}));
+    expect(pluginHasUpdate(pinned, off, {})).toBe(false);
+    expect(pluginHasUpdate(pinned, enabledPatch(pinned, true, off), {})).toBe(false);
+  });
+
+  it('brings the entry up to date and keeps what belongs to the user', () => {
+    const settings = {
+      mcpConfig: configWith({ command: 'npx', args: ['-y', 'old@1.0.0'], env: { OLD_VAR: 'x' }, disabled: true, cwd: 'D:/mine' }),
+    };
+    const next = updatePatch(pinned, settings);
+    const entry = readMcpEntries(next.mcpConfig)![pinned.id];
+    expect(entry.args).toEqual(server.args);
+    expect(entry.env).toBeUndefined();
+    expect(entry.disabled).toBe(true);
+    expect(entry.cwd).toBe('D:/mine');
+    expect(pluginState(pinned, next, [])).toBe('disabled');
+    // ไม่ถูกติดป้ายซ้ำหลังอัปเดต
+    expect(pluginHasUpdate(pinned, next, {})).toBe(false);
+  });
+
+  it('keeps other servers when updating', () => {
+    const text = JSON.stringify({ mcpServers: { mine: { command: 'x' }, [pinned.id]: { command: 'npx', args: [] } } });
+    expect(Object.keys(readMcpEntries(updatePatch(pinned, { mcpConfig: text }).mcpConfig)!)).toEqual(['mine', pinned.id]);
+  });
+
+  it('compares skills by the installed file, and only for ones it installed', () => {
+    if (skillPlugin.install.kind !== 'skill') throw new Error('unreachable');
+    const current = renderSkillFile(skillPlugin.install);
+    expect(pluginHasUpdate(skillPlugin, {}, {})).toBe(false);
+    expect(pluginHasUpdate(skillPlugin, {}, { 'code-review': current })).toBe(false);
+    expect(pluginHasUpdate(skillPlugin, {}, { 'code-review': `${current}\nedited` })).toBe(true);
+    expect(updatePatch(skillPlugin, {})).toEqual({});
+  });
+
+  it('reads only managed skills and survives an unreadable file', async () => {
+    bridge.readSkillFile.mockReset();
+    bridge.readSkillFile.mockImplementation(async (dir: string) => {
+      if (dir.endsWith('broken')) throw new Error('gone');
+      return `text of ${dir}`;
+    });
+    const files = await readManagedSkillFiles(
+      [skill('Code-Review', { managed: true }), skill('broken', { managed: true }), skill('mine')],
+      'D:/ws'
+    );
+    expect(files).toEqual({ 'code-review': 'text of C:/skills/Code-Review' });
+    expect(bridge.readSkillFile).toHaveBeenCalledTimes(2);
+    expect(bridge.readSkillFile).toHaveBeenCalledWith('C:/skills/Code-Review', undefined, 'D:/ws');
+  });
+});
+
 describe('install and uninstall side effects', () => {
   beforeEach(() => vi.clearAllMocks());
 
@@ -323,9 +425,10 @@ describe('moving an older install to sign-in', () => {
 
   beforeEach(() => vi.clearAllMocks());
 
-  it('keeps the old config working until the user signs in', () => {
+  it('keeps the old config working until the user signs in, and offers it as an update', () => {
     expect(pluginState(oauthPlugin, legacy, [])).toBe('enabled');
     expect(needsOauthMigration(oauthPlugin, legacy)).toBe(true);
+    expect(pluginHasUpdate(oauthPlugin, legacy, {})).toBe(true);
     const [server] = parseMcpConfig(legacy.mcpConfig).servers;
     expect(server.auth).toBeUndefined();
     expect(server.headers?.Authorization).toContain('SUPABASE_ACCESS_TOKEN');
@@ -333,21 +436,29 @@ describe('moving an older install to sign-in', () => {
 
   it('does not offer it for fresh installs, other plugins or nothing installed', () => {
     expect(needsOauthMigration(oauthPlugin, installPatch(oauthPlugin, {}))).toBe(false);
+    expect(pluginHasUpdate(oauthPlugin, installPatch(oauthPlugin, {}), {})).toBe(false);
     expect(needsOauthMigration(oauthPlugin, {})).toBe(false);
     expect(needsOauthMigration(keyedPlugin, installPatch(keyedPlugin, {}))).toBe(false);
   });
 
   it('replaces the config and removes the old key', async () => {
-    const patched = oauthMigrationPatch(oauthPlugin, legacy);
+    const patched = updatePatch(oauthPlugin, legacy);
     expect(needsOauthMigration(oauthPlugin, patched)).toBe(false);
-    expect(patched.mcpConfig).not.toContain('SUPABASE_ACCESS_TOKEN');
+    expect(pluginHasUpdate(oauthPlugin, patched, {})).toBe(false);
+    expect(readMcpEntries(patched.mcpConfig)!.supabase).toEqual(oauthPlugin.install.kind === 'mcp' ? oauthPlugin.install.server : null);
     await removeLegacySecrets(oauthPlugin);
     expect(bridge.saveMcpSecret).toHaveBeenCalledWith('SUPABASE_ACCESS_TOKEN', '');
   });
 
+  it('also removes the key name of the release before the version pinning', async () => {
+    await removeLegacySecrets(MARKETPLACE_PLUGINS.find((p) => p.id === 'sentry')!);
+    expect(bridge.saveMcpSecret).toHaveBeenCalledWith('SENTRY_AUTH_TOKEN', '');
+    expect(bridge.saveMcpSecret).toHaveBeenCalledWith('SENTRY_ACCESS_TOKEN', '');
+  });
+
   it('keeps a disabled plugin disabled', () => {
     const off = { mcpConfig: withMcpEntryDisabled(legacy.mcpConfig, 'supabase', true) };
-    const patched = oauthMigrationPatch(oauthPlugin, off);
+    const patched = updatePatch(oauthPlugin, off);
     expect(pluginState(oauthPlugin, patched, [])).toBe('disabled');
     expect(readMcpEntries(patched.mcpConfig)!.supabase.auth).toBe('oauth');
   });
@@ -364,7 +475,7 @@ describe('page helpers', () => {
   });
 
   it('shows what will run before install', () => {
-    expect(pluginTarget(byId('sequential-thinking'))).toBe('npx -y @modelcontextprotocol/server-sequential-thinking');
+    expect(pluginTarget(byId('sequential-thinking'))).toMatch(/^npx -y @modelcontextprotocol\/server-sequential-thinking@\d/);
     expect(pluginTarget(mcpPlugin)).toBe('https://mcp.context7.com/mcp');
     expect(pluginTarget(skillPlugin)).toBe('~/.dex/skills/code-review/SKILL.md');
   });

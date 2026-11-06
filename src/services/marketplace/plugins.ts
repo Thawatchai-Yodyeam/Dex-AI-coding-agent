@@ -74,7 +74,7 @@ export function usesOauth(plugin: MarketplacePlugin): boolean {
 
 /**
  * ติดตั้งไว้ตั้งแต่รุ่นที่ยังใช้คีย์ — config เดิมยังใช้งานได้ จึงไม่แก้ให้เองจนกว่าผู้ใช้จะล็อกอิน
- * (ถ้าเปลี่ยนให้เลย ผู้ใช้จะถูกตัดการเชื่อมต่อโดยไม่ได้สั่ง)
+ * (ถ้าเปลี่ยนให้เลย ผู้ใช้จะถูกตัดการเชื่อมต่อโดยไม่ได้สั่ง) ตอนนั้น pluginHasUpdate เป็นจริง และอัปเดตด้วย updatePatch
  */
 export function needsOauthMigration(plugin: MarketplacePlugin, settings: PluginSettings): boolean {
   if (!usesOauth(plugin)) return false;
@@ -85,13 +85,6 @@ export function needsOauthMigration(plugin: MarketplacePlugin, settings: PluginS
 /** คีย์ของรุ่นเก่าที่ OAuth มาแทนแล้ว */
 export async function removeLegacySecrets(plugin: MarketplacePlugin): Promise<void> {
   for (const name of plugin.legacySecrets ?? []) await tauriBridge.saveMcpSecret(name, '');
-}
-
-/** เปลี่ยน config เดิมเป็นแบบ OAuth โดยคงสถานะเปิด/ปิดไว้ */
-export function oauthMigrationPatch(plugin: MarketplacePlugin, settings: PluginSettings): PluginSettings {
-  const disabled = isMcpEntryDisabled(readMcpEntries(settings.mcpConfig)?.[plugin.id]);
-  const patch = installPatch(plugin, settings);
-  return disabled ? { mcpConfig: withMcpEntryDisabled(patch.mcpConfig, plugin.id, true) } : patch;
 }
 
 /** ลบไฟล์ skill คีย์ และ token ของ plugin — ทำก่อน uninstallPatch: ถ้าพังก็ยังถือว่าติดตั้งอยู่และลองใหม่ได้ */
@@ -124,19 +117,75 @@ export function enabledPatch(plugin: MarketplacePlugin, enabled: boolean, settin
   return { mcpConfig: withMcpEntryDisabled(settings.mcpConfig, plugin.id, !enabled) };
 }
 
+/**
+ * ฟิลด์ที่ catalog เป็นเจ้าของ — ฟิลด์อื่นใน entry (disabled, cwd ฯลฯ) เป็นของผู้ใช้
+ * ต้องคงไว้ตอนอัปเดต และเปลี่ยนสถานะเปิด/ปิดแล้วต้องไม่ถูกนับว่ามีเวอร์ชันใหม่
+ */
+const CATALOG_MCP_FIELDS = ['type', 'transport', 'command', 'args', 'env', 'url', 'headers', 'auth'];
+
+/**
+ * ของที่ติดตั้งไว้ไม่ตรงกับ catalog — ไม่อัปเดตให้เองเพราะจะได้โค้ดใหม่มารันโดยผู้ใช้ไม่รู้
+ * skillFiles: เนื้อหา SKILL.md จาก readManagedSkillFiles
+ */
+export function pluginHasUpdate(plugin: MarketplacePlugin, settings: PluginSettings, skillFiles: Record<string, string>): boolean {
+  if (plugin.install.kind === 'skill') {
+    const current = skillFiles[plugin.install.skillName.toLowerCase()];
+    return current !== undefined && current !== renderSkillFile(plugin.install);
+  }
+  const entry = readMcpEntries(settings.mcpConfig)?.[plugin.id];
+  if (!entry) return false;
+  const { server } = plugin.install;
+  return CATALOG_MCP_FIELDS.some((field) => JSON.stringify(entry[field]) !== JSON.stringify(server[field]));
+}
+
+/** ใช้คู่กับ prepareInstall ซึ่งเก็บคีย์ใหม่และเขียนไฟล์ skill ทับให้แล้ว */
+export function updatePatch(plugin: MarketplacePlugin, settings: PluginSettings): PluginSettings {
+  if (plugin.install.kind === 'skill') return {};
+  const entry = readMcpEntries(settings.mcpConfig)?.[plugin.id] ?? {};
+  const kept = Object.fromEntries(Object.entries(entry).filter(([field]) => !CATALOG_MCP_FIELDS.includes(field)));
+  return { mcpConfig: withMcpEntry(settings.mcpConfig, plugin.id, { ...kept, ...plugin.install.server }) };
+}
+
+/** เนื้อหา SKILL.md ของ skill ที่ Marketplace ติดตั้ง (ชื่อตัวพิมพ์เล็ก → เนื้อหา) อ่านไม่ได้ก็ถือว่าไม่มีอัปเดต */
+export async function readManagedSkillFiles(skills: SkillInfo[], cwd: string): Promise<Record<string, string>> {
+  const files = await Promise.all(
+    skills
+      .filter((skill) => skill.managed)
+      .map(async (skill): Promise<[string, string] | null> => {
+        try {
+          return [skill.name.toLowerCase(), await tauriBridge.readSkillFile(skill.dir, undefined, cwd)];
+        } catch {
+          return null;
+        }
+      })
+  );
+  return Object.fromEntries(files.filter((file) => file !== null));
+}
+
 /** โปรแกรมที่เครื่องต้องมีก่อน plugin จะรันได้ */
-export function pluginRuntime(plugin: MarketplacePlugin): { name: string; url: string } | null {
+export function pluginRuntime(plugin: MarketplacePlugin): { command: string; name: string; url: string } | null {
   if (plugin.install.kind !== 'mcp') return null;
-  if (plugin.install.server.command === 'npx') return { name: 'Node.js', url: 'https://nodejs.org/' };
-  if (plugin.install.server.command === 'uvx') return { name: 'uv', url: 'https://docs.astral.sh/uv/getting-started/installation/' };
+  if (plugin.install.server.command === 'npx') return { command: 'npx', name: 'Node.js', url: 'https://nodejs.org/' };
+  if (plugin.install.server.command === 'uvx') {
+    return { command: 'uvx', name: 'uv', url: 'https://docs.astral.sh/uv/getting-started/installation/' };
+  }
   return null;
 }
+
+const mcpTarget = (entry: Record<string, unknown>): string =>
+  typeof entry.url === 'string' ? entry.url : [entry.command, ...(Array.isArray(entry.args) ? entry.args : [])].join(' ');
 
 /** บรรทัดคำสั่ง หรือ URL ที่ผู้ใช้ต้องเห็นก่อนกดติดตั้ง */
 export function pluginTarget(plugin: MarketplacePlugin): string {
   if (plugin.install.kind === 'skill') return `~/.dex/skills/${plugin.install.skillName}/SKILL.md`;
-  const { command, args, url } = plugin.install.server;
-  return typeof url === 'string' ? url : [command, ...((args as string[] | undefined) ?? [])].join(' ');
+  return mcpTarget(plugin.install.server);
+}
+
+/** คำสั่งหรือ URL ที่ติดตั้งอยู่จริงตอนนี้ */
+export function installedTarget(plugin: MarketplacePlugin, settings: PluginSettings): string | null {
+  if (plugin.install.kind !== 'mcp') return null;
+  const entry = readMcpEntries(settings.mcpConfig)?.[plugin.id];
+  return entry ? mcpTarget(entry) : null;
 }
 
 export function matchesQuery(plugin: MarketplacePlugin, query: string): boolean {

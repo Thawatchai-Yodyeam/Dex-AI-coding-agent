@@ -15,6 +15,10 @@ import {
  * เพิ่ม plugin: ตรวจว่าแพ็กเกจ/URL มีจริงและรันได้ แล้วเติมที่นี่ — marketplace.test.ts ตรวจความสอดคล้องของข้อมูลให้
  * คีย์ต้องส่งผ่าน `${NAME}` ใน env/headers เสมอ (ห้ามใส่ใน args: จะเห็นใน process list)
  *
+ * แพ็กเกจของ npx/uvx ต้องระบุเวอร์ชันตายตัว: server เริ่มเองทุกครั้งที่เปิดแอป ถ้าไม่ pin จะได้โค้ดใหม่มารันโดยไม่มีใครถาม
+ * ตอนเปลี่ยนเวอร์ชัน ให้ดูชื่อ flag และตัวแปรจากแพ็กเกจเวอร์ชันนั้นจริง ๆ — README บน GitHub อาจล้ำหน้าเวอร์ชันที่ปล่อยแล้ว
+ * และเลือกเวอร์ชันที่ปล่อยมาสักพัก เผื่อเวอร์ชันที่ถูกแฮ็กหรือพังถูกจับได้ก่อน ผู้ที่ติดตั้งไว้จะเห็นปุ่มอัปเดตเอง
+ *
  * remoteOauth ใช้ได้เฉพาะ server ที่เอกสารทางการยืนยันและ metadata จริงมี registration_endpoint กับ S256
  * ที่ตรวจแล้วว่าใช้ไม่ได้ (2026-11-05): GitHub และ Asana ไม่มี registration_endpoint, Atlassian v1 ไม่มี protected
  * resource metadata, Figma รับเฉพาะ client ใน catalog ของตัวเอง, Google Workspace แบบ hosted ไม่มี
@@ -224,7 +228,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
     install: {
       kind: 'mcp',
       // ค่าเริ่มต้นเก็บในโฟลเดอร์แพ็กเกจของ npx ซึ่งถูกล้างได้ — ย้ายมาไว้ใน home ไม่ให้ความจำหาย
-      server: npx(['@modelcontextprotocol/server-memory'], { MEMORY_FILE_PATH: '${USERPROFILE}/.dex-memory.jsonl' }),
+      server: npx(['@modelcontextprotocol/server-memory@2.0.1'], { MEMORY_FILE_PATH: '${USERPROFILE}/.dex-memory.jsonl' }),
     },
   },
   {
@@ -239,7 +243,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
       en: 'Lets the agent think in revisable steps, for problems that need planning.',
     },
     homepage: `${MCP_SERVERS_REPO}/sequentialthinking`,
-    install: { kind: 'mcp', server: npx(['@modelcontextprotocol/server-sequential-thinking']) },
+    install: { kind: 'mcp', server: npx(['@modelcontextprotocol/server-sequential-thinking@2.0.0']) },
   },
   {
     id: 'time',
@@ -253,7 +257,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
       en: 'Current time and time zone conversion.',
     },
     homepage: `${MCP_SERVERS_REPO}/time`,
-    install: { kind: 'mcp', server: uvx(['mcp-server-time']) },
+    install: { kind: 'mcp', server: uvx(['mcp-server-time@2026.10.28']) },
   },
   {
     id: 'git',
@@ -267,7 +271,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
       en: 'Read logs and diffs, search history and manage branches in local repos.',
     },
     homepage: `${MCP_SERVERS_REPO}/git`,
-    install: { kind: 'mcp', server: uvx(['mcp-server-git']) },
+    install: { kind: 'mcp', server: uvx(['mcp-server-git@2026.10.28']) },
   },
 
   // ---------- เว็บและเบราว์เซอร์ ----------
@@ -284,7 +288,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
     },
     note: { th: 'ต้องมี Google Chrome ในเครื่อง', en: 'Needs Google Chrome on this machine.' },
     homepage: 'https://github.com/ChromeDevTools/chrome-devtools-mcp',
-    install: { kind: 'mcp', server: npx(['chrome-devtools-mcp@latest']) },
+    install: { kind: 'mcp', server: npx(['chrome-devtools-mcp@1.12.0']) },
   },
   {
     id: 'playwright',
@@ -298,7 +302,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
       en: 'Open a browser, click and fill forms to test web apps end to end.',
     },
     homepage: 'https://github.com/microsoft/playwright-mcp',
-    install: { kind: 'mcp', server: npx(['@playwright/mcp@latest']) },
+    install: { kind: 'mcp', server: npx(['@playwright/mcp@0.0.83']) },
   },
   {
     id: 'brave-search',
@@ -315,7 +319,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
     secrets: [{ name: 'BRAVE_API_KEY', label: 'Brave Search API key', helpUrl: 'https://brave.com/search/api/' }],
     install: {
       kind: 'mcp',
-      server: npx(['@brave/brave-search-mcp-server', '--transport', 'stdio'], secretEnv('BRAVE_API_KEY')),
+      server: npx(['@brave/brave-search-mcp-server@2.1.4', '--transport', 'stdio'], secretEnv('BRAVE_API_KEY')),
     },
   },
   {
@@ -331,7 +335,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
     },
     homepage: 'https://github.com/tavily-ai/tavily-mcp',
     secrets: [{ name: 'TAVILY_API_KEY', label: 'Tavily API key', helpUrl: 'https://app.tavily.com/' }],
-    install: { kind: 'mcp', server: npx(['tavily-mcp@latest'], secretEnv('TAVILY_API_KEY')) },
+    install: { kind: 'mcp', server: npx(['tavily-mcp@0.2.22'], secretEnv('TAVILY_API_KEY')) },
   },
   {
     id: 'firecrawl',
@@ -346,7 +350,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
     },
     homepage: 'https://github.com/firecrawl/firecrawl-mcp-server',
     secrets: [{ name: 'FIRECRAWL_API_KEY', label: 'Firecrawl API key', helpUrl: 'https://www.firecrawl.dev/app/api-keys' }],
-    install: { kind: 'mcp', server: npx(['firecrawl-mcp'], secretEnv('FIRECRAWL_API_KEY')) },
+    install: { kind: 'mcp', server: npx(['firecrawl-mcp@3.36.0'], secretEnv('FIRECRAWL_API_KEY')) },
   },
 
   // ---------- สร้างและดูแลระบบ ----------
@@ -390,7 +394,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
       en: 'Sign in first with npx firebase-tools login.',
     },
     homepage: 'https://firebase.google.com/docs/cli/mcp-server',
-    install: { kind: 'mcp', server: npx(['firebase-tools@latest', 'mcp', '--dir', '.']) },
+    install: { kind: 'mcp', server: npx(['firebase-tools@15.34.2', 'mcp', '--dir', '.']) },
   },
   {
     id: 'supabase',
@@ -441,7 +445,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
       en: 'Works with sentry.io. For self-hosted Sentry, add @sentry/mcp-server yourself in Settings.',
     },
     homepage: 'https://docs.sentry.io/product/sentry-mcp/',
-    legacySecrets: ['SENTRY_AUTH_TOKEN'],
+    legacySecrets: ['SENTRY_AUTH_TOKEN', 'SENTRY_ACCESS_TOKEN'],
     install: { kind: 'mcp', server: remoteOauth('https://mcp.sentry.dev/mcp') },
   },
   {
@@ -465,7 +469,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
     ],
     install: {
       kind: 'mcp',
-      server: npx(['mongodb-mcp-server@latest', '--readOnly'], secretEnv('MDB_MCP_CONNECTION_STRING')),
+      server: npx(['mongodb-mcp-server@3.2.2', '--readOnly'], secretEnv('MDB_MCP_CONNECTION_STRING')),
     },
   },
   {
@@ -557,7 +561,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
     ],
     install: {
       kind: 'mcp',
-      server: uvx(['workspace-mcp', '--tool-tier', 'core'], secretEnv('GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET')),
+      server: uvx(['workspace-mcp@2.2.1', '--tool-tier', 'core'], secretEnv('GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET')),
     },
   },
   {
@@ -609,7 +613,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
         helpUrl: 'https://help.figma.com/hc/en-us/articles/8085703771159-Manage-personal-access-tokens',
       },
     ],
-    install: { kind: 'mcp', server: npx(['figma-developer-mcp', '--stdio'], secretEnv('FIGMA_API_KEY')) },
+    install: { kind: 'mcp', server: npx(['figma-developer-mcp@0.13.2', '--stdio'], secretEnv('FIGMA_API_KEY')) },
   },
 
   // ---------- เกมและ 3D ----------
@@ -626,11 +630,11 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
       en: 'Create and edit 3D scenes in your open Blender from the chat.',
     },
     note: {
-      th: 'ต้องติดตั้ง add-on ก่อนด้วย uvx mcp-for-blender install-addon และเปิด Blender ไว้',
-      en: 'Install the add-on first with uvx mcp-for-blender install-addon, then keep Blender open.',
+      th: 'ต้องติดตั้ง add-on ก่อนด้วย uvx mcp-for-blender@2.2.6 install-addon และเปิด Blender ไว้',
+      en: 'Install the add-on first with uvx mcp-for-blender@2.2.6 install-addon, then keep Blender open.',
     },
     homepage: 'https://github.com/ahujasid/mcp-for-blender',
-    install: { kind: 'mcp', server: uvx(['mcp-for-blender']) },
+    install: { kind: 'mcp', server: uvx(['mcp-for-blender@2.2.6']) },
   },
   {
     id: 'godot',
@@ -649,7 +653,7 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
       en: 'Needs Godot on this machine. Set the GODOT_PATH environment variable if it is not found.',
     },
     homepage: 'https://github.com/Coding-Solo/godot-mcp',
-    install: { kind: 'mcp', server: npx(['@coding-solo/godot-mcp']) },
+    install: { kind: 'mcp', server: npx(['@coding-solo/godot-mcp@0.1.1']) },
   },
 
   // ---------- ชุด Skill ----------

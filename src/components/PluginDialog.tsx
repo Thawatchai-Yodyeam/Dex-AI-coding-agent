@@ -17,10 +17,16 @@ interface PluginDialogProps {
   uninstallable: boolean;
   /** ติดตั้งไว้ตั้งแต่รุ่นที่ใช้คีย์ และ config ยังเป็นแบบเดิม */
   legacyAuth: boolean;
+  /** ของที่ติดตั้งไว้ไม่ตรงกับ catalog */
+  hasUpdate: boolean;
+  /** คำสั่งหรือ URL ที่ติดตั้งอยู่ตอนนี้ (null = ไม่ต้องแสดง เช่น skill) */
+  currentTarget: string | null;
   language: AppLanguage;
   t: Translation;
   /** signIn = ต้องล็อกอินก่อนเพิ่มลง config */
   onInstall: (values: Record<string, string>, signIn?: () => Promise<void>) => Promise<void>;
+  /** signIn = ต้องล็อกอินก่อนเปลี่ยน config (ย้ายจากคีย์มาล็อกอิน) */
+  onUpdate: (values: Record<string, string>, signIn?: () => Promise<void>) => Promise<void>;
   onSignedIn: () => Promise<void>;
   onSignedOut: () => void;
   onUninstall: () => Promise<void>;
@@ -45,9 +51,12 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
   status,
   uninstallable,
   legacyAuth,
+  hasUpdate,
+  currentTarget,
   language,
   t,
   onInstall,
+  onUpdate,
   onSignedIn,
   onSignedOut,
   onUninstall,
@@ -64,11 +73,13 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
   const [oauth, setOauth] = useState<McpOauthStatus | null>(null);
   const [signingIn, setSigningIn] = useState(false);
   const signingInRef = useRef(false);
+  const [runtimeFound, setRuntimeFound] = useState(true);
   const dialogRef = useRef<HTMLDivElement>(null);
 
   const secrets = plugin.secrets ?? [];
   const installed = state !== 'available';
   const runtime = pluginRuntime(plugin);
+  const runtimeCommand = runtime?.command;
   const isRemote = plugin.install.kind === 'mcp' && typeof plugin.install.server.url === 'string';
   const hasTypedKeys = secrets.some((s) => values[s.name]?.trim());
   const missingKey = secrets.some((s) => !present[s.name] && !values[s.name]?.trim());
@@ -105,6 +116,15 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
     },
     [plugin.id]
   );
+
+  useEffect(() => {
+    if (!runtimeCommand) return;
+    // เช็กไม่ได้ (รันนอก Tauri) ก็ไม่บล็อก — ถ้าขาดจริง สถานะ error ของ server ยังบอกสาเหตุได้
+    tauriBridge
+      .commandAvailable(runtimeCommand)
+      .then(setRuntimeFound)
+      .catch(() => setRuntimeFound(true));
+  }, [runtimeCommand]);
 
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
@@ -159,6 +179,13 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
       await tauriBridge.mcpOauthLogout(plugin.id);
       refreshOauth();
       onSignedOut();
+    });
+
+  const handleUpdate = () =>
+    run(async () => {
+      await onUpdate(values, isOauth && !signedIn ? signIn : undefined);
+      setValues({});
+      refreshPresent();
     });
 
   const handleSaveKeys = () =>
@@ -220,6 +247,19 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
             </div>
           )}
 
+          {hasUpdate && (
+            <section className="plugin-update">
+              <h3 className="plugin-target-title">{t.pluginUpdateTitle}</h3>
+              {currentTarget && (
+                <>
+                  <p className="field-hint">{t.pluginUpdateCurrent}</p>
+                  <code className="plugin-target-code">{currentTarget}</code>
+                </>
+              )}
+              <p className="field-hint">{plugin.install.kind === 'skill' ? t.pluginUpdateSkillHint : t.pluginUpdateHint}</p>
+            </section>
+          )}
+
           <section className="plugin-target">
             <h3 className="plugin-target-title">
               {plugin.install.kind === 'skill' ? t.pluginAddsSkill : isRemote ? t.pluginConnectsTo : t.pluginRunsCommand}
@@ -238,14 +278,17 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
 
           {(runtime || plugin.note) && (
             <ul className="plugin-requirements">
-              {runtime && (
-                <li>
-                  {t.pluginNeedsRuntime(runtime.name)}{' '}
-                  <a href={runtime.url} onClick={(e) => openExternal(e, runtime.url)}>
-                    {t.pluginGetRuntime}
-                  </a>
-                </li>
-              )}
+              {runtime &&
+                (runtimeFound ? (
+                  <li>{t.pluginRuntimeFound(runtime.name)}</li>
+                ) : (
+                  <li className="is-missing" role="alert">
+                    {t.pluginRuntimeMissing(runtime.name)}{' '}
+                    <a href={runtime.url} onClick={(e) => openExternal(e, runtime.url)}>
+                      {t.pluginGetRuntime}
+                    </a>
+                  </li>
+                ))}
               {plugin.note && <li>{plugin.note[language]}</li>}
             </ul>
           )}
@@ -335,7 +378,7 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
 
         <footer className="plugin-dialog-foot">
           {!installed ? (
-            <button type="button" className="btn btn-primary" disabled={busy || missingKey} onClick={handleInstall}>
+            <button type="button" className="btn btn-primary" disabled={busy || missingKey || !runtimeFound} onClick={handleInstall}>
               <Plus size={16} aria-hidden="true" />
               {signingIn ? t.oauthWaiting : busy ? t.pluginInstalling : isOauth && !signedIn ? t.oauthInstallAndSignIn : t.pluginInstall}
             </button>
@@ -354,7 +397,8 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
               ) : (
                 <p className="field-hint plugin-foot-note">{t.pluginNotManaged}</p>
               )}
-              {hasTypedKeys && (
+              {/* ตอนมีอัปเดต ปุ่มอัปเดตเก็บคีย์ที่กรอกให้ด้วย ถ้ามีปุ่มนี้อีกจะเปิด server เวอร์ชันเก่าใหม่โดยเปล่าประโยชน์ */}
+              {hasTypedKeys && !hasUpdate && (
                 <button type="button" className="btn btn-secondary" disabled={busy} onClick={handleSaveKeys}>
                   {t.pluginSaveKeys}
                 </button>
@@ -362,6 +406,11 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
               <button type="button" className="btn btn-secondary" disabled={busy} onClick={() => onSetEnabled(state === 'disabled')}>
                 {state === 'disabled' ? t.pluginEnable : t.pluginDisable}
               </button>
+              {hasUpdate && (
+                <button type="button" className="btn btn-primary" disabled={busy || missingKey || !runtimeFound} onClick={handleUpdate}>
+                  {busy ? t.pluginUpdating : t.pluginUpdate}
+                </button>
+              )}
             </>
           )}
         </footer>

@@ -3596,6 +3596,11 @@ pre,
   color: var(--success);
 }
 
+.plugin-badge.is-update {
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
 .plugin-see-more {
   display: inline-flex;
   align-items: center;
@@ -3726,6 +3731,18 @@ pre,
   background: var(--surface-muted);
 }
 
+.plugin-update {
+  padding: 10px 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: 10px;
+  /* พื้นกลาง: ธีมที่สีหลักเป็นแดงจะทำให้การอัปเดตธรรมดาดูเหมือน error */
+  background: var(--surface-muted);
+}
+
+.plugin-update .field-hint {
+  margin: 6px 0 2px;
+}
+
 .plugin-target-title {
   margin: 0 0 6px;
   font-size: 13px;
@@ -3767,6 +3784,10 @@ pre,
   padding-left: 18px;
   color: var(--text-secondary);
   font-size: 13.5px;
+}
+
+.plugin-requirements .is-missing {
+  color: var(--danger);
 }
 
 .plugin-secrets .field-hint {
