@@ -1,4 +1,4 @@
-import { isMcpEntryDisabled, readMcpEntries, withMcpEntry, withMcpEntryDisabled } from '../mcp/config';
+import { isMcpEntryDisabled, parseMcpConfig, readMcpEntries, serverKey, withMcpEntry, withMcpEntryDisabled } from '../mcp/config';
 import { tauriBridge, type SkillInfo } from '../tauriBridge';
 import { MARKETPLACE_PLUGINS, type MarketplacePlugin } from './catalog';
 
@@ -68,10 +68,38 @@ export function installPatch(plugin: MarketplacePlugin, settings: PluginSettings
   return { mcpConfig: withMcpEntry(settings.mcpConfig, plugin.id, plugin.install.server) };
 }
 
-/** ลบไฟล์ skill และคีย์ของ plugin — ทำก่อน uninstallPatch: ถ้าพังก็ยังถือว่าติดตั้งอยู่และลองใหม่ได้ */
+export function usesOauth(plugin: MarketplacePlugin): boolean {
+  return plugin.install.kind === 'mcp' && plugin.install.server.auth === 'oauth';
+}
+
+/**
+ * ติดตั้งไว้ตั้งแต่รุ่นที่ยังใช้คีย์ — config เดิมยังใช้งานได้ จึงไม่แก้ให้เองจนกว่าผู้ใช้จะล็อกอิน
+ * (ถ้าเปลี่ยนให้เลย ผู้ใช้จะถูกตัดการเชื่อมต่อโดยไม่ได้สั่ง) ตอนนั้น pluginHasUpdate เป็นจริง และอัปเดตด้วย updatePatch
+ */
+export function needsOauthMigration(plugin: MarketplacePlugin, settings: PluginSettings): boolean {
+  if (!usesOauth(plugin)) return false;
+  const entry = readMcpEntries(settings.mcpConfig)?.[plugin.id];
+  return !!entry && entry.auth !== 'oauth';
+}
+
+/** คีย์ของรุ่นเก่าที่ OAuth มาแทนแล้ว */
+export async function removeLegacySecrets(plugin: MarketplacePlugin): Promise<void> {
+  for (const name of plugin.legacySecrets ?? []) await tauriBridge.saveMcpSecret(name, '');
+}
+
+/** ลบไฟล์ skill คีย์ และ token ของ plugin — ทำก่อน uninstallPatch: ถ้าพังก็ยังถือว่าติดตั้งอยู่และลองใหม่ได้ */
 export async function prepareUninstall(plugin: MarketplacePlugin): Promise<void> {
   if (plugin.install.kind === 'skill') await tauriBridge.uninstallUserSkill(plugin.install.skillName);
   for (const secret of plugin.secrets ?? []) await tauriBridge.saveMcpSecret(secret.name, '');
+  await removeLegacySecrets(plugin);
+  if (usesOauth(plugin)) await tauriBridge.mcpOauthLogout(plugin.id);
+}
+
+/** server ที่ผู้ใช้วาง JSON เองแล้วตั้ง `auth: oauth` — ลบ token ก่อนเอาออกจาก config */
+export async function prepareRemoveCustomServer(name: string, settings: PluginSettings): Promise<void> {
+  if (readMcpEntries(settings.mcpConfig)?.[name]?.auth !== 'oauth') return;
+  const running = parseMcpConfig(settings.mcpConfig).servers.find((server) => server.name === name);
+  await tauriBridge.mcpOauthLogout(running?.key ?? serverKey(name));
 }
 
 export function uninstallPatch(plugin: MarketplacePlugin, settings: PluginSettings): PluginSettings {
@@ -93,7 +121,7 @@ export function enabledPatch(plugin: MarketplacePlugin, enabled: boolean, settin
  * ฟิลด์ที่ catalog เป็นเจ้าของ — ฟิลด์อื่นใน entry (disabled, cwd ฯลฯ) เป็นของผู้ใช้
  * ต้องคงไว้ตอนอัปเดต และเปลี่ยนสถานะเปิด/ปิดแล้วต้องไม่ถูกนับว่ามีเวอร์ชันใหม่
  */
-const CATALOG_MCP_FIELDS = ['type', 'transport', 'command', 'args', 'env', 'url', 'headers'];
+const CATALOG_MCP_FIELDS = ['type', 'transport', 'command', 'args', 'env', 'url', 'headers', 'auth'];
 
 /**
  * ของที่ติดตั้งไว้ไม่ตรงกับ catalog — ไม่อัปเดตให้เองเพราะจะได้โค้ดใหม่มารันโดยผู้ใช้ไม่รู้

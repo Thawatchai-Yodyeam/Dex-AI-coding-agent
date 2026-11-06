@@ -1,15 +1,25 @@
-import { tauriBridge } from '../tauriBridge';
+import { tauriBridge, type McpHttpResponse } from '../tauriBridge';
 import { tryParseJson } from '../agent/sse';
 import type { McpServerConfig } from './config';
 
 /** เวอร์ชันโปรโตคอลที่ขอตอน initialize (server ตอบเวอร์ชันที่ตัวเองใช้กลับมา) */
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
 
+// ข้อความนี้ไปถึงโมเดลผ่านผลของ tool จึงเป็นภาษาอังกฤษเหมือน error อื่นของ MCP
+const MCP_SIGN_IN_REQUIRED = 'This MCP server needs a sign-in. Ask the user to sign in from Customizations.';
+const MCP_MORE_SCOPE_REQUIRED = 'This MCP server needs more permissions. Ask the user to sign in again from Customizations';
+
 export interface McpTool {
   name: string;
   description?: string;
   inputSchema?: Record<string, unknown>;
   annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean; title?: string };
+}
+
+/** server ต้องการให้ล็อกอิน (401) หรือขอสิทธิ์เพิ่ม (403 insufficient_scope) */
+export interface McpAuthRequest {
+  kind: 'sign-in' | 'more-scope';
+  scope?: string;
 }
 
 /** ช่องทางส่ง/รับข้อความ JSON-RPC — ข้อความขาเข้าทุกชนิด (รวม response ของ http) ออกทาง onMessage */
@@ -19,6 +29,7 @@ export interface McpTransport {
   onMessage?: (message: unknown) => void;
   /** การเชื่อมต่อหลุด (process จบ ฯลฯ) */
   onClose?: (reason: string) => void;
+  onAuthRequired?: (request: McpAuthRequest) => void;
 }
 
 export class McpError extends Error {
@@ -256,10 +267,21 @@ export function parseSseMessages(body: string): unknown[] {
 export class HttpTransport implements McpTransport {
   onMessage?: (message: unknown) => void;
   onClose?: (reason: string) => void;
+  onAuthRequired?: (request: McpAuthRequest) => void;
   private sessionId?: string;
   private protocolVersion?: string;
 
   constructor(private readonly config: McpServerConfig) {}
+
+  /** 401 = ยังไม่ได้ล็อกอินหรือ token ใช้ไม่ได้แล้ว, 403 insufficient_scope = token ใช้ได้แต่สิทธิ์ไม่พอ */
+  private authRequest(res: McpHttpResponse): McpAuthRequest | null {
+    if (this.config.auth !== 'oauth') return null;
+    if (res.status === 401) return { kind: 'sign-in' };
+    if (res.status === 403 && res.auth_challenge?.error === 'insufficient_scope') {
+      return { kind: 'more-scope', scope: res.auth_challenge.scope ?? undefined };
+    }
+    return null;
+  }
 
   async send(message: Record<string, unknown>): Promise<void> {
     const headers: Record<string, string> = {
@@ -270,9 +292,24 @@ export class HttpTransport implements McpTransport {
     if (this.sessionId) headers['Mcp-Session-Id'] = this.sessionId;
     if (this.protocolVersion) headers['MCP-Protocol-Version'] = this.protocolVersion;
 
-    const res = await tauriBridge.mcpHttpRequest(this.config.url!, headers, JSON.stringify(message), this.config.timeoutMs);
+    const res = await tauriBridge.mcpHttpRequest(
+      this.config.url!,
+      headers,
+      JSON.stringify(message),
+      this.config.timeoutMs,
+      this.config.auth === 'oauth' ? this.config.key : undefined
+    );
     if (res.headers['mcp-session-id']) this.sessionId = res.headers['mcp-session-id'];
     if (res.status === 202 || res.status === 204) return;
+    const authRequest = this.authRequest(res);
+    if (authRequest) {
+      this.onAuthRequired?.(authRequest);
+      if (message.id !== undefined) {
+        const reason = authRequest.kind === 'sign-in' ? MCP_SIGN_IN_REQUIRED : `${MCP_MORE_SCOPE_REQUIRED}${authRequest.scope ? `: ${authRequest.scope}` : ''}`;
+        this.onMessage?.({ jsonrpc: '2.0', id: message.id, error: { code: -32001, message: reason } });
+      }
+      return;
+    }
     if (res.status >= 400) {
       const reason = `HTTP ${res.status}: ${res.body.slice(0, 300)}`;
       // request ที่รอคำตอบต้องรู้ทันที ไม่งั้นรอจน timeout

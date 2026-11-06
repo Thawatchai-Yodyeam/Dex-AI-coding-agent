@@ -11,22 +11,27 @@ import {
   installPatch,
   installedTarget,
   matchesQuery,
+  needsOauthMigration,
   pluginHasUpdate,
   pluginRuntime,
   pluginState,
   pluginTarget,
   prepareInstall,
+  prepareRemoveCustomServer,
   prepareUninstall,
   readManagedSkillFiles,
+  removeLegacySecrets,
   renderSkillFile,
   uninstallPatch,
   updatePatch,
+  usesOauth,
 } from './plugins';
 
 const bridge = vi.hoisted(() => ({
   saveMcpSecret: vi.fn(async () => {}),
   installUserSkill: vi.fn(async () => 'dir'),
   uninstallUserSkill: vi.fn(async () => {}),
+  mcpOauthLogout: vi.fn(async () => {}),
   readSkillFile: vi.fn(async (_dir: string, _file?: string, _workspace?: string) => ''),
 }));
 vi.mock('../tauriBridge', () => ({ tauriBridge: bridge }));
@@ -35,6 +40,7 @@ const byId = (id: string) => MARKETPLACE_PLUGINS.find((p) => p.id === id) as Mar
 const mcpPlugin = byId('context7');
 const keyedPlugin = byId('brave-search');
 const skillPlugin = byId('code-review');
+const oauthPlugin = byId('supabase');
 
 const skill = (name: string, extra: Partial<SkillInfo> = {}): SkillInfo => ({
   name,
@@ -117,6 +123,25 @@ describe('catalog', () => {
         expect(plugin.install.server.url, plugin.id).toMatch(/^https:\/\//);
       }
     }
+  });
+
+  it('lists the hosted servers that sign in with a browser', () => {
+    expect(MARKETPLACE_PLUGINS.filter(usesOauth).map((p) => p.id).sort()).toEqual(['cloudflare', 'linear', 'neon', 'notion', 'sentry', 'supabase']);
+    expect(usesOauth(skillPlugin)).toBe(false);
+    expect(usesOauth(keyedPlugin)).toBe(false);
+  });
+
+  it.each(MARKETPLACE_PLUGINS.filter(usesOauth).map((p) => [p.id, p] as const))('%s signs in over https and asks for no keys', (_id, plugin) => {
+    if (plugin.install.kind !== 'mcp') throw new Error('unreachable');
+    expect(plugin.secrets ?? []).toEqual([]);
+    expect(plugin.install.server.headers).toBeUndefined();
+    expect(plugin.install.server.url).toMatch(/^https:\/\//);
+    expect(pluginRuntime(plugin)).toBeNull();
+    const [server] = parseMcpConfig(withMcpEntry('', plugin.id, plugin.install.server)).servers;
+    expect(server.auth).toBe('oauth');
+    // คีย์เดิมต้องไม่ใช้ชื่อเดียวกับคีย์ของ plugin อื่น ไม่งั้นถอนตัวนี้แล้วตัวอื่นพัง
+    const others = MARKETPLACE_PLUGINS.filter((p) => p.id !== plugin.id).flatMap((p) => (p.secrets ?? []).map((s) => s.name));
+    for (const name of plugin.legacySecrets ?? []) expect(others).not.toContain(name);
   });
 
   it.each(MARKETPLACE_PLUGINS.filter((p) => p.install.kind === 'skill').map((p) => [p.id, p] as const))(
@@ -346,6 +371,96 @@ describe('install and uninstall side effects', () => {
     expect(bridge.uninstallUserSkill).toHaveBeenCalledWith('code-review');
     await prepareUninstall(keyedPlugin);
     expect(bridge.saveMcpSecret).toHaveBeenCalledWith('BRAVE_API_KEY', '');
+    expect(bridge.mcpOauthLogout).not.toHaveBeenCalled();
+  });
+
+  it('deletes the sign-in on uninstall, along with a key left by an older version', async () => {
+    await prepareUninstall(oauthPlugin);
+    expect(bridge.mcpOauthLogout).toHaveBeenCalledTimes(1);
+    expect(bridge.mcpOauthLogout).toHaveBeenCalledWith('supabase');
+    expect(bridge.saveMcpSecret).toHaveBeenCalledWith('SUPABASE_ACCESS_TOKEN', '');
+  });
+
+  it('stays installed when the sign-in cannot be deleted, so uninstalling can be retried', async () => {
+    bridge.mcpOauthLogout.mockRejectedValueOnce(new Error('OAUTH_STORE: locked'));
+    await expect(prepareUninstall(oauthPlugin)).rejects.toThrow('OAUTH_STORE');
+  });
+
+  it('writes only a marker to settings for plugins that sign in', () => {
+    const patch = installPatch(oauthPlugin, {});
+    expect(JSON.parse(patch.mcpConfig!).mcpServers.supabase).toEqual({
+      type: 'http',
+      url: 'https://mcp.supabase.com/mcp?read_only=true',
+      auth: 'oauth',
+    });
+    expect(referencedVars(patch.mcpConfig)).toEqual([]);
+  });
+
+  it('deletes the sign-in of a server added by hand when it is removed', async () => {
+    const config = JSON.stringify({
+      mcpServers: {
+        'my server': { type: 'http', url: 'https://x/mcp', auth: 'oauth' },
+        off: { type: 'http', url: 'https://y/mcp', auth: 'oauth', disabled: true },
+        plain: { type: 'http', url: 'https://z/mcp' },
+      },
+    });
+    await prepareRemoveCustomServer('my server', { mcpConfig: config });
+    expect(bridge.mcpOauthLogout).toHaveBeenLastCalledWith('my_server');
+    await prepareRemoveCustomServer('off', { mcpConfig: config });
+    expect(bridge.mcpOauthLogout).toHaveBeenLastCalledWith('off');
+    bridge.mcpOauthLogout.mockClear();
+    await prepareRemoveCustomServer('plain', { mcpConfig: config });
+    await prepareRemoveCustomServer('missing', { mcpConfig: config });
+    expect(bridge.mcpOauthLogout).not.toHaveBeenCalled();
+  });
+});
+
+describe('moving an older install to sign-in', () => {
+  const legacyEntry = {
+    type: 'http',
+    url: 'https://mcp.supabase.com/mcp?read_only=true',
+    headers: { Authorization: 'Bearer ${SUPABASE_ACCESS_TOKEN}' },
+  };
+  const legacy = { mcpConfig: withMcpEntry('', 'supabase', legacyEntry) };
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it('keeps the old config working until the user signs in, and offers it as an update', () => {
+    expect(pluginState(oauthPlugin, legacy, [])).toBe('enabled');
+    expect(needsOauthMigration(oauthPlugin, legacy)).toBe(true);
+    expect(pluginHasUpdate(oauthPlugin, legacy, {})).toBe(true);
+    const [server] = parseMcpConfig(legacy.mcpConfig).servers;
+    expect(server.auth).toBeUndefined();
+    expect(server.headers?.Authorization).toContain('SUPABASE_ACCESS_TOKEN');
+  });
+
+  it('does not offer it for fresh installs, other plugins or nothing installed', () => {
+    expect(needsOauthMigration(oauthPlugin, installPatch(oauthPlugin, {}))).toBe(false);
+    expect(pluginHasUpdate(oauthPlugin, installPatch(oauthPlugin, {}), {})).toBe(false);
+    expect(needsOauthMigration(oauthPlugin, {})).toBe(false);
+    expect(needsOauthMigration(keyedPlugin, installPatch(keyedPlugin, {}))).toBe(false);
+  });
+
+  it('replaces the config and removes the old key', async () => {
+    const patched = updatePatch(oauthPlugin, legacy);
+    expect(needsOauthMigration(oauthPlugin, patched)).toBe(false);
+    expect(pluginHasUpdate(oauthPlugin, patched, {})).toBe(false);
+    expect(readMcpEntries(patched.mcpConfig)!.supabase).toEqual(oauthPlugin.install.kind === 'mcp' ? oauthPlugin.install.server : null);
+    await removeLegacySecrets(oauthPlugin);
+    expect(bridge.saveMcpSecret).toHaveBeenCalledWith('SUPABASE_ACCESS_TOKEN', '');
+  });
+
+  it('also removes the key name of the release before the version pinning', async () => {
+    await removeLegacySecrets(MARKETPLACE_PLUGINS.find((p) => p.id === 'sentry')!);
+    expect(bridge.saveMcpSecret).toHaveBeenCalledWith('SENTRY_AUTH_TOKEN', '');
+    expect(bridge.saveMcpSecret).toHaveBeenCalledWith('SENTRY_ACCESS_TOKEN', '');
+  });
+
+  it('keeps a disabled plugin disabled', () => {
+    const off = { mcpConfig: withMcpEntryDisabled(legacy.mcpConfig, 'supabase', true) };
+    const patched = updatePatch(oauthPlugin, off);
+    expect(pluginState(oauthPlugin, patched, [])).toBe('disabled');
+    expect(readMcpEntries(patched.mcpConfig)!.supabase.auth).toBe('oauth');
   });
 });
 

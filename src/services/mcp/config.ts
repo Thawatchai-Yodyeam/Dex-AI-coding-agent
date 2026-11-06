@@ -10,6 +10,9 @@
  * หรือ environment variable — ไม่ต้องเก็บ token ไว้ใน settings
  *
  * `"disabledTools": ["tool_name"]` ปิด tool รายตัวของ server นั้น (ใช้ชื่อตามที่ server ประกาศ ไม่มี prefix mcp__)
+ *
+ * server แบบ http ที่ล็อกอินผ่านเบราว์เซอร์ได้ใส่ `"auth": "oauth"` แทน header:
+ *     "supabase": { "type": "http", "url": "https://mcp.supabase.com/mcp", "auth": "oauth" }
  */
 
 export interface McpServerConfig {
@@ -24,6 +27,8 @@ export interface McpServerConfig {
   cwd?: string;
   url?: string;
   headers?: Record<string, string>;
+  /** ล็อกอินผ่านเบราว์เซอร์ — token อยู่ฝั่ง Rust ไม่อยู่ใน config */
+  auth?: 'oauth';
   /** timeout ของแต่ละ request (ms) */
   timeoutMs?: number;
   /** tool ที่ผู้ใช้ปิดไว้ (ชื่อตามที่ server ประกาศ) — ไม่ส่งให้โมเดลและเรียกไม่ได้ */
@@ -46,6 +51,11 @@ export const MCP_CONFIG_EXAMPLE = `{
       "type": "http",
       "url": "https://example.com/mcp",
       "headers": { "Authorization": "Bearer \${MY_TOKEN}" }
+    },
+    "sign-in": {
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "auth": "oauth"
     }
   }
 }`;
@@ -121,12 +131,17 @@ export function parseMcpConfig(text: string | undefined): ParsedMcpConfig {
         errors.push(`${name}: "url" must start with http:// or https://`);
         continue;
       }
+      if (raw.auth !== undefined && raw.auth !== 'oauth') {
+        errors.push(`${name}: "auth" must be "oauth"`);
+        continue;
+      }
       servers.push({
         name,
         key,
         transport: 'http',
         url: raw.url.trim(),
         headers: stringRecord(raw.headers) ?? {},
+        ...(raw.auth === 'oauth' ? { auth: 'oauth' as const } : {}),
         ...(timeoutMs ? { timeoutMs } : {}),
         ...toolFilter,
       });

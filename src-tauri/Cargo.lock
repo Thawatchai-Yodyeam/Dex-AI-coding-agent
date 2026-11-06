@@ -744,6 +744,7 @@ name = "dex-agent"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "getrandom 0.3.4",
  "globset",
  "html2text",
  "include_dir",
@@ -751,6 +752,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-notification",

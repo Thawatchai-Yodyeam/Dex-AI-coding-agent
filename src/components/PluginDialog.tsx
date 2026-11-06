@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ExternalLink, Plus, RotateCcw, Trash2, X } from 'lucide-react';
+import { ExternalLink, LogIn, LogOut, Plus, RotateCcw, Trash2, X } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import type { McpServerStatus } from '../services/mcp/manager';
+import { describeOauthError, isOauthCancelled, issuerHost, mcpStatusLabel, signInToMcpServer } from '../services/mcp/oauth';
 import type { MarketplacePlugin } from '../services/marketplace/catalog';
-import { pluginRuntime, pluginTarget, type PluginState } from '../services/marketplace/plugins';
-import { tauriBridge } from '../services/tauriBridge';
+import { pluginRuntime, pluginTarget, usesOauth, type PluginState } from '../services/marketplace/plugins';
+import { tauriBridge, type McpOauthStatus } from '../services/tauriBridge';
 import type { AppLanguage, Translation } from '../utils/i18n';
 import { PluginIcon } from './PluginIcon';
 
@@ -14,14 +15,20 @@ interface PluginDialogProps {
   /** สถานะการเชื่อมต่อจริง (เฉพาะ MCP ที่เปิดอยู่) */
   status?: McpServerStatus;
   uninstallable: boolean;
+  /** ติดตั้งไว้ตั้งแต่รุ่นที่ใช้คีย์ และ config ยังเป็นแบบเดิม */
+  legacyAuth: boolean;
   /** ของที่ติดตั้งไว้ไม่ตรงกับ catalog */
   hasUpdate: boolean;
   /** คำสั่งหรือ URL ที่ติดตั้งอยู่ตอนนี้ (null = ไม่ต้องแสดง เช่น skill) */
   currentTarget: string | null;
   language: AppLanguage;
   t: Translation;
-  onInstall: (values: Record<string, string>) => Promise<void>;
-  onUpdate: (values: Record<string, string>) => Promise<void>;
+  /** signIn = ต้องล็อกอินก่อนเพิ่มลง config */
+  onInstall: (values: Record<string, string>, signIn?: () => Promise<void>) => Promise<void>;
+  /** signIn = ต้องล็อกอินก่อนเปลี่ยน config (ย้ายจากคีย์มาล็อกอิน) */
+  onUpdate: (values: Record<string, string>, signIn?: () => Promise<void>) => Promise<void>;
+  onSignedIn: () => Promise<void>;
+  onSignedOut: () => void;
   onUninstall: () => Promise<void>;
   onSetEnabled: (enabled: boolean) => void;
   onSaveKeys: (values: Record<string, string>) => Promise<void>;
@@ -43,12 +50,15 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
   state,
   status,
   uninstallable,
+  legacyAuth,
   hasUpdate,
   currentTarget,
   language,
   t,
   onInstall,
   onUpdate,
+  onSignedIn,
+  onSignedOut,
   onUninstall,
   onSetEnabled,
   onSaveKeys,
@@ -60,6 +70,9 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmUninstall, setConfirmUninstall] = useState(false);
+  const [oauth, setOauth] = useState<McpOauthStatus | null>(null);
+  const [signingIn, setSigningIn] = useState(false);
+  const signingInRef = useRef(false);
   const [runtimeFound, setRuntimeFound] = useState(true);
   const dialogRef = useRef<HTMLDivElement>(null);
 
@@ -70,6 +83,10 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
   const isRemote = plugin.install.kind === 'mcp' && typeof plugin.install.server.url === 'string';
   const hasTypedKeys = secrets.some((s) => values[s.name]?.trim());
   const missingKey = secrets.some((s) => !present[s.name] && !values[s.name]?.trim());
+  const isOauth = usesOauth(plugin);
+  const oauthUrl = isOauth && plugin.install.kind === 'mcp' ? String(plugin.install.server.url) : '';
+  const signedIn = oauth?.signed_in === true;
+  const signedInHost = issuerHost(oauth?.issuer ?? null);
 
   const refreshPresent = React.useCallback(() => {
     if (secrets.length === 0) return;
@@ -81,6 +98,24 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [plugin.id]);
   useEffect(refreshPresent, [refreshPresent]);
+
+  const refreshOauth = React.useCallback(() => {
+    if (!oauthUrl) return;
+    tauriBridge
+      .mcpOauthStatus(plugin.id, oauthUrl)
+      .then(setOauth)
+      .catch(() => setOauth(null));
+  }, [plugin.id, oauthUrl]);
+  // อ่านใหม่ทุกครั้งที่สถานะการเชื่อมต่อเปลี่ยน — refresh token ใช้ไม่ได้แล้วฝั่ง Rust จะลบ token ทิ้งระหว่างเชื่อมต่อ
+  useEffect(refreshOauth, [refreshOauth, status?.state]);
+
+  // ปิด dialog ระหว่างรอ: หยุดรอและคืนพอร์ต ไม่งั้นล็อกอินสำเร็จแล้วจะไม่มีใครเปิด server ใหม่ให้
+  useEffect(
+    () => () => {
+      if (signingInRef.current) void tauriBridge.mcpOauthCancel(plugin.id).catch(() => {});
+    },
+    [plugin.id]
+  );
 
   useEffect(() => {
     if (!runtimeCommand) return;
@@ -107,23 +142,48 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
     setError(null);
     try {
       await action();
-    } catch (err: any) {
-      setError(err?.message || String(err));
+    } catch (err) {
+      // ผู้ใช้กดยกเลิกเอง ไม่ใช่ข้อผิดพลาด
+      if (!isOauthCancelled(err)) setError(describeOauthError(err, t));
     } finally {
       setBusy(false);
     }
   };
 
+  const signIn = async () => {
+    signingInRef.current = true;
+    setSigningIn(true);
+    try {
+      setOauth(await signInToMcpServer(plugin.id, oauthUrl, t, status?.requiredScope));
+    } finally {
+      signingInRef.current = false;
+      setSigningIn(false);
+    }
+  };
+
   const handleInstall = () =>
     run(async () => {
-      await onInstall(values);
+      await onInstall(values, isOauth && !signedIn ? signIn : undefined);
       setValues({});
       refreshPresent();
     });
 
+  const handleSignIn = () =>
+    run(async () => {
+      await signIn();
+      await onSignedIn();
+    });
+
+  const handleSignOut = () =>
+    run(async () => {
+      await tauriBridge.mcpOauthLogout(plugin.id);
+      refreshOauth();
+      onSignedOut();
+    });
+
   const handleUpdate = () =>
     run(async () => {
-      await onUpdate(values);
+      await onUpdate(values, isOauth && !signedIn ? signIn : undefined);
       setValues({});
       refreshPresent();
     });
@@ -165,11 +225,7 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
               <span>{t.pluginBy(plugin.publisher)}</span>
               {plugin.community && <span className="tool-tag">{t.pluginCommunity}</span>}
               {state === 'disabled' && <span className="plugin-badge">{t.pluginDisabled}</span>}
-              {status && (
-                <span className={`ext-status is-${status.state}`}>
-                  {status.state === 'ready' ? t.mcpReady(status.tools.length) : status.state === 'starting' ? t.mcpStarting : t.mcpError}
-                </span>
-              )}
+              {status && <span className={`ext-status is-${status.state}`}>{mcpStatusLabel(status, t)}</span>}
               {state === 'enabled' && plugin.install.kind === 'skill' && <span className="ext-status is-ready">{t.pluginInstalled}</span>}
             </div>
           </div>
@@ -183,7 +239,7 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
 
           {status?.error && (
             <div>
-              <pre className="tool-error mcp-error">{status.error}</pre>
+              <pre className="tool-error mcp-error">{describeOauthError(status.error, t)}</pre>
               <button type="button" className="btn btn-ghost btn-sm" onClick={onRestart}>
                 <RotateCcw size={14} aria-hidden="true" />
                 {t.mcpRestart}
@@ -237,6 +293,50 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
             </ul>
           )}
 
+          {isOauth && (
+            <section className="plugin-oauth">
+              <h3 className="plugin-target-title">{t.oauthTitle}</h3>
+              <p className="field-hint">{installed ? t.oauthHint : t.oauthInstallHint}</p>
+              {legacyAuth && <p className="field-hint">{t.oauthMigrate}</p>}
+              {status?.needsMoreScope && <p className="field-hint">{t.oauthMoreScope}</p>}
+              <div className="plugin-oauth-row">
+                <span className={`ext-status ${signingIn ? 'is-starting' : signedIn ? 'is-ready' : 'is-auth'}`} role="status">
+                  {signingIn
+                    ? t.oauthWaiting
+                    : signedIn
+                      ? signedInHost
+                        ? t.oauthSignedInWith(signedInHost)
+                        : t.oauthSignedIn
+                      : t.oauthNotSignedIn}
+                </span>
+                <div className="plugin-oauth-actions">
+                  {signingIn ? (
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => void tauriBridge.mcpOauthCancel(plugin.id).catch(() => {})}>
+                      {t.oauthCancel}
+                    </button>
+                  ) : (
+                    installed && (
+                      <>
+                        {signedIn && (
+                          <button type="button" className="btn btn-ghost btn-sm" disabled={busy} onClick={handleSignOut}>
+                            <LogOut size={14} aria-hidden="true" />
+                            {t.oauthSignOut}
+                          </button>
+                        )}
+                        <button type="button" className="btn btn-secondary btn-sm" disabled={busy} onClick={handleSignIn}>
+                          <LogIn size={14} aria-hidden="true" />
+                          {signedIn ? t.oauthSignInAgain : t.oauthSignIn}
+                        </button>
+                      </>
+                    )
+                  )}
+                </div>
+              </div>
+              {signedIn && oauth?.scope && <p className="field-hint plugin-oauth-scope">{t.oauthScope(oauth.scope)}</p>}
+              {signedIn && <p className="field-hint">{t.oauthSignOutHint}</p>}
+            </section>
+          )}
+
           {secrets.length > 0 && (
             <section className="plugin-secrets">
               <h3 className="plugin-target-title">{t.pluginKeysTitle}</h3>
@@ -280,7 +380,7 @@ export const PluginDialog: React.FC<PluginDialogProps> = ({
           {!installed ? (
             <button type="button" className="btn btn-primary" disabled={busy || missingKey || !runtimeFound} onClick={handleInstall}>
               <Plus size={16} aria-hidden="true" />
-              {busy ? t.pluginInstalling : t.pluginInstall}
+              {signingIn ? t.oauthWaiting : busy ? t.pluginInstalling : isOauth && !signedIn ? t.oauthInstallAndSignIn : t.pluginInstall}
             </button>
           ) : (
             <>

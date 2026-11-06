@@ -6,6 +6,7 @@ import { loadSkills, USE_SKILL_TOOL } from '../services/agent/skills';
 import { TOOL_DEFINITIONS } from '../services/agent/tools';
 import { isMcpEntryDisabled, readMcpEntries, withMcpEntry, withMcpEntryDisabled, withMcpToolsDisabled } from '../services/mcp/config';
 import { mcpManager, type McpServerStatus } from '../services/mcp/manager';
+import { describeOauthError, mcpStatusLabel } from '../services/mcp/oauth';
 import { summarizeToolUsage } from '../services/mcp/toolUsage';
 import { MARKETPLACE_PLUGINS, PLUGIN_SECTIONS, type MarketplacePlugin } from '../services/marketplace/catalog';
 import {
@@ -16,12 +17,15 @@ import {
   installPatch,
   installedTarget,
   matchesQuery,
+  needsOauthMigration,
   pluginHasUpdate,
   pluginState,
   pluginTarget,
   prepareInstall,
+  prepareRemoveCustomServer,
   prepareUninstall,
   readManagedSkillFiles,
+  removeLegacySecrets,
   saveSecrets,
   uninstallPatch,
   updatePatch,
@@ -30,6 +34,7 @@ import {
 import type { SkillInfo } from '../services/tauriBridge';
 import { PROVIDERS_CATALOG, type AppSettings } from '../types/agent';
 import type { Translation } from '../utils/i18n';
+import { McpSignInButton } from './McpSignInButton';
 import { EnableSwitch, McpToolList, McpUsageSummary } from './McpToolUsage';
 import { PluginDialog } from './PluginDialog';
 import { PluginIcon, PluginTile } from './PluginIcon';
@@ -50,11 +55,7 @@ type Tab = 'marketplace' | 'installed';
 const SECTION_PREVIEW = 6;
 
 const McpStatusChip: React.FC<{ status?: McpServerStatus; t: Translation }> = ({ status, t }) =>
-  status ? (
-    <span className={`ext-status is-${status.state}`}>
-      {status.state === 'ready' ? t.mcpReady(status.tools.length) : status.state === 'starting' ? t.mcpStarting : t.mcpError}
-    </span>
-  ) : null;
+  status ? <span className={`ext-status is-${status.state}`}>{mcpStatusLabel(status, t)}</span> : null;
 
 export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
   settings,
@@ -73,6 +74,7 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
   const [skillFiles, setSkillFiles] = useState<Record<string, string>>({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
 
   const refreshSkills = useCallback(async () => {
     const found = await loadSkills(settings.cwd);
@@ -127,7 +129,11 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
       return;
     }
     setConfirmRemove(null);
-    applyPatch((prev) => ({ mcpConfig: withMcpEntry(prev.mcpConfig, name, null) }));
+    setRemoveError(null);
+    // ลบ token ก่อน: ถ้าลบไม่ได้ server ยังอยู่ในรายการให้ลองใหม่ได้ ไม่ทิ้ง token ไว้โดยไม่มีใครรู้
+    prepareRemoveCustomServer(name, settings)
+      .then(() => applyPatch((prev) => ({ mcpConfig: withMcpEntry(prev.mcpConfig, name, null) })))
+      .catch((err) => setRemoveError(describeOauthError(err, t)));
   };
 
   const setSkillEnabled = (name: string, enabled: boolean) =>
@@ -206,6 +212,12 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
             <button type="button" className="btn btn-ghost btn-sm" onClick={onEditConfig}>
               {t.pluginEditConfig}
             </button>
+          </div>
+        )}
+
+        {removeError && (
+          <div className="custom-notice is-danger" role="alert">
+            <span>{removeError}</span>
           </div>
         )}
 
@@ -316,7 +328,8 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
                           {pluginSummary(plugin, state)}
                         </div>
                         <p className="field-hint">{plugin.description[language]}</p>
-                        {status?.error && <pre className="tool-error mcp-error">{status.error}</pre>}
+                        {status?.error && <pre className="tool-error mcp-error">{describeOauthError(status.error, t)}</pre>}
+                        {status && <McpSignInButton status={status} t={t} />}
                       </div>
                       {status?.state === 'error' && (
                         <button
@@ -375,7 +388,8 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
                           {disabled && <span className="plugin-badge">{t.pluginDisabled}</span>}
                           <McpStatusChip status={status} t={t} />
                         </div>
-                        {status?.error && <pre className="tool-error mcp-error">{status.error}</pre>}
+                        {status?.error && <pre className="tool-error mcp-error">{describeOauthError(status.error, t)}</pre>}
+                        {status && <McpSignInButton status={status} t={t} />}
                       </div>
                       {status && (
                         <button
@@ -445,6 +459,7 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
           state={stateOf(selected)}
           status={stateOf(selected) === 'enabled' ? statusOf(selected.id) : undefined}
           uninstallable={canUninstall(selected, skills)}
+          legacyAuth={needsOauthMigration(selected, settings)}
           hasUpdate={hasUpdate(selected)}
           currentTarget={(() => {
             // ถ้าตรงกับของใหม่ (เช่น เปลี่ยนแค่ env) แสดงซ้ำจะดูเหมือนไม่มีอะไรเปลี่ยน
@@ -453,14 +468,33 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
           })()}
           language={language}
           t={t}
-          onInstall={async (values) => {
+          onInstall={async (values, signIn) => {
             await prepareInstall(selected, values, settings);
+            // ล็อกอินก่อนเพิ่มใน config: ล็อกอินไม่สำเร็จก็ไม่เหลือ server ที่ใช้งานไม่ได้ค้างในรายการ
+            await signIn?.();
             applyPatch((prev) => installPatch(selected, prev));
             await refreshSkills();
           }}
-          onUpdate={async (values) => {
+          onSignedIn={async () => {
+            // ติดตั้งแบบคีย์ไว้: ล็อกอินแล้วเปลี่ยน config เป็นแบบ OAuth ให้เลย (sync เปิด server ใหม่เอง)
+            if (needsOauthMigration(selected, settings)) {
+              await removeLegacySecrets(selected);
+              applyPatch((prev) => updatePatch(selected, prev));
+              return;
+            }
+            const status = statusOf(selected.id);
+            if (status) mcpManager.restart(status.key);
+          }}
+          onSignedOut={() => {
+            const status = statusOf(selected.id);
+            if (status) mcpManager.restart(status.key);
+          }}
+          onUpdate={async (values, signIn) => {
             // config เปลี่ยน sync จึงเปิด server ใหม่ให้เอง (ถ้าผู้ใช้ปิดไว้ก็ยังปิดอยู่)
             await prepareInstall(selected, values, settings);
+            // ย้ายจากคีย์มาล็อกอิน: ล็อกอินให้ได้ก่อน แล้วค่อยลบคีย์เดิมที่ยังใช้งานได้อยู่
+            await signIn?.();
+            await removeLegacySecrets(selected);
             applyPatch((prev) => updatePatch(selected, prev));
             await refreshSkills();
           }}
