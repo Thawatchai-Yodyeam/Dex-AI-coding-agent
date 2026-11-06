@@ -3,13 +3,26 @@ import { MCP_TOOL_PREFIX } from '../agent/tools';
 import type { ToolDefinition } from '../agent/types';
 import { HttpTransport, McpClient, StdioTransport, type McpTool, type McpTransport } from './client';
 import type { McpServerConfig } from './config';
+import { estimateToolTokens } from './toolUsage';
+
+export interface McpToolInfo {
+  /** ชื่อตามที่ server ประกาศ — ชื่อนี้ที่เก็บใน disabledTools */
+  name: string;
+  description: string;
+  enabled: boolean;
+  /** ขนาด definition โดยประมาณที่ส่งให้โมเดลในทุกคำขอ (ถ้าเปิดอยู่) */
+  tokens: number;
+}
 
 export interface McpServerStatus {
   name: string;
   key: string;
   transport: McpServerConfig['transport'];
   state: 'starting' | 'ready' | 'error';
+  /** tool ที่ส่งให้โมเดลจริง (ไม่รวมตัวที่ผู้ใช้ปิด) */
   tools: string[];
+  /** tool ทุกตัวที่ server ประกาศ รวมตัวที่ผู้ใช้ปิด */
+  toolInfo: McpToolInfo[];
   error?: string;
 }
 
@@ -57,8 +70,22 @@ export function formatToolResult(result: any): string {
   return parts.join('\n');
 }
 
-const signatureOf = (config: McpServerConfig, cwd: string) =>
-  JSON.stringify({ ...config, cwd: config.transport === 'stdio' ? (config.cwd ?? cwd) : undefined });
+/** disabledTools ไม่อยู่ในนี้: เปิด/ปิด tool รายตัวไม่ต้องตัดการเชื่อมต่อ (งานที่ค้างอยู่ใน server ไม่ควรหาย) */
+function signatureOf(config: McpServerConfig, cwd: string): string {
+  const { disabledTools: _disabledTools, ...connection } = config;
+  return JSON.stringify({ ...connection, cwd: config.transport === 'stdio' ? (config.cwd ?? cwd) : undefined });
+}
+
+const isToolEnabled = (config: McpServerConfig, toolName: string) => !config.disabledTools?.includes(toolName);
+
+/** definition ที่ส่งให้โมเดลจริง — ขนาดที่แสดงในหน้า Customizations คำนวณจากตัวนี้ด้วย ตัวเลขจึงไม่คลาดจากของจริง */
+function toolDefinition(config: McpServerConfig, tool: McpTool): ToolDefinition {
+  return {
+    name: mcpToolName(config.key, tool.name),
+    description: `[MCP server "${config.name}"] ${tool.description ?? tool.annotations?.title ?? tool.name}`.slice(0, 1024),
+    parameters: sanitizeSchema(tool.inputSchema),
+  };
+}
 
 /**
  * เปิด/ปิด MCP server ตาม settings และให้ AgentService ใช้ tool ของทุก server ที่พร้อม
@@ -93,6 +120,9 @@ export class McpManager implements McpProvider {
       if (!next || signatureOf(next, cwd) !== entry.signature) {
         this.entries.delete(key);
         void entry.client?.close();
+      } else {
+        entry.config = next;
+        if (entry.status.state === 'ready') this.publishTools(entry);
       }
     }
     for (const config of servers) if (!this.entries.has(config.key)) this.start(config);
@@ -113,7 +143,7 @@ export class McpManager implements McpProvider {
       config,
       signature: signatureOf(config, this.cwd),
       tools: [],
-      status: { name: config.name, key: config.key, transport: config.transport, state: 'starting', tools: [] },
+      status: { name: config.name, key: config.key, transport: config.transport, state: 'starting', tools: [], toolInfo: [] },
     };
     this.entries.set(config.key, entry);
     void this.connect(entry);
@@ -126,7 +156,7 @@ export class McpManager implements McpProvider {
   private fail(entry: Entry, reason: string) {
     if (!this.isCurrent(entry)) return;
     entry.tools = [];
-    entry.status = { ...entry.status, state: 'error', tools: [], error: reason };
+    entry.status = { ...entry.status, state: 'error', tools: [], toolInfo: [], error: reason };
     this.emit();
   }
 
@@ -150,8 +180,25 @@ export class McpManager implements McpProvider {
     const tools = await entry.client!.listTools();
     if (!this.isCurrent(entry)) return;
     entry.tools = tools;
-    entry.status = { ...entry.status, state: 'ready', tools: tools.map((t) => t.name), error: undefined };
+    this.publishTools(entry);
     this.emit();
+  }
+
+  /** อัปเดตสถานะให้ตรงกับ tool ล่าสุดและรายการที่ปิดไว้ — ผู้เรียกต้อง emit เอง */
+  private publishTools(entry: Entry) {
+    const { config, tools } = entry;
+    entry.status = {
+      ...entry.status,
+      state: 'ready',
+      tools: tools.filter((tool) => isToolEnabled(config, tool.name)).map((tool) => tool.name),
+      toolInfo: tools.map((tool) => ({
+        name: tool.name,
+        description: tool.description ?? tool.annotations?.title ?? '',
+        enabled: isToolEnabled(config, tool.name),
+        tokens: estimateToolTokens(toolDefinition(config, tool)),
+      })),
+      error: undefined,
+    };
   }
 
   toolDefinitions(): ToolDefinition[] {
@@ -159,22 +206,24 @@ export class McpManager implements McpProvider {
     for (const entry of this.entries.values()) {
       if (entry.status.state !== 'ready') continue;
       for (const tool of entry.tools) {
-        defs.push({
-          name: mcpToolName(entry.config.key, tool.name),
-          description: `[MCP server "${entry.config.name}"] ${tool.description ?? tool.annotations?.title ?? tool.name}`.slice(0, 1024),
-          parameters: sanitizeSchema(tool.inputSchema),
-        });
+        if (isToolEnabled(entry.config, tool.name)) defs.push(toolDefinition(entry.config, tool));
       }
     }
     return defs;
   }
 
+  /** หาเฉพาะ tool ที่เปิดอยู่ — ชื่อเต็มของสองตัวอาจชนกัน (a.b กับ a_b) ตัวที่ปิดจึงต้องไม่บังตัวที่เปิด */
   private resolve(name: string): { entry: Entry; tool: McpTool } | null {
     for (const entry of this.entries.values()) {
-      const tool = entry.tools.find((t) => mcpToolName(entry.config.key, t.name) === name);
+      const tool = entry.tools.find((t) => isToolEnabled(entry.config, t.name) && mcpToolName(entry.config.key, t.name) === name);
       if (tool) return { entry, tool };
     }
     return null;
+  }
+
+  isDisabled(name: string): boolean {
+    if (this.resolve(name)) return false;
+    return [...this.entries.values()].some((entry) => entry.tools.some((t) => mcpToolName(entry.config.key, t.name) === name));
   }
 
   isReadOnly(name: string): boolean {
