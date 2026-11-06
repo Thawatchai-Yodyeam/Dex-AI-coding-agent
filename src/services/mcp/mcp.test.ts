@@ -6,8 +6,9 @@ import type { AppSettings } from '../../types/agent';
 import type { AgentCallbacks } from '../agent/types';
 import { executeTool } from '../agent/tools';
 import { McpClient, parseSseMessages, type McpTransport } from './client';
-import { parseMcpConfig, serverKey } from './config';
-import { McpManager, formatToolResult, mcpToolName, sanitizeSchema } from './manager';
+import { parseMcpConfig, readMcpEntries, serverKey, withMcpEntryDisabled, withMcpToolsDisabled } from './config';
+import { McpManager, formatToolResult, mcpToolName, sanitizeSchema, type McpServerStatus, type McpToolInfo } from './manager';
+import { TOOL_COUNT_WARN_AT, TOOL_TOKENS_WARN_AT, estimateToolTokens, summarizeToolUsage } from './toolUsage';
 
 /** server ปลอมในหน่วยความจำ: ตอบ initialize / tools/list / tools/call */
 function fakeServer(tools: any[], onCall?: (name: string, args: any) => any): McpTransport & { sent: any[] } {
@@ -195,6 +196,7 @@ describe('MCP tool permissions', () => {
     },
   });
   const mcp = {
+    isDisabled: (name: string) => name.endsWith('off'),
     isReadOnly: (name: string) => name.endsWith('search'),
     callTool: vi.fn(async () => ({ text: 'ok', isError: false })),
   };
@@ -229,5 +231,198 @@ describe('MCP tool permissions', () => {
     const signal = new AbortController().signal;
     await executeTool('mcp__gh__search', { q: 'x' }, settings(true), callbacks('once', []), undefined, { mcp, signal });
     expect(mcp.callTool).toHaveBeenLastCalledWith('mcp__gh__search', { q: 'x' }, signal);
+  });
+
+  it('refuses a disabled tool without asking, even with an allow rule', async () => {
+    const asked: string[] = [];
+    const calls = mcp.callTool.mock.calls.length;
+    const rules = [{ id: '1', action: 'allow' as const, tool: 'mcp' as const, pattern: 'mcp__gh__*' }];
+    const store = { rules: () => rules, addRule: () => {} };
+    for (const autoPilot of [true, false]) {
+      expect(await executeTool('mcp__gh__off', {}, settings(autoPilot), callbacks('once', asked), store, { mcp })).toMatchObject({
+        error: expect.stringContaining('turned off'),
+      });
+    }
+    expect(asked).toEqual([]);
+    expect(mcp.callTool).toHaveBeenCalledTimes(calls);
+  });
+});
+
+describe('disabledTools in the config', () => {
+  const config = (server: Record<string, unknown>) => JSON.stringify({ mcpServers: { gh: { type: 'http', url: 'https://x', ...server } } });
+
+  it('reads the list for both transports and leaves it out when empty', () => {
+    expect(parseMcpConfig(config({ disabledTools: ['a', 'b'] })).servers[0].disabledTools).toEqual(['a', 'b']);
+    expect(parseMcpConfig(config({ disabledTools: [] })).servers[0]).not.toHaveProperty('disabledTools');
+    expect(parseMcpConfig(config({})).servers[0]).not.toHaveProperty('disabledTools');
+    const stdio = JSON.stringify({ mcpServers: { fs: { command: 'node', disabledTools: ['write'] } } });
+    expect(parseMcpConfig(stdio).servers[0].disabledTools).toEqual(['write']);
+  });
+
+  it('skips the server when the list cannot be read, so a tool meant to be off never turns on by accident', () => {
+    for (const bad of ['write', ['write', 1], { write: true }, null]) {
+      const { servers, errors } = parseMcpConfig(config({ disabledTools: bad }));
+      expect(servers).toEqual([]);
+      expect(errors[0]).toContain('disabledTools');
+    }
+  });
+
+  it('adds and removes tools while keeping everything else in the entry', () => {
+    const start = JSON.stringify({ mcpServers: { gh: { type: 'http', url: 'https://x', disabled: true } }, other: 1 });
+    const off = withMcpToolsDisabled(start, 'gh', ['a', 'b'], true);
+    expect(readMcpEntries(off)!.gh).toEqual({ type: 'http', url: 'https://x', disabled: true, disabledTools: ['a', 'b'] });
+    expect(JSON.parse(off).other).toBe(1);
+    // ซ้ำไม่เพิ่ม และเปิดกลับเฉพาะตัวที่ระบุ
+    expect(readMcpEntries(withMcpToolsDisabled(off, 'gh', ['a'], true))!.gh.disabledTools).toEqual(['a', 'b']);
+    expect(readMcpEntries(withMcpToolsDisabled(off, 'gh', ['a'], false))!.gh.disabledTools).toEqual(['b']);
+    expect(readMcpEntries(withMcpToolsDisabled(off, 'gh', ['a', 'b'], false))!.gh).not.toHaveProperty('disabledTools');
+  });
+
+  it('keeps the list when the whole server is turned off and on', () => {
+    const off = withMcpToolsDisabled(config({}), 'gh', ['a'], true);
+    expect(readMcpEntries(withMcpEntryDisabled(withMcpEntryDisabled(off, 'gh', true), 'gh', false))!.gh.disabledTools).toEqual(['a']);
+  });
+
+  it('ignores servers that do not exist and refuses a broken config', () => {
+    expect(readMcpEntries(withMcpToolsDisabled(config({}), 'nope', ['a'], true))).not.toHaveProperty('nope');
+    expect(() => withMcpToolsDisabled('{ broken', 'gh', ['a'], true)).toThrow();
+  });
+});
+
+describe('McpManager with disabled tools', () => {
+  const tools = [
+    { name: 'search', description: 'Find things', inputSchema: { type: 'object', properties: { q: { type: 'string' } } }, annotations: { readOnlyHint: true } },
+    { name: 'delete', description: 'Delete things', inputSchema: {} },
+  ];
+  const servers = (disabledTools?: string[]) =>
+    parseMcpConfig(JSON.stringify({ mcpServers: { gh: { type: 'http', url: 'https://x', ...(disabledTools ? { disabledTools } : {}) } } })).servers;
+
+  async function connected(disabledTools?: string[], list: any[] = tools, onCall?: (name: string, args: any) => any) {
+    const transports: ReturnType<typeof fakeServer>[] = [];
+    const manager = new McpManager(() => {
+      const transport = fakeServer(list, onCall);
+      transports.push(transport);
+      return transport;
+    });
+    manager.sync(servers(disabledTools), '');
+    await vi.waitFor(() => expect(manager.statuses()[0].state).toBe('ready'));
+    return { manager, transports };
+  }
+
+  it('does not offer a disabled tool to the model', async () => {
+    const { manager } = await connected(['delete']);
+    expect(manager.toolDefinitions().map((d) => d.name)).toEqual(['mcp__gh__search']);
+    expect(manager.statuses()[0].tools).toEqual(['search']);
+  });
+
+  it('still lists it for the page, with its size', async () => {
+    const { manager } = await connected(['delete']);
+    const info = manager.statuses()[0].toolInfo;
+    expect(info.map((t) => [t.name, t.enabled])).toEqual([
+      ['search', true],
+      ['delete', false],
+    ]);
+    expect(info[0].description).toBe('Find things');
+    expect(info[0].tokens).toBeGreaterThan(info[1].tokens);
+  });
+
+  it('refuses to call a disabled tool and never reaches the server', async () => {
+    const calls: string[] = [];
+    const { manager } = await connected(['delete'], tools, (name) => {
+      calls.push(name);
+      return { content: [] };
+    });
+    expect(manager.isDisabled('mcp__gh__delete')).toBe(true);
+    expect(manager.isDisabled('mcp__gh__search')).toBe(false);
+    expect(manager.isDisabled('mcp__gh__unknown')).toBe(false);
+    expect(manager.isReadOnly('mcp__gh__delete')).toBe(false);
+    await expect(manager.callTool('mcp__gh__delete', {})).rejects.toThrow(/not available/);
+    expect(calls).toEqual([]);
+  });
+
+  it('does not treat a declared read-only tool as allowed once it is disabled', async () => {
+    const { manager } = await connected(['search']);
+    expect(manager.isReadOnly('mcp__gh__search')).toBe(false);
+    expect(manager.isDisabled('mcp__gh__search')).toBe(true);
+  });
+
+  it('applies a change right away without reconnecting', async () => {
+    const { manager, transports } = await connected();
+    const seen = vi.fn();
+    manager.subscribe(seen);
+    manager.sync(servers(['delete']), '');
+    expect(manager.toolDefinitions().map((d) => d.name)).toEqual(['mcp__gh__search']);
+    expect(manager.statuses()[0].toolInfo[1].enabled).toBe(false);
+    expect(seen).toHaveBeenCalled();
+    manager.sync(servers(), '');
+    expect(manager.toolDefinitions()).toHaveLength(2);
+    expect(transports).toHaveLength(1);
+  });
+
+  it('reconnects when the connection itself changes, and keeps the list', async () => {
+    const { manager, transports } = await connected(['delete']);
+    const moved = parseMcpConfig(JSON.stringify({ mcpServers: { gh: { type: 'http', url: 'https://y', disabledTools: ['delete'] } } })).servers;
+    manager.sync(moved, '');
+    await vi.waitFor(() => expect(manager.statuses()[0].state).toBe('ready'));
+    expect(transports).toHaveLength(2);
+    expect(manager.toolDefinitions().map((d) => d.name)).toEqual(['mcp__gh__search']);
+  });
+
+  it('keeps tools off after the server refreshes its list, and turns on tools it adds later', async () => {
+    const { manager, transports } = await connected(['delete']);
+    const send = transports[0].send;
+    transports[0].send = async (msg: any) => {
+      if (msg.method !== 'tools/list') return send(msg);
+      queueMicrotask(() => transports[0].onMessage?.({ jsonrpc: '2.0', id: msg.id, result: { tools: [...tools, { name: 'brand_new' }] } }));
+    };
+    transports[0].onMessage?.({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+    await vi.waitFor(() => expect(manager.statuses()[0].toolInfo).toHaveLength(3));
+    expect(manager.toolDefinitions().map((d) => d.name)).toEqual(['mcp__gh__search', 'mcp__gh__brand_new']);
+  });
+
+  it('does not let a disabled tool hide an enabled one with the same safe name', async () => {
+    const calls: string[] = [];
+    const { manager } = await connected(['a.b'], [{ name: 'a.b' }, { name: 'a_b' }], (name) => {
+      calls.push(name);
+      return { content: [] };
+    });
+    expect(manager.isDisabled('mcp__gh__a_b')).toBe(false);
+    await manager.callTool('mcp__gh__a_b', {});
+    expect(calls).toEqual(['a_b']);
+  });
+});
+
+describe('summarizeToolUsage', () => {
+  const builtIn = [{ name: 'read_file', description: 'Read a file', parameters: { type: 'object', properties: {} } }];
+  const status = (toolInfo: McpToolInfo[], state: McpServerStatus['state'] = 'ready'): McpServerStatus => ({
+    name: 's',
+    key: 's',
+    transport: 'http',
+    state,
+    tools: [],
+    toolInfo,
+  });
+  const tool = (tokens: number, enabled = true): McpToolInfo => ({ name: `t${tokens}`, description: '', enabled, tokens });
+
+  it('counts only tools that will really be sent', () => {
+    const usage = summarizeToolUsage([status([tool(100), tool(50, false)]), status([tool(9000)], 'error')], builtIn);
+    expect(usage).toMatchObject({ mcpTools: 1, mcpTokens: 100, builtInTools: 1, totalTools: 2, isHigh: false });
+    expect(usage.totalTokens).toBe(100 + usage.builtInTokens);
+  });
+
+  it('warns once the plugins are heavy or there are too many tools, but never about built-ins alone', () => {
+    expect(summarizeToolUsage([status([tool(TOOL_TOKENS_WARN_AT - 1)])], builtIn).isHigh).toBe(false);
+    expect(summarizeToolUsage([status([tool(TOOL_TOKENS_WARN_AT)])], builtIn).isHigh).toBe(true);
+    const many = Array.from({ length: TOOL_COUNT_WARN_AT }, (_, i) => ({ ...tool(1), name: `t${i}` }));
+    expect(summarizeToolUsage([status(many)], builtIn).isHigh).toBe(true);
+    expect(summarizeToolUsage([status(many.slice(1))], builtIn).isHigh).toBe(false);
+    expect(summarizeToolUsage([], Array.from({ length: 100 }, () => builtIn[0])).isHigh).toBe(false);
+  });
+
+  it('estimates from the JSON size and counts Thai text as heavier', () => {
+    const ascii = estimateToolTokens({ name: 'a', description: 'x'.repeat(350), parameters: {} });
+    expect(ascii).toBeGreaterThan(100);
+    expect(ascii).toBeLessThan(125);
+    expect(estimateToolTokens({ name: 'a', description: 'ก'.repeat(350), parameters: {} })).toBeGreaterThan(350);
   });
 });

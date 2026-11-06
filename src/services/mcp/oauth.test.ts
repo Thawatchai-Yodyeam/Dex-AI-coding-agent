@@ -205,7 +205,7 @@ describe('sign-in helpers', () => {
   });
 
   it('labels the sign-in state', () => {
-    const status = { name: 's', key: 's', transport: 'http' as const, state: 'auth' as const, tools: [] };
+    const status = { name: 's', key: 's', transport: 'http' as const, state: 'auth' as const, tools: [], toolInfo: [] };
     expect(mcpStatusLabel(status, th)).toBe(th.mcpNeedsSignIn);
     expect(mcpStatusLabel({ ...status, state: 'ready', tools: ['a'] }, en)).toBe(en.mcpReady(1));
     expect(mcpStatusLabel({ ...status, state: 'starting' }, en)).toBe(en.mcpStarting);

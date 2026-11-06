@@ -9,6 +9,8 @@
  * `${NAME}` ใน args/env/url/headers ถูกแทนฝั่ง Rust ด้วยคีย์ใน Credential Manager (กรอกในหน้า Customizations)
  * หรือ environment variable — ไม่ต้องเก็บ token ไว้ใน settings
  *
+ * `"disabledTools": ["tool_name"]` ปิด tool รายตัวของ server นั้น (ใช้ชื่อตามที่ server ประกาศ ไม่มี prefix mcp__)
+ *
  * server แบบ http ที่ล็อกอินผ่านเบราว์เซอร์ได้ใส่ `"auth": "oauth"` แทน header:
  *     "supabase": { "type": "http", "url": "https://mcp.supabase.com/mcp", "auth": "oauth" }
  */
@@ -29,6 +31,8 @@ export interface McpServerConfig {
   auth?: 'oauth';
   /** timeout ของแต่ละ request (ms) */
   timeoutMs?: number;
+  /** tool ที่ผู้ใช้ปิดไว้ (ชื่อตามที่ server ประกาศ) — ไม่ส่งให้โมเดลและเรียกไม่ได้ */
+  disabledTools?: string[];
 }
 
 export interface ParsedMcpConfig {
@@ -70,6 +74,8 @@ const stringRecord = (v: unknown): Record<string, string> | undefined => {
   return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, val]) => [k, String(val)]));
 };
 
+const isStringList = (v: unknown): v is string[] => Array.isArray(v) && v.every((item) => typeof item === 'string');
+
 export function parseMcpConfig(text: string | undefined): ParsedMcpConfig {
   if (!text?.trim()) return { servers: [], errors: [] };
   let json: any;
@@ -93,6 +99,12 @@ export function parseMcpConfig(text: string | undefined): ParsedMcpConfig {
       continue;
     }
     if (raw.disabled === true || raw.enabled === false) continue;
+    // อ่านไม่ออกว่าปิดอะไรไว้ → ไม่เปิด server เลย ดีกว่าปล่อยให้ tool ที่ผู้ใช้ตั้งใจปิดกลับมาใช้ได้
+    if (raw.disabledTools !== undefined && !isStringList(raw.disabledTools)) {
+      errors.push(`${name}: "disabledTools" must be a list of tool names`);
+      continue;
+    }
+    const toolFilter = raw.disabledTools?.length ? { disabledTools: raw.disabledTools as string[] } : {};
     let key = serverKey(name);
     for (let i = 2; usedKeys.has(key); i++) key = `${serverKey(name).slice(0, 21)}_${i}`;
     const type = String(raw.type ?? raw.transport ?? (raw.url ? 'http' : 'stdio')).toLowerCase();
@@ -112,6 +124,7 @@ export function parseMcpConfig(text: string | undefined): ParsedMcpConfig {
         env: stringRecord(raw.env) ?? {},
         ...(typeof raw.cwd === 'string' ? { cwd: raw.cwd } : {}),
         ...(timeoutMs ? { timeoutMs } : {}),
+        ...toolFilter,
       });
     } else if (type === 'http' || type === 'streamable-http' || type === 'streamablehttp') {
       if (typeof raw.url !== 'string' || !/^https?:\/\//i.test(raw.url.trim())) {
@@ -130,6 +143,7 @@ export function parseMcpConfig(text: string | undefined): ParsedMcpConfig {
         headers: stringRecord(raw.headers) ?? {},
         ...(raw.auth === 'oauth' ? { auth: 'oauth' as const } : {}),
         ...(timeoutMs ? { timeoutMs } : {}),
+        ...toolFilter,
       });
     } else {
       // SSE แบบเก่า (2024-11-05) ถูกแทนด้วย Streamable HTTP แล้ว
@@ -189,5 +203,17 @@ export function withMcpEntryDisabled(text: string | undefined, name: string, dis
   delete entry.enabled;
   if (disabled) entry.disabled = true;
   else delete entry.disabled;
+  return JSON.stringify(root, null, 2);
+}
+
+/** เปิด/ปิด tool รายตัวของ server — ค่าอื่นใน entry คงเดิม และไม่เหลือ key ว่างเมื่อเปิดครบทุกตัว */
+export function withMcpToolsDisabled(text: string | undefined, name: string, tools: readonly string[], disabled: boolean): string {
+  const { root, entries } = openMcpConfig(text);
+  const entry = entries[name];
+  if (!isPlainObject(entry)) return JSON.stringify(root, null, 2);
+  const current = isStringList(entry.disabledTools) ? entry.disabledTools : [];
+  const next = disabled ? [...new Set([...current, ...tools])] : current.filter((tool) => !tools.includes(tool));
+  if (next.length > 0) entry.disabledTools = next;
+  else delete entry.disabledTools;
   return JSON.stringify(root, null, 2);
 }

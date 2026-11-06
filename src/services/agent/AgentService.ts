@@ -2,7 +2,7 @@ import type { AIProvider, AppSettings, PermissionRule, TokenUsage, ToolCallRecor
 import { PROVIDERS_CATALOG, requiresApiKey, supportsImages } from '../../types/agent';
 import { tauriBridge } from '../tauriBridge';
 import { COMPACT_AT_CHARS, compactHistory, type CompactionResult } from './compaction';
-import { estimateHistoryChars, fromNeutral, isUserTextTurn, pruneHistory, pruneHistoryToBudget, toNeutral } from './history';
+import { estimateHistoryChars, fromNeutral, isUserTextTurn, pruneHistory, pruneHistoryToBudget, stripThinking, toNeutral } from './history';
 import { newRuleId } from './permissions';
 import {
   MAX_PROJECT_INSTRUCTION_CHARS,
@@ -13,6 +13,7 @@ import {
 import { runAnthropicTurn } from './providers/anthropic';
 import { runGoogleTurn } from './providers/google';
 import { runOpenAITurn } from './providers/openai';
+import { withToolLimitErrors } from './providers/toolLimits';
 import { loadSkills, USE_SKILL_TOOL } from './skills';
 import {
   TOOL_DEFINITIONS,
@@ -50,7 +51,7 @@ function formatFor(provider: AIProvider): HistoryFormat {
 
 /** สิ่งที่ AgentService ต้องการจาก MCP manager */
 export interface McpProvider extends McpToolRunner {
-  /** tool ของทุก server ที่เชื่อมต่ออยู่ ชื่อขึ้นต้นด้วย mcp__<server>__ */
+  /** tool ของทุก server ที่เชื่อมต่ออยู่ ยกเว้นตัวที่ผู้ใช้ปิด ชื่อขึ้นต้นด้วย mcp__<server>__ */
   toolDefinitions(): ToolDefinition[];
 }
 
@@ -62,13 +63,23 @@ interface HistorySnapshot {
   format: HistoryFormat;
   history: any[];
   sessionRules?: PermissionRule[];
+  /** ชุด tool ที่ thinking block ใน history ผูกอยู่ — snapshot รุ่นเก่าไม่มี */
+  toolSetId?: string;
 }
 
 const DRIVERS: Record<HistoryFormat, (ctx: TurnContext, input: UserInput) => Promise<TurnResult>> = {
-  google: runGoogleTurn,
-  anthropic: runAnthropicTurn,
-  openai: runOpenAITurn,
+  google: withToolLimitErrors(runGoogleTurn),
+  anthropic: withToolLimitErrors(runAnthropicTurn),
+  openai: withToolLimitErrors(runOpenAITurn),
 };
+
+/** รหัสของชุด tool (FNV-1a) ไว้เทียบว่าเปลี่ยนไหม — เก็บลงไฟล์ประวัติได้โดยไม่ต้องเก็บ schema ทั้งก้อน */
+function toolSetIdOf(tools: readonly ToolDefinition[]): string {
+  const json = JSON.stringify(tools);
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < json.length; i++) hash = Math.imul(hash ^ json.charCodeAt(i), 0x01000193);
+  return `${json.length.toString(36)}-${(hash >>> 0).toString(36)}`;
+}
 
 /**
  * ทุก STEPS_PER_CONFIRM step ถามผู้ใช้ผ่านแถบอนุมัติแบบเดียวกับ tool (การ์ด "ทำงานต่อ")
@@ -108,6 +119,7 @@ export class MultiProviderAgentService {
   private version = 0;
   private turnVersion = -1;
   private mcp: McpProvider | null = null;
+  private toolSetId: string | undefined;
 
   constructor(settings: AppSettings) {
     this.settings = settings;
@@ -131,6 +143,7 @@ export class MultiProviderAgentService {
     this.historyFormat = null;
     this.pendingNeutral = [];
     this.sessionRules = [];
+    this.toolSetId = undefined;
     this.version++;
   }
 
@@ -150,6 +163,7 @@ export class MultiProviderAgentService {
       format: this.historyFormat,
       history: this.history,
       sessionRules: this.sessionRules,
+      toolSetId: this.toolSetId,
     };
     return JSON.stringify(snapshot);
   }
@@ -173,6 +187,7 @@ export class MultiProviderAgentService {
     this.historyFormat = snapshot.format;
     this.pendingNeutral = [];
     this.sessionRules = Array.isArray(snapshot.sessionRules) ? snapshot.sessionRules : [];
+    this.toolSetId = typeof snapshot.toolSetId === 'string' ? snapshot.toolSetId : undefined;
     this.version++;
     return true;
   }
@@ -317,6 +332,11 @@ export class MultiProviderAgentService {
     const turnVersion = ++this.version;
     this.turnVersion = turnVersion;
     this.history = pruneHistory(this.historyFor(format), format, MAX_HISTORY_MESSAGES);
+    // Claude 5.1 ขึ้นไปผูก thinking block กับชุด tool ตอนที่สร้าง: เปิด/ปิด tool หรือ server กลางแชทแล้วส่ง block เดิมไป
+    // API จะตอบ 400 ทุกคำขอ จึงถอดออกก่อน (โมเดลเสียแค่เหตุผลเก่า ส่วนข้อความกับผลของ tool ยังอยู่ครบ)
+    const toolSetId = toolSetIdOf(tools);
+    if (format === 'anthropic' && this.toolSetId !== toolSetId) this.history = stripThinking(this.history);
+    this.toolSetId = toolSetId;
     // ถูกแทนหลังสรุปบทสนทนา (ถ้ามี) — catch ใช้ย้อนประวัติของเทิร์นนี้
     let turnHistory = this.history;
     let snapshotLength = turnHistory.length;

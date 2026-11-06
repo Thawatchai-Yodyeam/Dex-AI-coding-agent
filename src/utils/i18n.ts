@@ -98,6 +98,29 @@ const th = {
     OAUTH_REFRESH_FAILED: 'ต่ออายุการล็อกอินไม่สำเร็จชั่วคราว การล็อกอินยังอยู่ ลองเชื่อมต่อใหม่ภายหลัง',
     OAUTH_STORE: 'อ่านหรือเขียน Windows Credential Manager ไม่สำเร็จ',
   } as Record<string, string>,
+  toolUsageTitle: 'tool ที่ส่งให้โมเดล',
+  toolUsageFromPlugins: 'จาก plugin',
+  toolUsageBuiltIn: 'ของ Dex เอง',
+  toolUsageTotal: 'รวมต่อคำขอ',
+  toolUsageStat: (tools: number, tokens: string) => `${tools} tools · ~${tokens} tokens`,
+  toolUsageHint:
+    'ทุกตัวถูกส่งซ้ำในทุกคำขอระหว่างทำงานและคิดเงินเป็น input ตัวเลข token เป็นค่าประมาณจากขนาด JSON ปิด tool ที่ไม่ใช้ได้ในแต่ละรายการด้านล่าง',
+  toolUsageHigh: (tools: number, tokens: string) =>
+    `ตอนนี้ส่ง ${tools} tools และ plugin ใช้ราว ${tokens} tokens ในทุกคำขอ ซึ่งเพิ่มค่าใช้จ่ายได้ชัดเจน และโมเดลอาจเลือก tool แม่นน้อยลง ควรปิดตัวที่ไม่ใช้`,
+  toolUsageOverLimit: (provider: string, limit: number, tools: number) =>
+    `${provider} รับ tool ได้ไม่เกิน ${limit} ตัวต่อคำขอ แต่ตอนนี้เปิดอยู่ ${tools} ตัว ต้องปิดอย่างน้อย ${tools - limit} ตัว ไม่งั้นส่งข้อความไม่ได้`,
+  toolUsageServer: (on: number, total: number, tokens: string) =>
+    `${on === total ? `${total} tools` : `เปิด ${on} จาก ${total} tools`} · ~${tokens} tokens`,
+  toolUsageEnableAll: 'เปิดทั้งหมด',
+  toolUsageDisableAll: 'ปิดทั้งหมด',
+  toolUsageToolList: (server: string) => `tool ของ ${server}`,
+  toolLimitExceeded: (provider: string, limit: number, tools: number) =>
+    `${provider} รับ tool ได้ไม่เกิน ${limit} ตัวต่อคำขอ แต่คำขอนี้ส่งไป ${tools} ตัว`,
+  toolLimitLikely: (provider: string, tools: number) =>
+    `${provider} ปฏิเสธคำขอนี้ น่าจะเพราะ tool ${tools} ตัวที่ส่งไปเยอะหรือซับซ้อนเกินไป`,
+  toolLimitFix: (excess: number | null) =>
+    `${excess ? `ปิด tool ที่ไม่ใช้อย่างน้อย ${excess} ตัว` : 'ปิด tool หรือ MCP server ที่ไม่ใช้'}ที่ Customizations → ติดตั้งแล้ว แล้วส่งข้อความอีกครั้ง`,
+  toolLimitFixElsewhere: 'ปิด tool ของ MCP อย่างเดียวไม่พอ ลองเปลี่ยนโมเดลหรือ endpoint',
   recents: 'ล่าสุด',
   noHistory: 'ยังไม่มีประวัติการแชท',
   deleteChat: 'ลบแชท',
@@ -287,7 +310,7 @@ const th = {
   skillSourceWorkspace: 'โปรเจกต์',
   skillSourceUser: 'ของคุณ',
   mcpIntro:
-    'วาง config แบบเดียวกับ Claude Desktop / .mcp.json (stdio ใช้ command + args, remote ใช้ "type": "http" + url) ใช้ ${ชื่อ_ENV} แทน token เพื่อไม่ต้องเก็บไว้ใน settings หรือใส่ "auth": "oauth" ถ้า server รองรับการล็อกอินผ่านเบราว์เซอร์ — tool ของ MCP ถามก่อนรันเสมอ ยกเว้นตัวที่ประกาศว่าอ่านอย่างเดียวในโหมด Auto-Pilot หรือจะติดตั้งสำเร็จรูปจาก Customizations ที่แถบซ้ายก็ได้',
+    'วาง config แบบเดียวกับ Claude Desktop / .mcp.json (stdio ใช้ command + args, remote ใช้ "type": "http" + url) ใช้ ${ชื่อ_ENV} แทน token เพื่อไม่ต้องเก็บไว้ใน settings หรือใส่ "auth": "oauth" ถ้า server รองรับการล็อกอินผ่านเบราว์เซอร์ — tool ของ MCP ถามก่อนรันเสมอ ยกเว้นตัวที่ประกาศว่าอ่านอย่างเดียวในโหมด Auto-Pilot หรือจะติดตั้งสำเร็จรูปจาก Customizations ที่แถบซ้ายก็ได้ ส่วนการปิด tool รายตัวทำได้ที่แท็บติดตั้งแล้วของหน้านั้น (เก็บไว้ใน "disabledTools" ของ server)',
   mcpSaveHint: (n: number) => `${n} server — กดบันทึกเพื่อเชื่อมต่อ`,
   mcpReady: (n: number) => `พร้อม · ${n} tools`,
   mcpStarting: 'กำลังเชื่อมต่อ…',
@@ -500,6 +523,29 @@ const en: Translation = {
     OAUTH_REFRESH_FAILED: 'Could not renew the sign-in right now. You are still signed in, so try reconnecting later.',
     OAUTH_STORE: 'Could not read or write Windows Credential Manager.',
   },
+  toolUsageTitle: 'Tools sent to the model',
+  toolUsageFromPlugins: 'From plugins',
+  toolUsageBuiltIn: 'Built into Dex',
+  toolUsageTotal: 'Total per request',
+  toolUsageStat: (tools: number, tokens: string) => `${tools} tools · ~${tokens} tokens`,
+  toolUsageHint:
+    'All of these are sent again with every request while Dex works, and they are billed as input. Token counts are estimates based on JSON size. You can turn off tools you do not use in each item below.',
+  toolUsageHigh: (tools: number, tokens: string) =>
+    `You are sending ${tools} tools, and plugins use about ${tokens} tokens on every request. This can noticeably raise your costs and make the model less accurate at choosing tools. Consider turning off the ones you do not use.`,
+  toolUsageOverLimit: (provider: string, limit: number, tools: number) =>
+    `${provider} accepts at most ${limit} tools per request, but ${tools} are on. Turn off at least ${tools - limit} or your messages will be rejected.`,
+  toolUsageServer: (on: number, total: number, tokens: string) =>
+    `${on === total ? `${total} tools` : `${on} of ${total} tools on`} · ~${tokens} tokens`,
+  toolUsageEnableAll: 'Turn all on',
+  toolUsageDisableAll: 'Turn all off',
+  toolUsageToolList: (server: string) => `Tools of ${server}`,
+  toolLimitExceeded: (provider: string, limit: number, tools: number) =>
+    `${provider} accepts at most ${limit} tools per request, but this request sent ${tools}.`,
+  toolLimitLikely: (provider: string, tools: number) =>
+    `${provider} rejected this request, probably because the ${tools} tools sent are too many or too complex.`,
+  toolLimitFix: (excess: number | null) =>
+    `Turn off ${excess ? `at least ${excess} tools` : 'tools or MCP servers'} you do not use in Customizations → Installed, then send your message again.`,
+  toolLimitFixElsewhere: 'Turning off MCP tools will not be enough here. Try another model or endpoint.',
   recents: 'Recents',
   noHistory: 'No chats yet',
   deleteChat: 'Delete chat',
@@ -679,7 +725,7 @@ const en: Translation = {
   skillSourceWorkspace: 'project',
   skillSourceUser: 'yours',
   mcpIntro:
-    'Paste a config in the Claude Desktop / .mcp.json format (stdio servers use command + args, remote ones use "type": "http" + url). Use ${ENV_NAME} for tokens so they are not stored in settings, or add "auth": "oauth" if the server supports signing in with a browser. MCP tools always ask before running, except ones marked read-only while Auto-Pilot is on. You can also install ready-made ones from Customizations in the sidebar.',
+    'Paste a config in the Claude Desktop / .mcp.json format (stdio servers use command + args, remote ones use "type": "http" + url). Use ${ENV_NAME} for tokens so they are not stored in settings, or add "auth": "oauth" if the server supports signing in with a browser. MCP tools always ask before running, except ones marked read-only while Auto-Pilot is on. You can also install ready-made ones from Customizations in the sidebar, and turn off individual tools in its Installed tab (saved as "disabledTools" on the server).',
   mcpSaveHint: (n: number) => `${n} server(s) — save to connect`,
   mcpReady: (n: number) => `ready · ${n} tools`,
   mcpStarting: 'connecting…',

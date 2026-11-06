@@ -125,6 +125,7 @@ Go to ⚙️ Settings → Skills and MCP and paste a config in the same format a
 - `${NAME}` in args, env, url and headers is replaced by a key saved in Customizations or by an environment variable, so tokens need not be kept in settings.
 - Remote servers that support it can sign in with your browser instead: use `{ "type": "http", "url": "https://…", "auth": "oauth" }` and press **Sign in** next to the server. This follows the [MCP authorization spec](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization) with dynamic client registration, so a server must offer a `registration_endpoint`. For CI, keep using a token in `headers`.
 - MCP tools are named `mcp__<server>__<tool>` and **always ask before running**, except those that declare `readOnlyHint` in Auto-Pilot mode or have an allow rule of type *MCP tool*.
+- `"disabledTools": ["tool_name"]` on a server turns off individual tools, using the names the server declares. They are not sent to the model and cannot be called. Customizations → Installed writes this for you.
 - stdio and Streamable HTTP are supported (the older SSE transport is not). Connection status and errors appear on the settings page.
 
 ### Customizations
@@ -133,6 +134,8 @@ Open **Customizations** in the sidebar to browse the **Marketplace** and manage 
 
 - **Before you install**, each plugin shows the exact command or URL it uses, who publishes it, and whether it comes from the community rather than the service's owner.
 - **MCP plugins** add an entry to the same config as ⚙️ Settings → Skills and MCP, so you can still edit them there. Their tools ask before running under the usual rules.
+- **Tool usage:** every tool's schema is sent with every request and billed as input. The Installed tab shows how many tools each server adds and their estimated size, warns when plugins reach about 10k tokens or the total passes 50 tools, and lets you turn off single tools without reconnecting. Turning a tool on or off in the middle of a chat restarts Claude's prompt cache and drops its earlier reasoning, because Claude's API ties both to the tool list.
+- **Tool limits:** OpenAI refuses more than 128 tools in a request and the Gemini API more than 512. Other providers document no fixed limit. Dex does not block a request itself, because limits change. When a provider refuses the tool list, the chat explains how many tools to turn off instead of showing the raw API error.
 - **Skill plugins** write `~/.dex/skills/<name>/SKILL.md`. They contain instructions only, and nothing runs. Dex never overwrites or deletes a skill you wrote yourself.
 - **Keys** go to Windows Credential Manager as `mcp-secret-<NAME>`, and the config stores only `${NAME}`. A saved key takes priority over an environment variable of the same name. Uninstalling a plugin deletes its keys.
 - **Sign-in:** plugins marked `auth: 'oauth'` open your system browser when you install them, so there is no key to create. Tokens go to Credential Manager as `mcp-oauth.<server>.<part>`, split into parts because one entry holds at most 2,560 bytes. Rust adds the `Authorization` header itself, and uninstalling or signing out deletes the tokens from this computer. To remove the access completely, do it in the settings of that service. A plugin you installed with a key before it moved to sign-in shows **Update**: it signs you in first, then deletes the old key.
@@ -240,7 +243,7 @@ src/
       retry.ts              retries on 429/5xx/529/network loss (exponential backoff + retry-after)
       skills.ts             finds/reads SKILL.md, use_skill tool, /skill-name
       prompt.ts             system prompt + project instructions + skill list
-      providers/            anthropic.ts (prompt caching), openai.ts (+ custom endpoint), google.ts
+      providers/            anthropic.ts (prompt caching), openai.ts (+ custom endpoint), google.ts, toolLimits.ts (per-provider tool limits and clear errors)
     browser/
       pane.ts               browser pane state + follows the frame's position in the layout
       actions.ts            browser tool actions (navigate/snapshot/click/type/...) over the DevTools protocol
@@ -255,8 +258,9 @@ src/
     mcp/
       config.ts             reads Claude Desktop style config
       client.ts             JSON-RPC client + stdio / Streamable HTTP transports
-      manager.ts            starts/stops servers, merges tools as mcp__server__tool
+      manager.ts            starts/stops servers, merges tools as mcp__server__tool, leaves out disabled tools
       oauth.ts              sign-in helpers for the UI (the tokens themselves stay in Rust)
+      toolUsage.ts          estimated size of the tools sent to the model
     marketplace/
       catalog.ts            the plugins in the Marketplace (data only)
       skillPacks.ts         instructions of the skills that ship with the Marketplace
