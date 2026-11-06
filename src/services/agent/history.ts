@@ -207,19 +207,24 @@ export function trimToolResults(history: any[], format: HistoryFormat, budget = 
   return cleared;
 }
 
-/** ตัดหัวประวัติที่ตำแหน่ง cut (ต้องเป็นขอบเทิร์น) — Claude ต้องถอด thinking ของข้อความที่เหลือด้วย */
-export function cutAt(history: any[], format: HistoryFormat, cut: number): any[] {
-  const kept = history.slice(cut);
-  if (format === 'anthropic') {
-    // ประวัติถูกแก้ (ตัดหัว) → thinking block เดิมใช้ต่อไม่ได้ (preserved thinking ตรวจลำดับ)
-    // จึงถอด thinking ออกจากข้อความ assistant ที่เหลือ
-    return kept.map((m) =>
+/**
+ * ถอด thinking block ทั้งหมดออกจากประวัติแบบ Claude — ใช้เมื่อสิ่งที่อยู่ก่อนหน้า block เปลี่ยน
+ * (ตัดหัวประวัติ, ชุด tool เปลี่ยน) preserved thinking จะไม่รับ block เดิม แต่อนุญาตให้ถอดออกทั้งหมดได้
+ */
+export function stripThinking(history: any[]): any[] {
+  return history
+    .map((m) =>
       m.role === 'assistant' && Array.isArray(m.content)
         ? { ...m, content: m.content.filter((b: any) => b?.type !== 'thinking' && b?.type !== 'redacted_thinking') }
         : m
-    ).filter((m) => !(Array.isArray(m.content) && m.content.length === 0));
-  }
-  return kept;
+    )
+    .filter((m) => !(Array.isArray(m.content) && m.content.length === 0));
+}
+
+/** ตัดหัวประวัติที่ตำแหน่ง cut (ต้องเป็นขอบเทิร์น) — Claude ต้องถอด thinking ของข้อความที่เหลือด้วย */
+export function cutAt(history: any[], format: HistoryFormat, cut: number): any[] {
+  const kept = history.slice(cut);
+  return format === 'anthropic' ? stripThinking(kept) : kept;
 }
 
 /**

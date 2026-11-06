@@ -1,9 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Check, ChevronDown, ChevronUp, Plug, Plus, RotateCcw, Search, Settings2, Sparkles, Trash2 } from 'lucide-react';
 import { useMcpStatuses } from '../hooks/useMcpStatuses';
-import { loadSkills } from '../services/agent/skills';
-import { isMcpEntryDisabled, readMcpEntries, withMcpEntry, withMcpEntryDisabled } from '../services/mcp/config';
+import { toolLimitOf } from '../services/agent/providers/toolLimits';
+import { loadSkills, USE_SKILL_TOOL } from '../services/agent/skills';
+import { TOOL_DEFINITIONS } from '../services/agent/tools';
+import { isMcpEntryDisabled, readMcpEntries, withMcpEntry, withMcpEntryDisabled, withMcpToolsDisabled } from '../services/mcp/config';
 import { mcpManager, type McpServerStatus } from '../services/mcp/manager';
+import { summarizeToolUsage } from '../services/mcp/toolUsage';
 import { MARKETPLACE_PLUGINS, PLUGIN_SECTIONS, type MarketplacePlugin } from '../services/marketplace/catalog';
 import {
   canUninstall,
@@ -25,8 +28,9 @@ import {
   type PluginSettings,
 } from '../services/marketplace/plugins';
 import type { SkillInfo } from '../services/tauriBridge';
-import type { AppSettings } from '../types/agent';
+import { PROVIDERS_CATALOG, type AppSettings } from '../types/agent';
 import type { Translation } from '../utils/i18n';
+import { EnableSwitch, McpToolList, McpUsageSummary } from './McpToolUsage';
 import { PluginDialog } from './PluginDialog';
 import { PluginIcon, PluginTile } from './PluginIcon';
 
@@ -51,19 +55,6 @@ const McpStatusChip: React.FC<{ status?: McpServerStatus; t: Translation }> = ({
       {status.state === 'ready' ? t.mcpReady(status.tools.length) : status.state === 'starting' ? t.mcpStarting : t.mcpError}
     </span>
   ) : null;
-
-const EnableSwitch: React.FC<{ label: string; enabled: boolean; onChange: (enabled: boolean) => void }> = ({ label, enabled, onChange }) => (
-  <button
-    type="button"
-    role="switch"
-    aria-checked={enabled}
-    aria-label={label}
-    className={`switch ${enabled ? 'is-on' : ''}`}
-    onClick={() => onChange(!enabled)}
-  >
-    <span className="switch-thumb" />
-  </button>
-);
 
 export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
   settings,
@@ -144,6 +135,27 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
       const rest = (prev.disabledSkills ?? []).filter((s) => s.toLowerCase() !== name.toLowerCase());
       return { disabledSkills: enabled ? rest : [...rest, name] };
     });
+
+  /** รายการ tool ของ server ที่พร้อมใช้ — ยังไม่เชื่อมต่อจะยังไม่รู้ว่ามี tool อะไร */
+  const toolList = (status: McpServerStatus | undefined, label: string) =>
+    status?.state === 'ready' &&
+    status.toolInfo.length > 0 && (
+      <McpToolList
+        status={status}
+        serverLabel={label}
+        t={t}
+        onSetDisabled={(tools, disabled) =>
+          applyPatch((prev) => ({ mcpConfig: withMcpToolsDisabled(prev.mcpConfig, status.name, tools, disabled) }))
+        }
+      />
+    );
+
+  // ชุดเดียวกับที่ AgentService ส่งให้โมเดล — ตัวเลขในหน้านี้จึงตรงกับของจริง
+  const disabledSkills = new Set((settings.disabledSkills ?? []).map((name) => name.toLowerCase()));
+  const usesSkillTool = skills.some((skill) => !disabledSkills.has(skill.name.toLowerCase()));
+  const usage = summarizeToolUsage(statuses, [...TOOL_DEFINITIONS, ...(usesSkillTool ? [USE_SKILL_TOOL] : [])]);
+  const providerName = PROVIDERS_CATALOG.find((p) => p.id === settings.provider)?.name ?? settings.provider;
+  const hasMcpServers = Object.keys(readMcpEntries(settings.mcpConfig) ?? {}).length > 0;
 
   const selected = MARKETPLACE_PLUGINS.find((p) => p.id === selectedId) ?? null;
 
@@ -279,6 +291,7 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
 
         {tab === 'installed' && (
           <>
+            {hasMcpServers && <McpUsageSummary usage={usage} limit={toolLimitOf(settings.provider)} providerName={providerName} t={t} />}
             {installedCount === 0 ? (
               <div className="plugin-empty">
                 <p>{t.pluginNothingInstalled}</p>
@@ -340,6 +353,7 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
                         enabled={state === 'enabled'}
                         onChange={(enabled) => applyPatch((prev) => enabledPatch(plugin, enabled, prev))}
                       />
+                      {toolList(status, plugin.name)}
                     </li>
                   );
                 })}
@@ -361,7 +375,6 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
                           {disabled && <span className="plugin-badge">{t.pluginDisabled}</span>}
                           <McpStatusChip status={status} t={t} />
                         </div>
-                        {status?.state === 'ready' && status.tools.length > 0 && <p className="field-hint">{status.tools.join(', ')}</p>}
                         {status?.error && <pre className="tool-error mcp-error">{status.error}</pre>}
                       </div>
                       {status && (
@@ -391,6 +404,7 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
                           applyPatch((prev) => ({ mcpConfig: withMcpEntryDisabled(prev.mcpConfig, name, !enabled) }))
                         }
                       />
+                      {toolList(status, name)}
                     </li>
                   );
                 })}

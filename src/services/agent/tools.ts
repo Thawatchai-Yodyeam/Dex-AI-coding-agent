@@ -448,6 +448,8 @@ export interface ToolContext {
 
 /** ส่วนที่ tools.ts ต้องใช้จาก MCP manager (แยก interface ไว้ให้เทสต์ mock ได้ง่าย) */
 export interface McpToolRunner {
+  /** ผู้ใช้ปิด tool นี้ไว้ — โมเดลอาจยังเรียกชื่อเดิมจากประวัติแชท */
+  isDisabled(toolName: string): boolean;
   /** tool นี้ประกาศ readOnlyHint (รันใน Auto-Pilot ได้โดยไม่ถาม) */
   isReadOnly(toolName: string): boolean;
   callTool(toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<{ text: string; isError: boolean }>;
@@ -1453,6 +1455,12 @@ const mcpHandler: ToolHandler = async (args, env) => {
   if (!mcp) {
     env.record.status = 'failed';
     env.record.error = `MCP server for ${name} is not connected`;
+    return { error: env.record.error };
+  }
+  // tool ที่รันไม่ได้อยู่แล้วไม่ต้องถาม — กฎการถามของ tool ที่รันได้อยู่ถัดจากนี้และไม่เปลี่ยน
+  if (mcp.isDisabled(name)) {
+    env.record.status = 'failed';
+    env.record.error = `${name} is turned off by the user in Customizations. Do not call it again; if you need it, ask the user to turn it back on.`;
     return { error: env.record.error };
   }
   const verdict = evaluateRules(env.permissions.rules(), 'mcp', name);
