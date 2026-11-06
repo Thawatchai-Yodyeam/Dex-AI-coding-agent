@@ -1,16 +1,23 @@
 import type { McpProvider } from '../agent/AgentService';
 import { MCP_TOOL_PREFIX } from '../agent/tools';
 import type { ToolDefinition } from '../agent/types';
-import { HttpTransport, McpClient, StdioTransport, type McpTool, type McpTransport } from './client';
+import { HttpTransport, McpClient, StdioTransport, type McpAuthRequest, type McpTool, type McpTransport } from './client';
 import type { McpServerConfig } from './config';
 
 export interface McpServerStatus {
   name: string;
   key: string;
   transport: McpServerConfig['transport'];
-  state: 'starting' | 'ready' | 'error';
+  /** `auth` = server ต้องการให้ผู้ใช้ล็อกอินก่อน ไม่ใช่ข้อผิดพลาด */
+  state: 'starting' | 'ready' | 'error' | 'auth';
   tools: string[];
   error?: string;
+  /** มีเฉพาะ server ที่ตั้ง `auth: 'oauth'` */
+  oauthUrl?: string;
+  /** server บอกว่า token สิทธิ์ไม่พอ (403) — tool อื่นยังใช้ได้ */
+  needsMoreScope?: boolean;
+  /** scope ที่ server ขอเพิ่ม ส่งให้การล็อกอินครั้งถัดไป */
+  requiredScope?: string;
 }
 
 interface Entry {
@@ -113,7 +120,14 @@ export class McpManager implements McpProvider {
       config,
       signature: signatureOf(config, this.cwd),
       tools: [],
-      status: { name: config.name, key: config.key, transport: config.transport, state: 'starting', tools: [] },
+      status: {
+        name: config.name,
+        key: config.key,
+        transport: config.transport,
+        state: 'starting',
+        tools: [],
+        ...(config.auth === 'oauth' ? { oauthUrl: config.url } : {}),
+      },
     };
     this.entries.set(config.key, entry);
     void this.connect(entry);
@@ -124,9 +138,21 @@ export class McpManager implements McpProvider {
   }
 
   private fail(entry: Entry, reason: string) {
-    if (!this.isCurrent(entry)) return;
+    // error ที่ตามมาหลัง 401 ไม่ใช่ปัญหาของ server — ยังต้องแสดงว่าให้ล็อกอิน
+    if (!this.isCurrent(entry) || entry.status.state === 'auth') return;
     entry.tools = [];
     entry.status = { ...entry.status, state: 'error', tools: [], error: reason };
+    this.emit();
+  }
+
+  private authRequired(entry: Entry, request: McpAuthRequest) {
+    if (!this.isCurrent(entry)) return;
+    if (request.kind === 'sign-in') {
+      entry.tools = [];
+      entry.status = { ...entry.status, state: 'auth', tools: [], error: undefined };
+    } else {
+      entry.status = { ...entry.status, needsMoreScope: true, requiredScope: request.scope };
+    }
     this.emit();
   }
 
@@ -135,6 +161,7 @@ export class McpManager implements McpProvider {
     const client = new McpClient(transport, entry.config.timeoutMs ?? 60_000);
     entry.client = client;
     client.onClose = (reason) => this.fail(entry, reason);
+    transport.onAuthRequired = (request) => this.authRequired(entry, request);
     try {
       if (transport instanceof StdioTransport) await transport.start();
       await client.initialize();
@@ -148,7 +175,7 @@ export class McpManager implements McpProvider {
 
   private async refreshTools(entry: Entry) {
     const tools = await entry.client!.listTools();
-    if (!this.isCurrent(entry)) return;
+    if (!this.isCurrent(entry) || entry.status.state === 'auth') return;
     entry.tools = tools;
     entry.status = { ...entry.status, state: 'ready', tools: tools.map((t) => t.name), error: undefined };
     this.emit();

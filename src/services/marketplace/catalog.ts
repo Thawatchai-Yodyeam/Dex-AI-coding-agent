@@ -14,6 +14,11 @@ import {
  *
  * เพิ่ม plugin: ตรวจว่าแพ็กเกจ/URL มีจริงและรันได้ แล้วเติมที่นี่ — marketplace.test.ts ตรวจความสอดคล้องของข้อมูลให้
  * คีย์ต้องส่งผ่าน `${NAME}` ใน env/headers เสมอ (ห้ามใส่ใน args: จะเห็นใน process list)
+ *
+ * remoteOauth ใช้ได้เฉพาะ server ที่เอกสารทางการยืนยันและ metadata จริงมี registration_endpoint กับ S256
+ * ที่ตรวจแล้วว่าใช้ไม่ได้ (2026-11-05): GitHub และ Asana ไม่มี registration_endpoint, Atlassian v1 ไม่มี protected
+ * resource metadata, Figma รับเฉพาะ client ใน catalog ของตัวเอง, Google Workspace แบบ hosted ไม่มี
+ * registration_endpoint และผู้ใช้ต้องสร้าง OAuth client เองใน Developer Preview
  */
 
 export interface Localized {
@@ -46,6 +51,7 @@ export type PluginIconName =
   | 'server'
   | 'briefcase'
   | 'notebook-pen'
+  | 'list-checks'
   | 'pen-tool'
   | 'box'
   | 'gamepad'
@@ -64,7 +70,8 @@ export interface PluginSecret {
   helpUrl: string;
 }
 
-export type McpEntry = Record<string, unknown>;
+/** `auth: 'oauth'` = ล็อกอินผ่านเบราว์เซอร์ — ไม่มีคีย์ใน config และ token อยู่ฝั่ง Rust */
+export type McpEntry = Record<string, unknown> & { auth?: 'oauth' };
 
 export type PluginInstall =
   | { kind: 'mcp'; server: McpEntry }
@@ -86,6 +93,8 @@ export interface MarketplacePlugin {
   note?: Localized;
   homepage: string;
   secrets?: PluginSecret[];
+  /** คีย์จากรุ่นก่อนที่เปลี่ยนมาใช้ OAuth — ไม่ได้ใช้แล้วแต่ยังอาจค้างใน Credential Manager จึงต้องลบตอนถอนการติดตั้ง */
+  legacySecrets?: string[];
   install: PluginInstall;
 }
 
@@ -164,6 +173,8 @@ const remote = (url: string, headers?: Record<string, string>): McpEntry => ({
   url,
   ...(headers ? { headers } : {}),
 });
+
+const remoteOauth = (url: string): McpEntry => ({ type: 'http', url, auth: 'oauth' });
 
 const MCP_REFERENCE = 'Model Context Protocol';
 const MCP_SERVERS_REPO = 'https://github.com/modelcontextprotocol/servers/tree/main/src';
@@ -392,18 +403,27 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
       th: 'อ่าน schema และ query ฐานข้อมูล Supabase แบบอ่านอย่างเดียว',
       en: 'Read schemas and query your Supabase database in read-only mode.',
     },
-    homepage: 'https://github.com/supabase/mcp',
-    secrets: [
-      {
-        name: 'SUPABASE_ACCESS_TOKEN',
-        label: 'Supabase personal access token',
-        helpUrl: 'https://supabase.com/dashboard/account/tokens',
-      },
-    ],
-    install: {
-      kind: 'mcp',
-      server: remote('https://mcp.supabase.com/mcp?read_only=true', { Authorization: 'Bearer ${SUPABASE_ACCESS_TOKEN}' }),
+    homepage: 'https://supabase.com/docs/guides/getting-started/mcp',
+    legacySecrets: ['SUPABASE_ACCESS_TOKEN'],
+    install: { kind: 'mcp', server: remoteOauth('https://mcp.supabase.com/mcp?read_only=true') },
+  },
+  {
+    id: 'neon',
+    name: 'Neon',
+    publisher: 'Neon',
+    section: 'build',
+    icon: 'database',
+    color: '#00e599',
+    description: {
+      th: 'จัดการโปรเจกต์ Neon สร้าง branch และ query ฐานข้อมูล Postgres',
+      en: 'Manage Neon projects, create branches and query Postgres databases.',
     },
+    note: {
+      th: 'Neon แนะนำให้ใช้กับงานพัฒนาและทดสอบเท่านั้น อย่าเชื่อมกับฐานข้อมูล production',
+      en: 'Neon recommends this for development and testing only. Do not connect it to production databases.',
+    },
+    homepage: 'https://neon.com/docs/ai/neon-mcp-server',
+    install: { kind: 'mcp', server: remoteOauth('https://mcp.neon.tech/mcp') },
   },
   {
     id: 'sentry',
@@ -416,15 +436,13 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
       th: 'ดู error และ issue จาก Sentry เพื่อไล่หาสาเหตุในโค้ด',
       en: 'Pull errors and issues from Sentry to trace their cause in your code.',
     },
-    homepage: 'https://github.com/getsentry/sentry-mcp',
-    secrets: [
-      {
-        name: 'SENTRY_AUTH_TOKEN',
-        label: 'Sentry auth token',
-        helpUrl: 'https://sentry.io/settings/account/api/auth-tokens/',
-      },
-    ],
-    install: { kind: 'mcp', server: npx(['@sentry/mcp-server@latest'], secretEnv('SENTRY_AUTH_TOKEN')) },
+    note: {
+      th: 'ใช้ได้กับ sentry.io ถ้าเป็น Sentry แบบ self-hosted ให้เพิ่ม @sentry/mcp-server เองในตั้งค่า',
+      en: 'Works with sentry.io. For self-hosted Sentry, add @sentry/mcp-server yourself in Settings.',
+    },
+    homepage: 'https://docs.sentry.io/product/sentry-mcp/',
+    legacySecrets: ['SENTRY_AUTH_TOKEN'],
+    install: { kind: 'mcp', server: remoteOauth('https://mcp.sentry.dev/mcp') },
   },
   {
     id: 'mongodb',
@@ -463,6 +481,20 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
     },
     homepage: 'https://github.com/MicrosoftDocs/mcp',
     install: { kind: 'mcp', server: remote('https://learn.microsoft.com/api/mcp') },
+  },
+  {
+    id: 'cloudflare',
+    name: 'Cloudflare',
+    publisher: 'Cloudflare',
+    section: 'build',
+    icon: 'cloud',
+    color: '#f38020',
+    description: {
+      th: 'จัดการบัญชี Cloudflare ผ่าน API เช่น Workers, DNS และ R2 โดยเลือกสิทธิ์ได้ตอนล็อกอิน',
+      en: 'Manage your Cloudflare account through its API, such as Workers, DNS and R2. You choose the permissions at sign-in.',
+    },
+    homepage: 'https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/',
+    install: { kind: 'mcp', server: remoteOauth('https://mcp.cloudflare.com/mcp') },
   },
   {
     id: 'cloudflare-docs',
@@ -539,13 +571,23 @@ export const MARKETPLACE_PLUGINS: MarketplacePlugin[] = [
       th: 'ค้น อ่าน และแก้หน้าและฐานข้อมูลใน workspace ของ Notion',
       en: 'Search, read and edit pages and databases in your Notion workspace.',
     },
-    note: {
-      th: 'ต้องแชร์หน้าที่ต้องการให้ integration ใน Notion ก่อน',
-      en: 'Share the pages you want with the integration in Notion first.',
+    homepage: 'https://developers.notion.com/docs/mcp',
+    legacySecrets: ['NOTION_TOKEN'],
+    install: { kind: 'mcp', server: remoteOauth('https://mcp.notion.com/mcp') },
+  },
+  {
+    id: 'linear',
+    name: 'Linear',
+    publisher: 'Linear',
+    section: 'work',
+    icon: 'list-checks',
+    color: '#5e6ad2',
+    description: {
+      th: 'ค้นหา สร้าง และอัปเดต issue และโปรเจกต์ใน Linear',
+      en: 'Find, create and update issues and projects in Linear.',
     },
-    homepage: 'https://github.com/makenotion/notion-mcp-server',
-    secrets: [{ name: 'NOTION_TOKEN', label: 'Notion integration token', helpUrl: 'https://www.notion.so/profile/integrations' }],
-    install: { kind: 'mcp', server: npx(['@notionhq/notion-mcp-server'], secretEnv('NOTION_TOKEN')) },
+    homepage: 'https://linear.app/docs/mcp',
+    install: { kind: 'mcp', server: remoteOauth('https://mcp.linear.app/mcp') },
   },
   {
     id: 'figma',

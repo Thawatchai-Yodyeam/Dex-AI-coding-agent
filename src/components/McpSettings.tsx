@@ -3,7 +3,9 @@ import { Plug, RotateCcw } from 'lucide-react';
 import { useMcpStatuses } from '../hooks/useMcpStatuses';
 import { MCP_CONFIG_EXAMPLE, parseMcpConfig } from '../services/mcp/config';
 import { mcpManager } from '../services/mcp/manager';
+import { describeOauthError, mcpStatusLabel } from '../services/mcp/oauth';
 import type { Translation } from '../utils/i18n';
+import { McpSignInButton } from './McpSignInButton';
 
 interface McpSettingsProps {
   /** JSON ในฟอร์ม (ยังไม่บันทึก) */
@@ -51,12 +53,11 @@ export const McpSettings: React.FC<McpSettingsProps> = ({ value, onChange, t }) 
                 <div className="ext-item-name">
                   <code>{s.name}</code>
                   <span className="tool-tag">{s.transport}</span>
-                  <span className={`ext-status is-${s.state}`}>
-                    {s.state === 'ready' ? t.mcpReady(s.tools.length) : s.state === 'starting' ? t.mcpStarting : t.mcpError}
-                  </span>
+                  <span className={`ext-status is-${s.state}`}>{mcpStatusLabel(s, t)}</span>
                 </div>
                 {s.state === 'ready' && s.tools.length > 0 && <p className="field-hint">{s.tools.join(', ')}</p>}
-                {s.error && <pre className="tool-error mcp-error">{s.error}</pre>}
+                {s.error && <pre className="tool-error mcp-error">{describeOauthError(s.error, t)}</pre>}
+                <McpSignInButton status={s} t={t} />
               </div>
               <button
                 type="button"

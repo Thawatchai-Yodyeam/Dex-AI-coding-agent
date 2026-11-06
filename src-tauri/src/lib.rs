@@ -1789,41 +1789,1267 @@ pub struct HttpResponse {
     /// ชื่อ header เป็นตัวพิมพ์เล็ก
     pub headers: HashMap<String, String>,
     pub body: String,
+    /// `WWW-Authenticate: Bearer ...` ของ response 401/403 ที่แยกส่วนให้แล้ว
+    pub auth_challenge: Option<AuthChallenge>,
+}
+
+/// POST หนึ่งครั้งโดยใส่ access token ถ้ามี
+/// มี `oauth_key` = server นี้ใช้ OAuth: ไม่ตาม redirect (กัน token หลุดไปปลายทางอื่น) และไม่ใช้ Authorization จาก config
+fn mcp_http_send(
+    url: &str,
+    headers: &HashMap<String, String>,
+    body: &str,
+    timeout_ms: Option<u64>,
+    uses_oauth: bool,
+    bearer: Option<&str>,
+) -> Result<HttpResponse, String> {
+    let mut builder = ureq::AgentBuilder::new().timeout(Duration::from_millis(timeout_ms.unwrap_or(120_000).clamp(1_000, 900_000)));
+    if uses_oauth {
+        builder = builder.redirects(0);
+    }
+    let agent = builder.build();
+    let mut req = agent.post(url);
+    for (k, v) in headers {
+        if uses_oauth && k.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        req = req.set(k, &expand_env(v));
+    }
+    if let Some(token) = bearer {
+        req = req.set("Authorization", &format!("Bearer {}", token));
+    }
+    let resp = match req.send_string(body) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => return Err(format!("เชื่อมต่อ MCP server ไม่สำเร็จ: {}", e)),
+    };
+    let status = resp.status();
+    let auth_challenge = if status == 401 || status == 403 { response_challenge(&resp) } else { None };
+    let mut out_headers = HashMap::new();
+    for name in resp.headers_names() {
+        if let Some(v) = resp.header(&name) {
+            out_headers.insert(name.to_lowercase(), v.to_string());
+        }
+    }
+    let body = resp.into_string().map_err(|e| format!("อ่าน response ไม่สำเร็จ: {}", e))?;
+    Ok(HttpResponse { status, headers: out_headers, body, auth_challenge })
+}
+
+/// ใส่ token ก่อนส่ง ต่ออายุถ้าหมดอายุแล้ว และลองใหม่หนึ่งครั้งถ้า server ปฏิเสธ token ที่ยังไม่หมดอายุ
+fn mcp_http_post(
+    store: &dyn OauthStore,
+    url: &str,
+    headers: &HashMap<String, String>,
+    body: &str,
+    timeout_ms: Option<u64>,
+    oauth_key: Option<&str>,
+) -> Result<HttpResponse, String> {
+    let url = expand_env(url);
+    let bearer = match oauth_key {
+        Some(key) => oauth_bearer(store, key, &url)?,
+        None => None,
+    };
+    let response = mcp_http_send(&url, headers, body, timeout_ms, oauth_key.is_some(), bearer.as_deref())?;
+    if let (401, Some(key), Some(rejected)) = (response.status, oauth_key, bearer.as_deref()) {
+        if let Some(fresh) = oauth_bearer_after_rejection(store, key, &url, rejected)? {
+            return mcp_http_send(&url, headers, body, timeout_ms, true, Some(&fresh));
+        }
+    }
+    Ok(response)
 }
 
 /// POST หนึ่งครั้งสำหรับ MCP แบบ Streamable HTTP — คืน response ทุกสถานะ (ให้ฝั่ง TS ตัดสินเอง)
+/// `oauth_key` = ชื่อ server ใน vault ของ OAuth — token ไม่เคยผ่าน webview เพราะฝั่งนี้ใส่ header เอง
 #[tauri::command]
 async fn mcp_http_request(
     url: String,
     headers: HashMap<String, String>,
     body: String,
     timeout_ms: Option<u64>,
+    oauth_key: Option<String>,
 ) -> Result<HttpResponse, String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("MCP URL ต้องขึ้นต้นด้วย http:// หรือ https://".to_string());
     }
-    tokio::task::spawn_blocking(move || {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_millis(timeout_ms.unwrap_or(120_000).clamp(1_000, 900_000)))
-            .build();
-        let mut req = agent.post(&expand_env(&url));
-        for (k, v) in &headers {
-            req = req.set(k, &expand_env(v));
+    tokio::task::spawn_blocking(move || mcp_http_post(&CredentialStore, &url, &headers, &body, timeout_ms, oauth_key.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+// 7.0.2 OAuth ของ MCP แบบ remote ตาม MCP authorization spec ฉบับ 2026-07-28
+// ทุกขั้นอยู่ฝั่งนี้ทั้งหมด (ค้น metadata, ลงทะเบียน client, แลก/ต่ออายุ token) เพื่อให้ webview ไม่เคยเห็น token
+// และกำหนดปลายทางที่จะส่ง refresh token ไม่ได้ — webview ได้แค่ OauthStatus ที่ไม่มีความลับ
+//
+// ยังไม่รองรับ Client ID Metadata Document เพราะต้องมีเอกสารของ Dex บน HTTPS จึงใช้ Dynamic Client Registration
+
+/// ชื่อใน Credential Manager มีจุดเสมอ: `mcp-oauth.<key>.<ลำดับ>` — valid_provider_id ไม่รับจุด
+/// load_api_keys/save_api_key จึงอ่านหรือเขียนทับ token ไม่ได้ และ `${NAME}` ก็ไม่ถึงเพราะมี prefix mcp-secret- นำหน้า
+const OAUTH_VAULT_PREFIX: &str = "mcp-oauth.";
+/// Credential Manager จำกัด 2,560 ไบต์ต่อรายการ แต่ access token แบบ JWT ยาวกว่านั้นได้ จึงแบ่งเก็บหลายรายการ
+const OAUTH_PART_BYTES: usize = 2048;
+const OAUTH_MAX_PARTS: usize = 32;
+/// ต่ออายุก่อนหมดจริงเล็กน้อย กัน token หมดระหว่างเดินทาง
+const OAUTH_EXPIRY_LEEWAY_SECS: u64 = 60;
+const OAUTH_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const OAUTH_CALLBACK_PATH: &str = "/callback";
+const OAUTH_INITIALIZE_PROBE: &str = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"dex-agent","version":"0.1.0"}}}"#;
+
+// รหัส error ที่ส่งให้ TS แปลเป็นข้อความสองภาษาใน i18n.ts (รูปแบบ `รหัส: รายละเอียด`)
+const OAUTH_ERR_BAD_SERVER: &str = "OAUTH_BAD_SERVER";
+const OAUTH_ERR_NETWORK: &str = "OAUTH_NETWORK";
+const OAUTH_ERR_NO_METADATA: &str = "OAUTH_NO_METADATA";
+const OAUTH_ERR_RESOURCE_MISMATCH: &str = "OAUTH_RESOURCE_MISMATCH";
+const OAUTH_ERR_NO_AS_METADATA: &str = "OAUTH_NO_AS_METADATA";
+const OAUTH_ERR_INSECURE_ENDPOINT: &str = "OAUTH_INSECURE_ENDPOINT";
+const OAUTH_ERR_NO_PKCE: &str = "OAUTH_NO_PKCE";
+const OAUTH_ERR_NO_REGISTRATION: &str = "OAUTH_NO_REGISTRATION";
+const OAUTH_ERR_REGISTRATION: &str = "OAUTH_REGISTRATION_FAILED";
+const OAUTH_ERR_BROWSER: &str = "OAUTH_BROWSER";
+const OAUTH_ERR_LISTENER: &str = "OAUTH_LISTENER";
+const OAUTH_ERR_TIMEOUT: &str = "OAUTH_TIMEOUT";
+const OAUTH_ERR_CANCELLED: &str = "OAUTH_CANCELLED";
+const OAUTH_ERR_ISSUER: &str = "OAUTH_ISSUER_MISMATCH";
+const OAUTH_ERR_DENIED: &str = "OAUTH_DENIED";
+const OAUTH_ERR_AUTHORIZATION: &str = "OAUTH_AUTHORIZATION_FAILED";
+const OAUTH_ERR_TOKEN: &str = "OAUTH_TOKEN_FAILED";
+const OAUTH_ERR_REFRESH: &str = "OAUTH_REFRESH_FAILED";
+const OAUTH_ERR_STORE: &str = "OAUTH_STORE";
+
+/// พารามิเตอร์ของ `WWW-Authenticate: Bearer ...` ที่ flow นี้ใช้
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+pub struct AuthChallenge {
+    error: Option<String>,
+    scope: Option<String>,
+    resource_metadata: Option<String>,
+}
+
+/// แยกด้วยจุลภาคที่อยู่นอกเครื่องหมายคำพูด
+fn split_header_items(header: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, c) in header.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if quoted && c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            quoted = !quoted;
+        } else if c == ',' && !quoted {
+            items.push(&header[start..i]);
+            start = i + 1;
         }
-        let resp = match req.send_string(&body) {
-            Ok(r) => r,
-            Err(ureq::Error::Status(_, r)) => r,
-            Err(e) => return Err(format!("เชื่อมต่อ MCP server ไม่สำเร็จ: {}", e)),
+    }
+    items.push(&header[start..]);
+    items
+}
+
+fn unquote_header_value(raw: &str) -> String {
+    let raw = raw.trim();
+    let Some(inner) = raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else {
+        return raw.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend(chars.next()),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// หา challenge แบบ Bearer ในค่าของ WWW-Authenticate (มี scheme อื่นปนได้ เช่น `Basic realm="x", Bearer ...`)
+fn parse_bearer_challenge(header: &str) -> Option<AuthChallenge> {
+    let mut challenge = None;
+    let mut in_bearer = false;
+    for item in split_header_items(header) {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        // `Scheme` หรือ `Scheme ...` เริ่ม challenge ใหม่ ส่วน `name=value` เป็นพารามิเตอร์ของตัวเดิม
+        let (first, rest) = item.split_once(char::is_whitespace).unwrap_or((item, ""));
+        let rest = rest.trim_start();
+        let param = if first.contains('=') || rest.starts_with('=') {
+            Some(item)
+        } else {
+            in_bearer = first.eq_ignore_ascii_case("bearer");
+            if in_bearer {
+                challenge.get_or_insert_with(AuthChallenge::default);
+            }
+            (!rest.is_empty()).then_some(rest)
         };
-        let status = resp.status();
-        let mut out_headers = HashMap::new();
-        for name in resp.headers_names() {
-            if let Some(v) = resp.header(&name) {
-                out_headers.insert(name.to_lowercase(), v.to_string());
+        if !in_bearer {
+            continue;
+        }
+        let Some((name, value)) = param.and_then(|p| p.split_once('=')) else {
+            continue;
+        };
+        let value = Some(unquote_header_value(value)).filter(|v| !v.is_empty());
+        let current = challenge.get_or_insert_with(AuthChallenge::default);
+        match name.trim().to_ascii_lowercase().as_str() {
+            "error" => current.error = value,
+            "scope" => current.scope = value,
+            "resource_metadata" => current.resource_metadata = value,
+            _ => {}
+        }
+    }
+    challenge
+}
+
+/// server ส่ง WWW-Authenticate มาหลายบรรทัดได้ จึงต้องอ่านทุกบรรทัด
+fn response_challenge(resp: &ureq::Response) -> Option<AuthChallenge> {
+    parse_bearer_challenge(&resp.all("www-authenticate").join(", "))
+}
+
+fn internal_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+}
+
+fn is_internal_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => internal_ipv4(ip),
+        Some(url::Host::Ipv6(ip)) => match ip.to_ipv4_mapped() {
+            Some(mapped) => internal_ipv4(mapped),
+            None => ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80,
+        },
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost"),
+        None => true,
+    }
+}
+
+fn is_loopback_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+/// URL ของ MCP server ที่จะรับ token ได้: https หรือ http ที่อยู่ในเครื่องเท่านั้น
+fn oauth_server_url(raw: &str) -> Result<url::Url, String> {
+    let url = url::Url::parse(raw.trim()).map_err(|_| OAUTH_ERR_BAD_SERVER.to_string())?;
+    let secure = url.scheme() == "https" || (url.scheme() == "http" && is_loopback_host(&url));
+    if !secure || !url.username().is_empty() || url.password().is_some() {
+        return Err(OAUTH_ERR_BAD_SERVER.to_string());
+    }
+    Ok(url)
+}
+
+/// URL ที่ server ส่งมาให้เราเรียกหรือเปิดในเบราว์เซอร์ — ของ server ที่อาจไม่น่าเชื่อถือ จึงตรวจเข้มทุกตัว:
+/// scheme อื่นอย่าง `file:` ห้ามเด็ดขาดเพราะจะถูกส่งให้ระบบปฏิบัติการเปิด
+/// server ภายนอกชี้กลับเข้าเครือข่ายภายในไม่ได้ (SSRF) และ http ใช้ได้เฉพาะตอนทดสอบกับ server ในเครื่อง
+fn oauth_url_allowed(server: &url::Url, raw: &str) -> Result<url::Url, String> {
+    let insecure = || format!("{}: {}", OAUTH_ERR_INSECURE_ENDPOINT, raw.chars().take(200).collect::<String>());
+    let url = url::Url::parse(raw).map_err(|_| insecure())?;
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return Err(insecure());
+    }
+    match url.scheme() {
+        "https" => {
+            if is_internal_host(&url) && !is_internal_host(server) {
+                return Err(insecure());
             }
         }
-        let body = resp.into_string().map_err(|e| format!("อ่าน response ไม่สำเร็จ: {}", e))?;
-        Ok(HttpResponse { status, headers: out_headers, body })
+        "http" => {
+            if !is_loopback_host(&url) || !is_loopback_host(server) {
+                return Err(insecure());
+            }
+        }
+        _ => return Err(insecure()),
+    }
+    Ok(url)
+}
+
+/// token ของ `resource` ใช้กับ URL นี้ได้ไหม: origin เดียวกันและ path อยู่ใต้ resource (query ไม่นับ)
+fn resource_covers(resource: &url::Url, request: &url::Url) -> bool {
+    if resource.origin() != request.origin() {
+        return false;
+    }
+    let with_slash = |path: &str| if path.ends_with('/') { path.to_string() } else { format!("{}/", path) };
+    with_slash(request.path()).starts_with(&with_slash(resource.path()))
+}
+
+fn protected_resource_candidates(server: &url::Url) -> Vec<String> {
+    let origin = server.origin().ascii_serialization();
+    let root = format!("{}/.well-known/oauth-protected-resource", origin);
+    if server.path() == "/" || server.path().is_empty() {
+        return vec![root];
+    }
+    let query = server.query().map(|q| format!("?{}", q)).unwrap_or_default();
+    vec![format!("{}{}{}", root, server.path(), query), root]
+}
+
+fn authorization_server_candidates(issuer: &url::Url) -> Vec<String> {
+    let origin = issuer.origin().ascii_serialization();
+    let path = issuer.path().trim_end_matches('/');
+    if path.is_empty() {
+        return vec![
+            format!("{}/.well-known/oauth-authorization-server", origin),
+            format!("{}/.well-known/openid-configuration", origin),
+        ];
+    }
+    vec![
+        format!("{}/.well-known/oauth-authorization-server{}", origin, path),
+        format!("{}/.well-known/openid-configuration{}", origin, path),
+        format!("{}{}/.well-known/openid-configuration", origin, path),
+    ]
+}
+
+fn oauth_agent() -> ureq::Agent {
+    // ไม่ตาม redirect: ปลายทางใหม่จะข้ามการตรวจ oauth_url_allowed ไปได้
+    ureq::AgentBuilder::new().timeout(OAUTH_HTTP_TIMEOUT).redirects(0).user_agent("dex-agent").build()
+}
+
+fn read_json_body<T: for<'de> Deserialize<'de>>(response: ureq::Response) -> Option<T> {
+    response.into_string().ok().and_then(|text| serde_json::from_str(&text).ok())
+}
+
+/// 200 + JSON เท่านั้นที่นับว่าเจอเอกสาร
+fn fetch_oauth_json<T: for<'de> Deserialize<'de>>(agent: &ureq::Agent, url: &url::Url) -> Option<T> {
+    match agent.get(url.as_str()).set("Accept", "application/json").call() {
+        Ok(resp) if resp.status() == 200 => read_json_body(resp),
+        _ => None,
+    }
+}
+
+#[derive(Deserialize)]
+struct ProtectedResourceMetadata {
+    resource: String,
+    authorization_servers: Vec<String>,
+    #[serde(default)]
+    scopes_supported: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Clone)]
+struct AuthorizationServerMetadata {
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    #[serde(default)]
+    registration_endpoint: Option<String>,
+    #[serde(default)]
+    code_challenge_methods_supported: Option<Vec<String>>,
+    #[serde(default)]
+    token_endpoint_auth_methods_supported: Option<Vec<String>>,
+    #[serde(default)]
+    scopes_supported: Option<Vec<String>>,
+    #[serde(default)]
+    authorization_response_iss_parameter_supported: Option<bool>,
+}
+
+/// URL จาก WWW-Authenticate ก่อน แล้วค่อย well-known ตามสเปก — `resource` ต้องครอบ URL ที่เราจะเรียกจริง
+fn discover_protected_resource(
+    agent: &ureq::Agent,
+    server: &url::Url,
+    from_challenge: Option<&str>,
+) -> Result<ProtectedResourceMetadata, String> {
+    let mut last_error = OAUTH_ERR_NO_METADATA.to_string();
+    let mut candidates = Vec::new();
+    if let Some(raw) = from_challenge {
+        candidates.push(oauth_url_allowed(server, raw)?);
+    }
+    for raw in protected_resource_candidates(server) {
+        candidates.push(oauth_url_allowed(server, &raw)?);
+    }
+    for candidate in candidates {
+        let Some(doc) = fetch_oauth_json::<ProtectedResourceMetadata>(agent, &candidate) else {
+            continue;
+        };
+        let covered = url::Url::parse(&doc.resource).map(|r| resource_covers(&r, server)).unwrap_or(false);
+        if !covered {
+            last_error = format!("{}: {}", OAUTH_ERR_RESOURCE_MISMATCH, doc.resource.chars().take(200).collect::<String>());
+            continue;
+        }
+        if !doc.authorization_servers.is_empty() {
+            return Ok(doc);
+        }
+    }
+    Err(last_error)
+}
+
+/// เอกสารที่ `issuer` ไม่ตรงกับ URL ที่ใช้สร้าง well-known ต้องทิ้งตามสเปก และต้องยืนยันได้ว่ารองรับ PKCE แบบ S256
+fn discover_authorization_server(
+    agent: &ureq::Agent,
+    server: &url::Url,
+    issuers: &[String],
+) -> Result<AuthorizationServerMetadata, String> {
+    let mut last_error = OAUTH_ERR_NO_AS_METADATA.to_string();
+    for issuer in issuers {
+        let issuer_url = match oauth_url_allowed(server, issuer) {
+            Ok(url) => url,
+            Err(e) => {
+                last_error = e;
+                continue;
+            }
+        };
+        for raw in authorization_server_candidates(&issuer_url) {
+            let Ok(candidate) = oauth_url_allowed(server, &raw) else {
+                continue;
+            };
+            let Some(doc) = fetch_oauth_json::<AuthorizationServerMetadata>(agent, &candidate) else {
+                continue;
+            };
+            if &doc.issuer != issuer {
+                continue;
+            }
+            let supports_s256 = doc.code_challenge_methods_supported.as_deref().unwrap_or_default().iter().any(|m| m == "S256");
+            if !supports_s256 {
+                last_error = OAUTH_ERR_NO_PKCE.to_string();
+                continue;
+            }
+            let endpoints = [Some(&doc.authorization_endpoint), Some(&doc.token_endpoint), doc.registration_endpoint.as_ref()];
+            let checked = endpoints.into_iter().flatten().try_for_each(|e| oauth_url_allowed(server, e).map(|_| ()));
+            match checked {
+                Ok(()) => return Ok(doc),
+                Err(e) => last_error = e,
+            }
+        }
+    }
+    Err(last_error)
+}
+
+fn merge_scopes<'a>(groups: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut merged: Vec<&str> = Vec::new();
+    for scope in groups.into_iter().flat_map(str::split_whitespace) {
+        if !merged.contains(&scope) {
+            merged.push(scope);
+        }
+    }
+    (!merged.is_empty()).then(|| merged.join(" "))
+}
+
+/// scope จาก 401 มาก่อน ไม่มีค่อยใช้ scopes_supported ของ resource (ไม่มีทั้งคู่ = ไม่ส่ง scope)
+/// รวม scope เดิมและที่ server เพิ่งขอ (403) ไว้ด้วยเพื่อไม่ให้สิทธิ์เดิมหายตอนขอเพิ่ม
+/// `offline_access` เติมเมื่อมี scope อื่นอยู่แล้วเท่านั้น: ถ้าขอตัวเดียว บาง server จะออก token ที่ไม่มีสิทธิ์ใช้งานจริง
+fn select_oauth_scope(
+    challenge: Option<&str>,
+    resource_supported: Option<&[String]>,
+    server_supported: Option<&[String]>,
+    previous: Option<&str>,
+    extra: Option<&str>,
+) -> Option<String> {
+    let fallback = resource_supported.map(|list| list.join(" "));
+    let base = challenge.filter(|s| !s.trim().is_empty()).or(fallback.as_deref());
+    let scope = merge_scopes([previous, base, extra].into_iter().flatten())?;
+    let offers_offline = server_supported.unwrap_or_default().iter().any(|s| s == "offline_access");
+    if offers_offline {
+        return merge_scopes([scope.as_str(), "offline_access"]);
+    }
+    Some(scope)
+}
+
+/// client ของ Dex เป็น public client ถ้า server รับ ไม่งั้นใช้ secret ที่ได้ตอนลงทะเบียน (Supabase ไม่รับ `none`)
+fn choose_client_auth_method(supported: Option<&[String]>) -> &'static str {
+    let Some(list) = supported else {
+        return "none";
+    };
+    let has = |method: &str| list.iter().any(|m| m == method);
+    if has("none") {
+        "none"
+    } else if has("client_secret_post") {
+        "client_secret_post"
+    } else if has("client_secret_basic") {
+        "client_secret_basic"
+    } else {
+        "none"
+    }
+}
+
+/// ข้อมูลการล็อกอินของ server หนึ่งตัว — ไม่ derive Debug เพื่อไม่ให้ token โผล่ใน log โดยบังเอิญ
+#[derive(Serialize, Deserialize, Clone)]
+struct OauthClient {
+    client_id: String,
+    #[serde(default)]
+    client_secret: Option<String>,
+    auth_method: String,
+    redirect_uri: String,
+    #[serde(default)]
+    registered_scope: Option<String>,
+    #[serde(default)]
+    secret_expires_at: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct OauthRecord {
+    /// token ใช้ได้กับ resource นี้เท่านั้น — config เปลี่ยน URL ไปที่อื่น token ก็ไม่ถูกส่งตาม
+    resource: String,
+    /// client ผูกกับ issuer ที่ออกให้ เปลี่ยน authorization server แล้วต้องลงทะเบียนใหม่
+    issuer: String,
+    token_endpoint: String,
+    client: OauthClient,
+    /// server อาจไม่รู้จัก client นี้แล้ว: login ครั้งหน้าต้องลงทะเบียนใหม่ (refresh ยังใช้ตัวเดิมที่ออก token นี้)
+    #[serde(default)]
+    client_stale: bool,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    /// unix seconds (ไม่มี = server ไม่ได้บอกอายุ ใช้จนกว่าจะโดน 401)
+    #[serde(default)]
+    expires_at: Option<u64>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// สิ่งเดียวที่ webview เห็นเกี่ยวกับการล็อกอิน — ห้ามเพิ่ม field ที่เป็นความลับ
+#[derive(Serialize, Debug, PartialEq)]
+pub struct OauthStatus {
+    signed_in: bool,
+    expires_at: Option<u64>,
+    can_refresh: bool,
+    issuer: Option<String>,
+    scope: Option<String>,
+}
+
+/// ข้อความหน้าเว็บหลังล็อกอิน มาจาก i18n.ts เพื่อให้ตรงภาษาที่ผู้ใช้เลือก
+#[derive(Deserialize)]
+pub struct OauthPages {
+    success: String,
+    failure: String,
+}
+
+trait OauthStore: Send + Sync {
+    fn get(&self, name: &str) -> Result<Option<Vec<u8>>, String>;
+    fn set(&self, name: &str, value: &[u8]) -> Result<(), String>;
+    /// ไม่มีอยู่แล้วก็ถือว่าสำเร็จ
+    fn delete(&self, name: &str) -> Result<(), String>;
+}
+
+/// Windows Credential Manager — ใช้ secret แบบไบต์ เพราะ set_password แปลงเป็น UTF-16 ซึ่งกินที่สองเท่า
+struct CredentialStore;
+
+impl OauthStore for CredentialStore {
+    fn get(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, name).map_err(|e| format!("{}: {}", OAUTH_ERR_STORE, e))?;
+        match entry.get_secret() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(format!("{}: {}", OAUTH_ERR_STORE, e)),
+        }
+    }
+
+    fn set(&self, name: &str, value: &[u8]) -> Result<(), String> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, name).map_err(|e| format!("{}: {}", OAUTH_ERR_STORE, e))?;
+        entry.set_secret(value).map_err(|e| format!("{}: {}", OAUTH_ERR_STORE, e))
+    }
+
+    fn delete(&self, name: &str) -> Result<(), String> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, name).map_err(|e| format!("{}: {}", OAUTH_ERR_STORE, e))?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(format!("{}: {}", OAUTH_ERR_STORE, e)),
+        }
+    }
+}
+
+fn oauth_part_name(key: &str, part: usize) -> String {
+    format!("{}{}.{}", OAUTH_VAULT_PREFIX, key, part)
+}
+
+fn validate_oauth_key(key: &str) -> Result<(), String> {
+    if valid_provider_id(key) {
+        Ok(())
+    } else {
+        Err(format!("{}: invalid server name", OAUTH_ERR_STORE))
+    }
+}
+
+/// ไบต์แรกของส่วนที่ 0 บอกจำนวนส่วนทั้งหมด — เขียนส่วนนี้ท้ายสุด เขียนค้างกลางทางจึงอ่านไม่ผ่านแทนที่จะได้ของเพี้ยน
+fn oauth_save(store: &dyn OauthStore, key: &str, record: &OauthRecord) -> Result<(), String> {
+    validate_oauth_key(key)?;
+    let json = serde_json::to_vec(record).map_err(|e| format!("{}: {}", OAUTH_ERR_STORE, e))?;
+    let parts: Vec<&[u8]> = json.chunks(OAUTH_PART_BYTES).collect();
+    if parts.len() > OAUTH_MAX_PARTS {
+        return Err(format!("{}: token too large", OAUTH_ERR_STORE));
+    }
+    for (i, part) in parts.iter().enumerate().skip(1) {
+        store.set(&oauth_part_name(key, i), part)?;
+    }
+    let mut first = vec![parts.len() as u8];
+    first.extend_from_slice(parts.first().copied().unwrap_or_default());
+    store.set(&oauth_part_name(key, 0), &first)?;
+    for i in parts.len()..OAUTH_MAX_PARTS {
+        store.delete(&oauth_part_name(key, i))?;
+    }
+    Ok(())
+}
+
+/// ข้อมูลเสีย = เหมือนยังไม่ได้ล็อกอิน ผู้ใช้ล็อกอินใหม่แล้วเขียนทับได้
+fn oauth_load(store: &dyn OauthStore, key: &str) -> Result<Option<OauthRecord>, String> {
+    validate_oauth_key(key)?;
+    let Some(first) = store.get(&oauth_part_name(key, 0))? else {
+        return Ok(None);
+    };
+    let Some((&count, head)) = first.split_first() else {
+        return Ok(None);
+    };
+    let mut json = head.to_vec();
+    for i in 1..count as usize {
+        match store.get(&oauth_part_name(key, i))? {
+            Some(part) => json.extend_from_slice(&part),
+            None => return Ok(None),
+        }
+    }
+    Ok(serde_json::from_slice(&json).ok())
+}
+
+/// ลบทุกส่วนโดยไม่อิงจำนวนที่บันทึกไว้ ข้อมูลที่เขียนค้างไว้จึงไม่ตกค้าง
+fn oauth_delete(store: &dyn OauthStore, key: &str) -> Result<(), String> {
+    validate_oauth_key(key)?;
+    // ส่วนที่ 0 ไปก่อน: ถ้าลบไม่ครบ ส่วนที่เหลือก็อ่านเป็น token ไม่ได้แล้ว
+    (0..OAUTH_MAX_PARTS).try_for_each(|i| store.delete(&oauth_part_name(key, i)))
+}
+
+/// อ่าน ต่ออายุ และบันทึกของ server เดียวกันทีละงาน — refresh token ใช้ได้ครั้งเดียว
+/// ถ้าสอง request ต่ออายุพร้อมกัน ตัวที่ช้ากว่าจะส่งของเก่าและบาง server จะยกเลิกการล็อกอินทั้งหมด
+fn oauth_lock(key: &str) -> Arc<Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key.to_string())
+        .or_default()
+        .clone()
+}
+
+fn with_oauth_lock<T>(key: &str, work: impl FnOnce() -> T) -> T {
+    let lock = oauth_lock(key);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    work()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// ไม่มี refresh token ก็ไม่ต้องกันเวลา เพราะเผื่อไว้แล้วทำอะไรต่อไม่ได้
+fn access_token_expired(record: &OauthRecord, now: u64) -> bool {
+    let leeway = if record.refresh_token.is_some() { OAUTH_EXPIRY_LEEWAY_SECS } else { 0 };
+    record.expires_at.map(|at| now + leeway >= at).unwrap_or(false)
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    token_type: Option<String>,
+    #[serde(default)]
+    expires_in: Option<serde_json::Value>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+struct OauthTokenFailure {
+    /// server ตอบชัดเจนว่าไม่รับ (400/401 พร้อม `error`) ต่างจากเน็ตหลุดหรือ server ล่ม
+    rejected: bool,
+    client_rejected: bool,
+    detail: String,
+}
+
+/// POST ไปที่ token endpoint พร้อมการยืนยันตัวตนของ client และ `resource`
+fn post_token_request<'a>(
+    token_endpoint: &str,
+    client: &'a OauthClient,
+    resource: &'a str,
+    mut form: Vec<(&'a str, &'a str)>,
+) -> Result<TokenResponse, OauthTokenFailure> {
+    use base64::Engine;
+    form.push(("resource", resource));
+    let mut request = oauth_agent().post(token_endpoint).set("Accept", "application/json");
+    match (client.auth_method.as_str(), client.client_secret.as_deref()) {
+        ("client_secret_basic", Some(secret)) => {
+            let encode = |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
+            let credentials = format!("{}:{}", encode(&client.client_id), encode(secret));
+            let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
+            request = request.set("Authorization", &format!("Basic {}", encoded));
+        }
+        ("client_secret_post", Some(secret)) => {
+            form.push(("client_id", client.client_id.as_str()));
+            form.push(("client_secret", secret));
+        }
+        _ => form.push(("client_id", client.client_id.as_str())),
+    }
+    let response = match request.send_form(&form) {
+        Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => return Err(OauthTokenFailure { rejected: false, client_rejected: false, detail: e.to_string() }),
+    };
+    let status = response.status();
+    match read_json_body::<TokenResponse>(response) {
+        Some(token) if status == 200 && token.error.is_none() => Ok(token),
+        Some(token) if (status == 400 || status == 401) && token.error.is_some() => {
+            let error = token.error.unwrap_or_default();
+            Err(OauthTokenFailure {
+                rejected: true,
+                client_rejected: error == "invalid_client" || error == "unauthorized_client",
+                detail: limited_detail(&error, token.error_description.as_deref()),
+            })
+        }
+        _ => Err(OauthTokenFailure { rejected: false, client_rejected: false, detail: format!("HTTP {}", status) }),
+    }
+}
+
+/// ข้อความจาก server ไม่น่าเชื่อถือและอาจยาวมาก — ตัดสั้นก่อนแสดง
+fn limited_detail(error: &str, description: Option<&str>) -> String {
+    let text = match description {
+        Some(d) => format!("{} ({})", error, d),
+        None => error.to_string(),
+    };
+    text.chars().filter(|c| !c.is_control()).take(300).collect()
+}
+
+/// ค่าที่จะเข้า header ต้องไม่มีอักขระควบคุม (server ที่ไม่น่าเชื่อถืออาจแทรก CRLF มา)
+fn usable_token(token: Option<String>) -> Option<String> {
+    token.filter(|t| !t.is_empty() && !t.chars().any(char::is_control))
+}
+
+/// ใช้คำตอบของ token endpoint กับ record — refresh token ใหม่ไม่มีมาก็เก็บตัวเดิมไว้ตามสเปก
+fn apply_token_response(record: &mut OauthRecord, token: TokenResponse, now: u64) -> Result<(), String> {
+    let bearer = token.token_type.as_deref().map(|t| t.eq_ignore_ascii_case("bearer")).unwrap_or(true);
+    let access_token = usable_token(token.access_token).filter(|_| bearer).ok_or_else(|| format!("{}: no bearer token", OAUTH_ERR_TOKEN))?;
+    let lifetime = token.expires_in.and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+    record.access_token = Some(access_token);
+    record.expires_at = lifetime.map(|seconds| now + seconds);
+    if let Some(refresh) = usable_token(token.refresh_token) {
+        record.refresh_token = Some(refresh);
+    }
+    if token.scope.is_some() {
+        record.scope = token.scope;
+    }
+    Ok(())
+}
+
+/// ต่ออายุแล้วบันทึก: server ปฏิเสธ = ล้าง token ให้ผู้ใช้ล็อกอินใหม่ (Ok(None))
+/// เน็ตหลุดหรือ server ล่ม = เก็บ token ไว้ลองใหม่ภายหลัง (Err) ไม่ไล่ผู้ใช้ออกจากระบบเพราะปัญหาชั่วคราว
+fn refresh_oauth_record(store: &dyn OauthStore, key: &str, record: &mut OauthRecord) -> Result<Option<String>, String> {
+    let Some(refresh_token) = record.refresh_token.clone() else {
+        record.access_token = None;
+        record.expires_at = None;
+        oauth_save(store, key, record)?;
+        return Ok(None);
+    };
+    let form = vec![("grant_type", "refresh_token"), ("refresh_token", refresh_token.as_str())];
+    match post_token_request(&record.token_endpoint, &record.client, &record.resource, form) {
+        Ok(token) => {
+            apply_token_response(record, token, now_secs())?;
+            oauth_save(store, key, record)?;
+            Ok(record.access_token.clone())
+        }
+        Err(failure) if failure.rejected => {
+            record.access_token = None;
+            record.refresh_token = None;
+            record.expires_at = None;
+            record.client_stale |= failure.client_rejected;
+            oauth_save(store, key, record)?;
+            Ok(None)
+        }
+        Err(failure) => Err(format!("{}: {}", OAUTH_ERR_REFRESH, failure.detail)),
+    }
+}
+
+/// token ใช้กับ URL นี้ได้ไหม — ไม่ผ่านก็ส่ง request แบบไม่มี token แล้ว server จะตอบ 401 ให้ผู้ใช้ล็อกอินเอง
+fn oauth_record_matches(record: &OauthRecord, request: &url::Url) -> bool {
+    let secure = request.scheme() == "https" || (request.scheme() == "http" && is_loopback_host(request));
+    secure && url::Url::parse(&record.resource).map(|r| resource_covers(&r, request)).unwrap_or(false)
+}
+
+/// access token ที่จะใส่ใน request นี้ (ต่ออายุให้ถ้าจำเป็น) — None = ยังไม่ได้ล็อกอิน
+fn oauth_bearer(store: &dyn OauthStore, key: &str, url: &str) -> Result<Option<String>, String> {
+    validate_oauth_key(key)?;
+    let Ok(request) = url::Url::parse(url) else {
+        return Ok(None);
+    };
+    with_oauth_lock(key, || {
+        let Some(mut record) = oauth_load(store, key)? else {
+            return Ok(None);
+        };
+        if !oauth_record_matches(&record, &request) {
+            return Ok(None);
+        }
+        match &record.access_token {
+            Some(token) if !access_token_expired(&record, now_secs()) => Ok(Some(token.clone())),
+            None if record.refresh_token.is_none() => Ok(None),
+            _ => refresh_oauth_record(store, key, &mut record),
+        }
+    })
+}
+
+/// server ตอบ 401 ทั้งที่ token ยังไม่หมดอายุ (ถูกเพิกถอน ฯลฯ) — None = ต้องล็อกอินใหม่
+fn oauth_bearer_after_rejection(store: &dyn OauthStore, key: &str, url: &str, rejected: &str) -> Result<Option<String>, String> {
+    let Ok(request) = url::Url::parse(url) else {
+        return Ok(None);
+    };
+    with_oauth_lock(key, || {
+        let Some(mut record) = oauth_load(store, key)? else {
+            return Ok(None);
+        };
+        if !oauth_record_matches(&record, &request) {
+            return Ok(None);
+        }
+        // request อื่นเพิ่งต่ออายุให้แล้ว
+        if record.access_token.as_deref().is_some_and(|current| current != rejected) {
+            return Ok(record.access_token.clone());
+        }
+        refresh_oauth_record(store, key, &mut record)
+    })
+}
+
+fn oauth_status_of(store: &dyn OauthStore, key: &str, url: &str) -> Result<OauthStatus, String> {
+    let record = with_oauth_lock(key, || oauth_load(store, key))?;
+    let request = url::Url::parse(url).ok();
+    let current = record.filter(|r| request.as_ref().is_some_and(|req| oauth_record_matches(r, req)));
+    Ok(match current {
+        Some(record) => {
+            let usable = record.access_token.is_some() && !access_token_expired(&record, now_secs());
+            OauthStatus {
+                signed_in: usable || record.refresh_token.is_some(),
+                expires_at: record.expires_at,
+                can_refresh: record.refresh_token.is_some(),
+                issuer: Some(record.issuer),
+                scope: record.scope,
+            }
+        }
+        None => OauthStatus { signed_in: false, expires_at: None, can_refresh: false, issuer: None, scope: None },
+    })
+}
+
+fn random_url_token() -> Result<String, String> {
+    use base64::Engine;
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| format!("{}: {}", OAUTH_ERR_LISTENER, e))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()))
+}
+
+fn register_oauth_client(
+    agent: &ureq::Agent,
+    metadata: &AuthorizationServerMetadata,
+    redirect_uri: &str,
+    scope: Option<&str>,
+) -> Result<OauthClient, String> {
+    let endpoint = metadata.registration_endpoint.as_deref().ok_or_else(|| OAUTH_ERR_NO_REGISTRATION.to_string())?;
+    let requested_method = choose_client_auth_method(metadata.token_endpoint_auth_methods_supported.as_deref());
+    let mut body = serde_json::json!({
+        "client_name": "Dex",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": requested_method,
+        // ไม่ระบุจะเป็น "web" ตาม OIDC ซึ่งไม่รับ redirect แบบ loopback
+        "application_type": "native",
+    });
+    if let Some(scope) = scope {
+        body["scope"] = scope.into();
+    }
+
+    #[derive(Deserialize)]
+    struct Registration {
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_secret: Option<String>,
+        #[serde(default)]
+        token_endpoint_auth_method: Option<String>,
+        #[serde(default)]
+        client_secret_expires_at: Option<u64>,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        error_description: Option<String>,
+    }
+
+    let request = agent.post(endpoint).set("Accept", "application/json").set("Content-Type", "application/json");
+    let response = match request.send_string(&body.to_string()) {
+        Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => return Err(format!("{}: {}", OAUTH_ERR_NETWORK, e)),
+    };
+    let status = response.status();
+    let fail = |detail: String| format!("{}: {}", OAUTH_ERR_REGISTRATION, detail);
+    let registration = read_json_body::<Registration>(response).ok_or_else(|| fail(format!("HTTP {}", status)))?;
+    if status != 200 && status != 201 {
+        let error = registration.error.as_deref().unwrap_or("error");
+        return Err(fail(format!("HTTP {}: {}", status, limited_detail(error, registration.error_description.as_deref()))));
+    }
+    let client_id = registration.client_id.filter(|id| !id.is_empty()).ok_or_else(|| fail("no client_id".to_string()))?;
+    let client_secret = registration.client_secret.filter(|s| !s.is_empty());
+    let auth_method = match (registration.token_endpoint_auth_method, &client_secret) {
+        (Some(method), Some(_)) => method,
+        (None, Some(_)) => requested_method.to_string(),
+        (_, None) => "none".to_string(),
+    };
+    Ok(OauthClient {
+        client_id,
+        client_secret,
+        auth_method,
+        redirect_uri: redirect_uri.to_string(),
+        registered_scope: scope.map(str::to_string),
+        // 0 ตาม RFC 7591 แปลว่าไม่หมดอายุ
+        secret_expires_at: registration.client_secret_expires_at.filter(|at| *at != 0),
+    })
+}
+
+/// client เดิมใช้ต่อได้เมื่อมาจาก issuer เดียวกัน และลงทะเบียนครอบ scope ที่จะขอ
+fn reusable_oauth_client(previous: Option<&OauthRecord>, issuer: &str, scope: Option<&str>, now: u64) -> Option<OauthClient> {
+    let record = previous.filter(|r| r.issuer == issuer && !r.client_stale)?;
+    let client = &record.client;
+    if client.secret_expires_at.is_some_and(|at| at <= now) {
+        return None;
+    }
+    let registered = client.registered_scope.as_deref().unwrap_or("");
+    let covered = scope.unwrap_or("").split_whitespace().all(|s| registered.split_whitespace().any(|r| r == s));
+    covered.then(|| client.clone())
+}
+
+/// ผูกกับ 127.0.0.1 เท่านั้น ไม่ใช่ 0.0.0.0 — เครื่องอื่นในเครือข่ายยิงเข้ามาไม่ได้
+/// ลองพอร์ตเดิมก่อน เพราะ server หลายตัวเทียบ redirect_uri ตรงตัวทั้งพอร์ต
+fn bind_oauth_listener(preferred_port: Option<u16>) -> Result<std::net::TcpListener, String> {
+    let bind = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port));
+    let listener = preferred_port
+        .and_then(|port| bind(port).ok())
+        .map(Ok)
+        .unwrap_or_else(|| bind(0))
+        .map_err(|e| format!("{}: {}", OAUTH_ERR_LISTENER, e))?;
+    listener.set_nonblocking(true).map_err(|e| format!("{}: {}", OAUTH_ERR_LISTENER, e))?;
+    Ok(listener)
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// หน้าเว็บตายตัวบน origin ของ loopback: ไม่สะท้อนค่าจาก query และไม่มีสคริปต์
+fn write_oauth_page(stream: &mut std::net::TcpStream, status: &str, message: &str) {
+    use std::io::Write;
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Dex</title><style>body{{font:16px/1.6 system-ui,sans-serif;display:grid;place-items:center;min-height:90vh;margin:0;padding:0 16px;text-align:center}}</style></head><body><p>{}</p></body></html>",
+        escape_html(message)
+    );
+    let head = format!(
+        "HTTP/1.1 {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        status,
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(body.as_bytes()));
+}
+
+struct OauthCallback {
+    stream: std::net::TcpStream,
+    code: Option<String>,
+    iss: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+/// อ่าน request หนึ่งตัวจาก socket ที่เพิ่ง accept (เวลาจำกัด โปรแกรมอื่นถือ socket ค้างเพื่อกันการล็อกอินไม่ได้)
+fn read_callback_request(stream: &mut std::net::TcpStream) -> Option<String> {
+    use std::io::Read;
+    stream.set_nonblocking(false).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    let mut buf = [0u8; 8192];
+    let mut len = 0;
+    while len < buf.len() && !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut buf[len..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => len += n,
+        }
+    }
+    Some(String::from_utf8_lossy(&buf[..len]).into_owned())
+}
+
+/// รอ redirect ของเบราว์เซอร์ที่ loopback — request ที่ `state` ไม่ตรงถูกทิ้งเสมอและไม่ทำให้การล็อกอินล้ม
+/// มิฉะนั้นเว็บหรือโปรแกรมใดก็ตามที่ยิงมาที่พอร์ตนี้จะล้มการล็อกอินของผู้ใช้ได้
+fn wait_for_oauth_callback(
+    listener: &std::net::TcpListener,
+    state: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    timeout: Duration,
+    failure_page: &str,
+) -> Result<OauthCallback, String> {
+    let port = listener.local_addr().map_err(|e| format!("{}: {}", OAUTH_ERR_LISTENER, e))?.port();
+    let expected_host = format!("127.0.0.1:{}", port);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(OAUTH_ERR_CANCELLED.to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(OAUTH_ERR_TIMEOUT.to_string());
+        }
+        let mut stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(e) => return Err(format!("{}: {}", OAUTH_ERR_LISTENER, e)),
+        };
+        let Some(request) = read_callback_request(&mut stream) else {
+            continue;
+        };
+        let mut lines = request.lines();
+        let request_line = lines.next().unwrap_or_default();
+        let mut words = request_line.split_whitespace();
+        let (method, target) = (words.next().unwrap_or_default(), words.next().unwrap_or_default());
+        let host_ok = lines.any(|line| {
+            line.split_once(':')
+                .is_some_and(|(name, value)| name.eq_ignore_ascii_case("host") && value.trim() == expected_host)
+        });
+        if !host_ok {
+            write_oauth_page(&mut stream, "403 Forbidden", failure_page);
+            continue;
+        }
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        if method != "GET" || path != OAUTH_CALLBACK_PATH {
+            write_oauth_page(&mut stream, "404 Not Found", failure_page);
+            continue;
+        }
+        let params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+        if params.get("state").map(String::as_str) != Some(state) {
+            write_oauth_page(&mut stream, "400 Bad Request", failure_page);
+            continue;
+        }
+        let param = |name: &str| params.get(name).cloned();
+        return Ok(OauthCallback {
+            code: param("code"),
+            iss: param("iss"),
+            error: param("error"),
+            error_description: param("error_description"),
+            stream,
+        });
+    }
+}
+
+/// RFC 9207 ตามตารางในสเปก ทำก่อนส่ง code ไปไหน และก่อนอ่าน `error` ของ response
+fn check_callback_issuer(expected: &str, advertised: Option<bool>, iss: Option<&str>) -> Result<(), String> {
+    match iss {
+        Some(value) if value == expected => Ok(()),
+        Some(_) => Err(OAUTH_ERR_ISSUER.to_string()),
+        None if advertised == Some(true) => Err(OAUTH_ERR_ISSUER.to_string()),
+        None => Ok(()),
+    }
+}
+
+/// ลองล็อกอินเพื่อเอา challenge — server ยังไม่ได้รับ token ในขั้นนี้
+fn probe_oauth_challenge(agent: &ureq::Agent, server: &url::Url) -> Result<Option<AuthChallenge>, String> {
+    let request = agent
+        .post(server.as_str())
+        .set("Content-Type", "application/json")
+        .set("Accept", "application/json, text/event-stream");
+    let response = match request.send_string(OAUTH_INITIALIZE_PROBE) {
+        Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => return Err(format!("{}: {}", OAUTH_ERR_NETWORK, e)),
+    };
+    Ok(if response.status() == 401 { response_challenge(&response) } else { None })
+}
+
+fn authorization_url(
+    metadata: &AuthorizationServerMetadata,
+    client: &OauthClient,
+    resource: &str,
+    scope: Option<&str>,
+    state: &str,
+    code_challenge: &str,
+) -> Result<url::Url, String> {
+    let mut url = url::Url::parse(&metadata.authorization_endpoint).map_err(|_| OAUTH_ERR_INSECURE_ENDPOINT.to_string())?;
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &client.client_id)
+            .append_pair("redirect_uri", &client.redirect_uri)
+            .append_pair("code_challenge", code_challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("state", state)
+            .append_pair("resource", resource);
+        if let Some(scope) = scope {
+            query.append_pair("scope", scope);
+        }
+    }
+    Ok(url)
+}
+
+fn mark_oauth_client_stale(store: &dyn OauthStore, key: &str) {
+    with_oauth_lock(key, || {
+        if let Ok(Some(mut record)) = oauth_load(store, key) {
+            record.client_stale = true;
+            let _ = oauth_save(store, key, &record);
+        }
+    });
+}
+
+/// flow ทั้งหมดของการล็อกอินหนึ่งครั้ง — `open_browser` แยกออกมาเพื่อให้เทสต์เล่นบทเบราว์เซอร์ได้
+#[allow(clippy::too_many_arguments)]
+fn oauth_login_flow(
+    store: &dyn OauthStore,
+    key: &str,
+    server_url: &str,
+    extra_scope: Option<&str>,
+    pages: &OauthPages,
+    cancel: &std::sync::atomic::AtomicBool,
+    timeout: Duration,
+    open_browser: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<OauthStatus, String> {
+    validate_oauth_key(key)?;
+    let server = oauth_server_url(server_url)?;
+    let agent = oauth_agent();
+
+    let challenge = probe_oauth_challenge(&agent, &server)?.unwrap_or_default();
+    let resource_doc = discover_protected_resource(&agent, &server, challenge.resource_metadata.as_deref())?;
+    // issuer ที่ผ่านการตรวจแล้วคือค่าที่ใช้เทียบกับ `iss` ตอน redirect กลับมา
+    let metadata = discover_authorization_server(&agent, &server, &resource_doc.authorization_servers)?;
+
+    let previous = with_oauth_lock(key, || oauth_load(store, key))?;
+    let scope = select_oauth_scope(
+        challenge.scope.as_deref(),
+        resource_doc.scopes_supported.as_deref(),
+        metadata.scopes_supported.as_deref(),
+        previous.as_ref().filter(|r| r.issuer == metadata.issuer).and_then(|r| r.scope.as_deref()),
+        extra_scope,
+    );
+
+    let known_client = reusable_oauth_client(previous.as_ref(), &metadata.issuer, scope.as_deref(), now_secs());
+    let preferred_port = known_client
+        .as_ref()
+        .and_then(|c| url::Url::parse(&c.redirect_uri).ok())
+        .and_then(|u| u.port());
+    let listener = bind_oauth_listener(preferred_port)?;
+    let port = listener.local_addr().map_err(|e| format!("{}: {}", OAUTH_ERR_LISTENER, e))?.port();
+    let redirect_uri = format!("http://127.0.0.1:{}{}", port, OAUTH_CALLBACK_PATH);
+    let (client, reused_client) = match known_client.filter(|c| c.redirect_uri == redirect_uri) {
+        Some(client) => (client, true),
+        None => (register_oauth_client(&agent, &metadata, &redirect_uri, scope.as_deref())?, false),
+    };
+
+    let verifier = random_url_token()?;
+    let state = random_url_token()?;
+    let url = authorization_url(&metadata, &client, &resource_doc.resource, scope.as_deref(), &state, &pkce_challenge(&verifier))?;
+    open_browser(url.as_str())?;
+
+    let mut callback = match wait_for_oauth_callback(&listener, &state, cancel, timeout, &pages.failure) {
+        Ok(callback) => callback,
+        Err(e) => {
+            // server อาจลืม client ที่ลงทะเบียนไว้นานแล้วและค้างอยู่ที่หน้า error ในเบราว์เซอร์
+            // ลบทิ้งเพื่อให้ครั้งหน้าลงทะเบียนใหม่ ไม่ติดอยู่กับ client เสียตลอดไป
+            if reused_client {
+                mark_oauth_client_stale(store, key);
+            }
+            return Err(e);
+        }
+    };
+
+    let outcome = (|| {
+        check_callback_issuer(&metadata.issuer, metadata.authorization_response_iss_parameter_supported, callback.iss.as_deref())?;
+        if let Some(error) = callback.error.as_deref() {
+            let code = if error == "access_denied" { OAUTH_ERR_DENIED } else { OAUTH_ERR_AUTHORIZATION };
+            return Err(format!("{}: {}", code, limited_detail(error, callback.error_description.as_deref())));
+        }
+        let code = callback.code.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| OAUTH_ERR_AUTHORIZATION.to_string())?;
+        let form = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", client.redirect_uri.as_str()),
+            ("code_verifier", verifier.as_str()),
+        ];
+        let token = post_token_request(&metadata.token_endpoint, &client, &resource_doc.resource, form).map_err(|failure| {
+            if failure.client_rejected {
+                mark_oauth_client_stale(store, key);
+            }
+            format!("{}: {}", OAUTH_ERR_TOKEN, failure.detail)
+        })?;
+        let mut record = OauthRecord {
+            resource: resource_doc.resource.clone(),
+            issuer: metadata.issuer.clone(),
+            token_endpoint: metadata.token_endpoint.clone(),
+            client: client.clone(),
+            client_stale: false,
+            access_token: None,
+            refresh_token: None,
+            expires_at: None,
+            scope: scope.clone(),
+        };
+        apply_token_response(&mut record, token, now_secs())?;
+        with_oauth_lock(key, || oauth_save(store, key, &record))?;
+        oauth_status_of(store, key, server.as_str())
+    })();
+
+    match &outcome {
+        Ok(_) => write_oauth_page(&mut callback.stream, "200 OK", &pages.success),
+        Err(_) => write_oauth_page(&mut callback.stream, "400 Bad Request", &pages.failure),
+    }
+    outcome
+}
+
+/// การล็อกอินที่กำลังรออยู่ของแต่ละ server — เริ่มใหม่หรือกดยกเลิกแล้วตัวเก่าต้องหยุดและคืนพอร์ต
+fn oauth_pending() -> &'static Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>> {
+    static PENDING: std::sync::OnceLock<Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>> = std::sync::OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+
+fn oauth_cancel_pending(key: &str) {
+    if let Some(flag) = oauth_pending().lock().unwrap_or_else(|e| e.into_inner()).remove(key) {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// เปิดเบราว์เซอร์ของระบบให้ผู้ใช้ล็อกอินเอง แล้วรอจนกว่าจะกลับมาหรือหมดเวลา
+#[tauri::command]
+async fn mcp_oauth_login(app: AppHandle, key: String, url: String, scope: Option<String>, pages: OauthPages) -> Result<OauthStatus, String> {
+    oauth_cancel_pending(&key);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    oauth_pending().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), cancel.clone());
+    let flag = cancel.clone();
+    let login_key = key.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use tauri_plugin_opener::OpenerExt;
+        oauth_login_flow(&CredentialStore, &login_key, &expand_env(&url), scope.as_deref(), &pages, &flag, OAUTH_LOGIN_TIMEOUT, &|auth_url: &str| {
+            app.opener().open_url(auth_url, None::<&str>).map_err(|e| format!("{}: {}", OAUTH_ERR_BROWSER, e))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut pending = oauth_pending().lock().unwrap_or_else(|e| e.into_inner());
+    if pending.get(&key).is_some_and(|flag| Arc::ptr_eq(flag, &cancel)) {
+        pending.remove(&key);
+    }
+    result
+}
+
+#[tauri::command]
+fn mcp_oauth_cancel(key: String) {
+    oauth_cancel_pending(&key);
+}
+
+/// ออกจากระบบหรือถอนการติดตั้ง: ลบ token และ client ทั้งหมดของ server นี้
+#[tauri::command]
+async fn mcp_oauth_logout(key: String) -> Result<(), String> {
+    oauth_cancel_pending(&key);
+    tokio::task::spawn_blocking(move || with_oauth_lock(&key, || oauth_delete(&CredentialStore, &key)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// สถานะการล็อกอินของ server กับ URL นี้ — ไม่มี token ในคำตอบ
+#[tauri::command]
+async fn mcp_oauth_status(key: String, url: String) -> Result<OauthStatus, String> {
+    tokio::task::spawn_blocking(move || {
+        validate_oauth_key(&key)?;
+        oauth_status_of(&CredentialStore, &key, &expand_env(&url))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2921,6 +4147,10 @@ pub fn run() {
             mcp_send,
             mcp_stop,
             mcp_http_request,
+            mcp_oauth_login,
+            mcp_oauth_cancel,
+            mcp_oauth_logout,
+            mcp_oauth_status,
             web_fetch,
             browser_open,
             browser_set_bounds,
@@ -3588,5 +4818,1276 @@ mod tests {
 
         assert_eq!(read_json_files(&dir), vec!["{\"id\":\"session-1\"}".to_string()]);
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// flow ของ OAuth กับ mock server ที่รันบน 127.0.0.1 จริง และ MemoryStore แทน Credential Manager
+#[cfg(test)]
+mod oauth_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicBool;
+
+    #[derive(Default)]
+    struct MemoryStore {
+        items: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl OauthStore for MemoryStore {
+        fn get(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
+            Ok(self.items.lock().unwrap().get(name).cloned())
+        }
+        fn set(&self, name: &str, value: &[u8]) -> Result<(), String> {
+            // ขีดจำกัดเดียวกับ Credential Manager
+            assert!(value.len() <= 2560, "{} is {} bytes", name, value.len());
+            self.items.lock().unwrap().insert(name.to_string(), value.to_vec());
+            Ok(())
+        }
+        fn delete(&self, name: &str) -> Result<(), String> {
+            self.items.lock().unwrap().remove(name);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum IssMode {
+        Correct,
+        Wrong,
+        Absent,
+    }
+
+    struct MockState {
+        port: u16,
+        advertise_iss: bool,
+        iss_mode: IssMode,
+        pkce_methods: Option<Vec<&'static str>>,
+        metadata_issuer: Option<String>,
+        authorization_endpoint: Option<String>,
+        registration_enabled: bool,
+        auth_methods: Option<Vec<&'static str>>,
+        resource: Option<String>,
+        as_scopes: Option<Vec<&'static str>>,
+        resource_scopes: Option<Vec<&'static str>>,
+        challenge_scope: Option<&'static str>,
+        expires_in: Option<u64>,
+        issue_refresh: bool,
+        refresh_failure: Option<(u16, &'static str)>,
+        token_failure: Option<(u16, &'static str)>,
+        authorize_error: Option<&'static str>,
+        rejects_all_access: bool,
+        registrations: Vec<serde_json::Value>,
+        authorize_requests: Vec<HashMap<String, String>>,
+        token_requests: Vec<HashMap<String, String>>,
+        token_auth_headers: Vec<Option<String>>,
+        mcp_auth_headers: Vec<Option<String>>,
+        leaked_requests: usize,
+        next_id: usize,
+        clients: HashMap<String, (Vec<String>, Option<String>)>,
+        codes: HashMap<String, (String, String, String)>,
+        valid_access: HashSet<String>,
+        valid_refresh: HashSet<String>,
+    }
+
+    struct MockServer {
+        port: u16,
+        state: Arc<Mutex<MockState>>,
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Option<(String, String, HashMap<String, String>, String)> {
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        let head_end = loop {
+            if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let n = stream.read(&mut buf).ok()?;
+            if n == 0 {
+                return None;
+            }
+            data.extend_from_slice(&buf[..n]);
+        };
+        let head = String::from_utf8_lossy(&data[..head_end]).into_owned();
+        let mut lines = head.lines();
+        let mut first = lines.next()?.split_whitespace();
+        let method = first.next()?.to_string();
+        let target = first.next()?.to_string();
+        let headers: HashMap<String, String> = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .collect();
+        let length: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+        while data.len() < head_end + length {
+            let n = stream.read(&mut buf).ok()?;
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+        }
+        let body = String::from_utf8_lossy(&data[head_end..]).into_owned();
+        Some((method, target, headers, body))
+    }
+
+    fn respond(stream: &mut TcpStream, status: &str, extra: &[(&str, String)], body: &str) {
+        let mut head = format!("HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n", status, body.len());
+        for (name, value) in extra {
+            head.push_str(&format!("{}: {}\r\n", name, value));
+        }
+        head.push_str("\r\n");
+        let _ = stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(body.as_bytes()));
+    }
+
+    fn respond_json(stream: &mut TcpStream, status: &str, body: serde_json::Value) {
+        respond(stream, status, &[("Content-Type", "application/json".to_string())], &body.to_string());
+    }
+
+    fn form_map(text: &str) -> HashMap<String, String> {
+        url::form_urlencoded::parse(text.as_bytes()).into_owned().collect()
+    }
+
+    fn issue_tokens(s: &mut MockState) -> serde_json::Value {
+        s.next_id += 1;
+        let access = format!("access-{}", s.next_id);
+        s.valid_access.insert(access.clone());
+        let mut body = serde_json::json!({ "access_token": access, "token_type": "Bearer" });
+        if let Some(seconds) = s.expires_in {
+            body["expires_in"] = seconds.into();
+        }
+        if s.issue_refresh {
+            let refresh = format!("refresh-{}", s.next_id);
+            s.valid_refresh.insert(refresh.clone());
+            body["refresh_token"] = refresh.into();
+        }
+        body
+    }
+
+    fn handle_token(s: &mut MockState, stream: &mut TcpStream, headers: &HashMap<String, String>, body: &str) {
+        let form = form_map(body);
+        s.token_requests.push(form.clone());
+        s.token_auth_headers.push(headers.get("authorization").cloned());
+        let grant = form.get("grant_type").cloned().unwrap_or_default();
+        if grant == "refresh_token" {
+            if let Some((status, text)) = s.refresh_failure {
+                let line = format!("{} Error", status);
+                respond(stream, &line, &[("Content-Type", "application/json".to_string())], text);
+                return;
+            }
+            let token = form.get("refresh_token").cloned().unwrap_or_default();
+            // refresh token ใช้ได้ครั้งเดียว ตัวเก่าถูกส่งซ้ำ = ล้มเหลว
+            if !s.valid_refresh.remove(&token) {
+                respond_json(stream, "400 Bad Request", serde_json::json!({ "error": "invalid_grant" }));
+                return;
+            }
+            let tokens = issue_tokens(s);
+            respond_json(stream, "200 OK", tokens);
+            return;
+        }
+        if let Some((status, text)) = s.token_failure {
+            let line = format!("{} Error", status);
+            respond(stream, &line, &[("Content-Type", "application/json".to_string())], text);
+            return;
+        }
+        let code = form.get("code").cloned().unwrap_or_default();
+        let Some((challenge, redirect_uri, client_id)) = s.codes.remove(&code) else {
+            respond_json(stream, "400 Bad Request", serde_json::json!({ "error": "invalid_grant" }));
+            return;
+        };
+        let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+        let client_ok = match s.clients.get(&client_id).and_then(|(_, secret)| secret.as_ref()) {
+            None => form.get("client_id") == Some(&client_id),
+            Some(secret) => form.get("client_secret") == Some(secret) || headers.contains_key("authorization"),
+        };
+        if pkce_challenge(&verifier) != challenge || form.get("redirect_uri") != Some(&redirect_uri) || !client_ok {
+            respond_json(stream, "400 Bad Request", serde_json::json!({ "error": "invalid_grant" }));
+            return;
+        }
+        let tokens = issue_tokens(s);
+        respond_json(stream, "200 OK", tokens);
+    }
+
+    fn handle(state: &Arc<Mutex<MockState>>, mut stream: TcpStream) {
+        let Some((method, target, headers, body)) = read_request(&mut stream) else {
+            return;
+        };
+        let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+        let mut s = state.lock().unwrap();
+        let origin = format!("http://127.0.0.1:{}", s.port);
+        let stream = &mut stream;
+        match (method.as_str(), path) {
+            ("POST", "/mcp") | ("POST", "/mcp/redirect") => {
+                let auth = headers.get("authorization").cloned();
+                s.mcp_auth_headers.push(auth.clone());
+                let valid = !s.rejects_all_access
+                    && auth.as_deref().and_then(|a| a.strip_prefix("Bearer ")).is_some_and(|t| s.valid_access.contains(t));
+                if path == "/mcp/redirect" {
+                    respond(stream, "302 Found", &[("Location", format!("{}/leak", origin))], "");
+                } else if valid {
+                    respond_json(stream, "200 OK", serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": {} }));
+                } else {
+                    let scope = s.challenge_scope.map(|v| format!(", scope=\"{}\"", v)).unwrap_or_default();
+                    let header = format!("Bearer realm=\"mock\", resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\"{}", origin, scope);
+                    respond(stream, "401 Unauthorized", &[("WWW-Authenticate", header)], "");
+                }
+            }
+            ("POST", "/leak") | ("GET", "/leak") => {
+                s.leaked_requests += 1;
+                respond(stream, "200 OK", &[], "");
+            }
+            ("GET", "/.well-known/oauth-protected-resource/mcp") => {
+                let resource = s.resource.clone().unwrap_or_else(|| format!("{}/mcp", origin));
+                let mut doc = serde_json::json!({ "resource": resource, "authorization_servers": [origin] });
+                if let Some(scopes) = &s.resource_scopes {
+                    doc["scopes_supported"] = serde_json::json!(scopes);
+                }
+                respond_json(stream, "200 OK", doc);
+            }
+            ("GET", "/.well-known/oauth-authorization-server") => {
+                let mut doc = serde_json::json!({
+                    "issuer": s.metadata_issuer.clone().unwrap_or_else(|| origin.clone()),
+                    "authorization_endpoint": s.authorization_endpoint.clone().unwrap_or_else(|| format!("{}/authorize", origin)),
+                    "token_endpoint": format!("{}/token", origin),
+                    "response_types_supported": ["code"],
+                });
+                if s.registration_enabled {
+                    doc["registration_endpoint"] = format!("{}/register", origin).into();
+                }
+                if let Some(methods) = &s.pkce_methods {
+                    doc["code_challenge_methods_supported"] = serde_json::json!(methods);
+                }
+                if let Some(methods) = &s.auth_methods {
+                    doc["token_endpoint_auth_methods_supported"] = serde_json::json!(methods);
+                }
+                if let Some(scopes) = &s.as_scopes {
+                    doc["scopes_supported"] = serde_json::json!(scopes);
+                }
+                if s.advertise_iss {
+                    doc["authorization_response_iss_parameter_supported"] = true.into();
+                }
+                respond_json(stream, "200 OK", doc);
+            }
+            ("POST", "/register") => {
+                let request: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                s.registrations.push(request.clone());
+                s.next_id += 1;
+                let client_id = format!("client-{}", s.next_id);
+                let method = request["token_endpoint_auth_method"].as_str().unwrap_or("none").to_string();
+                let secret = (method != "none").then(|| format!("secret-{}", s.next_id));
+                let redirect_uris: Vec<String> = request["redirect_uris"]
+                    .as_array()
+                    .map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                s.clients.insert(client_id.clone(), (redirect_uris, secret.clone()));
+                let mut reply = serde_json::json!({ "client_id": client_id, "token_endpoint_auth_method": method });
+                if let Some(secret) = secret {
+                    reply["client_secret"] = secret.into();
+                    reply["client_secret_expires_at"] = 0.into();
+                }
+                respond_json(stream, "201 Created", reply);
+            }
+            ("GET", "/authorize") => {
+                let params = form_map(query);
+                s.authorize_requests.push(params.clone());
+                let client_id = params.get("client_id").cloned().unwrap_or_default();
+                let redirect_uri = params.get("redirect_uri").cloned().unwrap_or_default();
+                // ตรวจ redirect_uri ตรงตัวทั้งพอร์ตเหมือน server ที่เข้มงวด
+                let known = s.clients.get(&client_id).is_some_and(|(uris, _)| uris.contains(&redirect_uri));
+                if !known {
+                    respond(stream, "400 Bad Request", &[], "invalid client or redirect_uri");
+                    return;
+                }
+                s.next_id += 1;
+                let code = format!("code-{}", s.next_id);
+                let challenge = params.get("code_challenge").cloned().unwrap_or_default();
+                s.codes.insert(code.clone(), (challenge, redirect_uri.clone(), client_id));
+                let mut location = url::Url::parse(&redirect_uri).unwrap();
+                {
+                    let mut pairs = location.query_pairs_mut();
+                    match s.authorize_error {
+                        Some(error) => {
+                            pairs.append_pair("error", error).append_pair("error_description", "<script>alert(1)</script>");
+                        }
+                        None => {
+                            pairs.append_pair("code", &code);
+                        }
+                    }
+                    pairs.append_pair("state", params.get("state").map(String::as_str).unwrap_or_default());
+                    match s.iss_mode {
+                        IssMode::Correct => {
+                            pairs.append_pair("iss", &origin);
+                        }
+                        IssMode::Wrong => {
+                            pairs.append_pair("iss", "https://attacker.example");
+                        }
+                        IssMode::Absent => {}
+                    }
+                }
+                respond(stream, "302 Found", &[("Location", location.to_string())], "");
+            }
+            ("POST", "/token") => handle_token(&mut s, stream, &headers, &body),
+            _ => respond(stream, "404 Not Found", &[], ""),
+        }
+    }
+
+    impl MockServer {
+        fn start() -> MockServer {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let state = Arc::new(Mutex::new(MockState {
+                port,
+                advertise_iss: true,
+                iss_mode: IssMode::Correct,
+                pkce_methods: Some(vec!["S256"]),
+                metadata_issuer: None,
+                authorization_endpoint: None,
+                registration_enabled: true,
+                auth_methods: Some(vec!["none"]),
+                resource: None,
+                as_scopes: None,
+                resource_scopes: Some(vec!["files:read"]),
+                challenge_scope: None,
+                expires_in: Some(3600),
+                issue_refresh: true,
+                refresh_failure: None,
+                token_failure: None,
+                authorize_error: None,
+                rejects_all_access: false,
+                registrations: Vec::new(),
+                authorize_requests: Vec::new(),
+                token_requests: Vec::new(),
+                token_auth_headers: Vec::new(),
+                mcp_auth_headers: Vec::new(),
+                leaked_requests: 0,
+                next_id: 0,
+                clients: HashMap::new(),
+                codes: HashMap::new(),
+                valid_access: HashSet::new(),
+                valid_refresh: HashSet::new(),
+            }));
+            let shared = state.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let shared = shared.clone();
+                    std::thread::spawn(move || handle(&shared, stream));
+                }
+            });
+            MockServer { port, state }
+        }
+
+        fn url(&self) -> String {
+            format!("http://127.0.0.1:{}/mcp", self.port)
+        }
+
+        fn origin(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+
+        fn set(&self, change: impl FnOnce(&mut MockState)) {
+            change(&mut self.state.lock().unwrap());
+        }
+
+        fn read<T>(&self, get: impl FnOnce(&MockState) -> T) -> T {
+            get(&self.state.lock().unwrap())
+        }
+    }
+
+    fn pages() -> OauthPages {
+        OauthPages { success: "signed-in-page".to_string(), failure: "failed-page".to_string() }
+    }
+
+    fn http_get(url: &str) -> (u16, String) {
+        let agent = ureq::AgentBuilder::new().redirects(0).timeout(Duration::from_secs(10)).build();
+        match agent.get(url).call() {
+            Ok(r) | Err(ureq::Error::Status(_, r)) => {
+                let status = r.status();
+                (status, r.into_string().unwrap_or_default())
+            }
+            Err(e) => panic!("GET {} failed: {}", url, e),
+        }
+    }
+
+    fn redirect_location(auth_url: &str) -> String {
+        let agent = ureq::AgentBuilder::new().redirects(0).timeout(Duration::from_secs(10)).build();
+        let response = match agent.get(auth_url).call() {
+            Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+            Err(e) => panic!("GET {} failed: {}", auth_url, e),
+        };
+        response.header("location").unwrap_or_else(|| panic!("no redirect from {}", auth_url)).to_string()
+    }
+
+    fn with_param(url: &str, name: &str, value: Option<&str>) -> String {
+        let mut parsed = url::Url::parse(url).unwrap();
+        let kept: Vec<(String, String)> = parsed.query_pairs().into_owned().filter(|(k, _)| k != name).collect();
+        {
+            let mut pairs = parsed.query_pairs_mut();
+            pairs.clear();
+            for (k, v) in &kept {
+                pairs.append_pair(k, v);
+            }
+            if let Some(value) = value {
+                pairs.append_pair(name, value);
+            }
+        }
+        parsed.to_string()
+    }
+
+    /// เบราว์เซอร์จำลอง: เปิดหน้า authorize แล้วขอ URL ที่ `visits` สร้างจาก redirect ของ server ทีละตัว
+    fn login_with(
+        server: &MockServer,
+        store: &dyn OauthStore,
+        key: &str,
+        extra_scope: Option<&str>,
+        timeout: Duration,
+        visits: impl Fn(String) -> Vec<String> + Send + Sync + 'static,
+    ) -> (Result<OauthStatus, String>, Arc<Mutex<Vec<(u16, String)>>>) {
+        let seen: Arc<Mutex<Vec<(u16, String)>>> = Arc::default();
+        let visits = Arc::new(visits);
+        let cancel = AtomicBool::new(false);
+        let opened = seen.clone();
+        let result = oauth_login_flow(store, key, &server.url(), extra_scope, &pages(), &cancel, timeout, &|auth_url: &str| {
+            let auth_url = auth_url.to_string();
+            let visits = visits.clone();
+            let seen = opened.clone();
+            std::thread::spawn(move || {
+                for target in visits(redirect_location(&auth_url)) {
+                    let page = http_get(&target);
+                    seen.lock().unwrap().push(page);
+                }
+            });
+            Ok(())
+        });
+        (result, seen)
+    }
+
+    fn login(server: &MockServer, store: &dyn OauthStore, key: &str) -> OauthStatus {
+        login_with(server, store, key, None, Duration::from_secs(10), |target| vec![target]).0.unwrap()
+    }
+
+    fn post(server: &MockServer, store: &dyn OauthStore, key: &str) -> HttpResponse {
+        mcp_http_post(store, &server.url(), &HashMap::new(), "{}", Some(5_000), Some(key)).unwrap()
+    }
+
+    fn sample_record(server: &MockServer) -> OauthRecord {
+        OauthRecord {
+            resource: server.url(),
+            issuer: server.origin(),
+            token_endpoint: format!("{}/token", server.origin()),
+            client: OauthClient {
+                client_id: "client-0".to_string(),
+                client_secret: None,
+                auth_method: "none".to_string(),
+                redirect_uri: "http://127.0.0.1:1/callback".to_string(),
+                registered_scope: None,
+                secret_expires_at: None,
+            },
+            client_stale: false,
+            access_token: Some("stale-access".to_string()),
+            refresh_token: Some("refresh-seed".to_string()),
+            expires_at: Some(now_secs() - 10),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn login_follows_the_spec_end_to_end() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+
+        // ยังไม่ล็อกอิน: ส่งแบบไม่มี token แล้วได้ 401 พร้อม challenge
+        let before = post(&server, &store, "srv");
+        assert_eq!(before.status, 401);
+        let challenge = before.auth_challenge.unwrap();
+        assert_eq!(challenge.resource_metadata.unwrap(), format!("{}/.well-known/oauth-protected-resource/mcp", server.origin()));
+        assert_eq!(server.read(|s| s.mcp_auth_headers.clone()), vec![None]);
+
+        let (result, pages_seen) = login_with(&server, &store, "srv", None, Duration::from_secs(10), |target| vec![target]);
+        let status = result.unwrap();
+        assert!(status.signed_in && status.can_refresh);
+        assert_eq!(status.issuer.as_deref(), Some(server.origin().as_str()));
+        std::thread::sleep(Duration::from_millis(100));
+        let shown = pages_seen.lock().unwrap().clone();
+        assert_eq!(shown[0].0, 200);
+        assert!(shown[0].1.contains("signed-in-page"));
+
+        // ลงทะเบียนเป็น native app พร้อม redirect แบบ 127.0.0.1
+        let registration = server.read(|s| s.registrations[0].clone());
+        assert_eq!(registration["application_type"], "native");
+        assert_eq!(registration["grant_types"], serde_json::json!(["authorization_code", "refresh_token"]));
+        let redirect_uri = registration["redirect_uris"][0].as_str().unwrap().to_string();
+        assert!(redirect_uri.starts_with("http://127.0.0.1:"), "{}", redirect_uri);
+        assert!(redirect_uri.ends_with("/callback"));
+
+        // authorization request มี PKCE, state, resource และ scope จาก scopes_supported
+        let auth = server.read(|s| s.authorize_requests[0].clone());
+        assert_eq!(auth["response_type"], "code");
+        assert_eq!(auth["code_challenge_method"], "S256");
+        assert_eq!(auth["resource"], server.url());
+        assert_eq!(auth["scope"], "files:read");
+        assert!(auth["state"].len() >= 32);
+        assert_eq!(auth["redirect_uri"], redirect_uri);
+
+        // token request มี verifier ที่ตรงกับ challenge และ resource ด้วย
+        let token = server.read(|s| s.token_requests[0].clone());
+        assert_eq!(token["grant_type"], "authorization_code");
+        assert_eq!(pkce_challenge(&token["code_verifier"]), auth["code_challenge"]);
+        assert_eq!(token["resource"], server.url());
+
+        // หลังล็อกอิน Rust ใส่ header ให้เองโดย TS ไม่ต้องส่งอะไรมา
+        let after = post(&server, &store, "srv");
+        assert_eq!(after.status, 200);
+        let header = server.read(|s| s.mcp_auth_headers.last().cloned().flatten()).unwrap();
+        assert!(header.starts_with("Bearer access-"), "{}", header);
+        // ของที่ webview ได้รับต้องไม่มี token
+        let status_json = serde_json::to_string(&status).unwrap();
+        assert!(!status_json.contains("access-") && !status_json.contains("refresh-"), "{}", status_json);
+    }
+
+    #[test]
+    fn callback_with_a_wrong_or_missing_state_is_discarded() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        let (result, pages_seen) = login_with(&server, &store, "srv", None, Duration::from_secs(10), |target| {
+            vec![
+                with_param(&target, "state", Some("forged")),
+                with_param(&target, "state", None),
+                with_param(&with_param(&target, "code", Some("attacker-code")), "state", Some("forged")),
+                target,
+            ]
+        });
+        // request ปลอมไม่ทำให้การล็อกอินจริงล้ม
+        assert!(result.unwrap().signed_in);
+        std::thread::sleep(Duration::from_millis(100));
+        let seen = pages_seen.lock().unwrap().clone();
+        assert_eq!(seen.iter().map(|(status, _)| *status).collect::<Vec<_>>(), vec![400, 400, 400, 200]);
+        assert!(seen[0].1.contains("failed-page"));
+        // code จาก request ปลอมไม่เคยถูกส่งไปแลก token
+        let tokens = server.read(|s| s.token_requests.clone());
+        assert_eq!(tokens.len(), 1);
+        assert_ne!(tokens[0]["code"], "attacker-code");
+    }
+
+    #[test]
+    fn a_wrong_state_alone_never_produces_a_token() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        let (result, _) = login_with(&server, &store, "srv", None, Duration::from_millis(800), |target| {
+            vec![with_param(&target, "state", Some("forged"))]
+        });
+        assert_eq!(result.unwrap_err(), OAUTH_ERR_TIMEOUT);
+        assert!(server.read(|s| s.token_requests.is_empty()));
+        assert!(oauth_load(&store, "srv").unwrap().is_none());
+        assert_eq!(post(&server, &store, "srv").status, 401);
+    }
+
+    #[test]
+    fn listener_only_accepts_get_callback_on_its_own_host() {
+        let listener = bind_oauth_listener(None).unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+
+        let cancel = AtomicBool::new(false);
+        let send = |raw: String| {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            let mut reply = String::new();
+            let _ = stream.read_to_string(&mut reply);
+            reply
+        };
+        let host = format!("127.0.0.1:{}", addr.port());
+        let replies = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| wait_for_oauth_callback(&listener, "good", &cancel, Duration::from_secs(5), "failed-page").map(|c| c.code));
+            let replies = vec![
+                send(format!("GET /callback?state=good&code=x HTTP/1.1\r\nHost: evil.example\r\n\r\n")),
+                send(format!("POST /callback?state=good&code=x HTTP/1.1\r\nHost: {}\r\n\r\n", host)),
+                send(format!("GET /favicon.ico HTTP/1.1\r\nHost: {}\r\n\r\n", host)),
+            ];
+            // ต้องรอต่อหลังเจอ request ที่ไม่ผ่าน
+            let accepted = TcpStream::connect(addr).map(|mut stream| {
+                stream.write_all(format!("GET /callback?state=good&code=real HTTP/1.1\r\nHost: {}\r\n\r\n", host).as_bytes()).unwrap();
+                stream
+            });
+            assert_eq!(waiter.join().unwrap().unwrap().as_deref(), Some("real"));
+            drop(accepted);
+            replies
+        });
+        assert!(replies[0].starts_with("HTTP/1.1 403"), "{}", replies[0]);
+        assert!(replies[1].starts_with("HTTP/1.1 404"), "{}", replies[1]);
+        assert!(replies[2].starts_with("HTTP/1.1 404"), "{}", replies[2]);
+    }
+
+    #[test]
+    fn cancelling_stops_waiting_for_the_browser() {
+        let listener = bind_oauth_listener(None).unwrap();
+        let cancel = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let error = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| wait_for_oauth_callback(&listener, "s", &cancel, Duration::from_secs(30), "x").err());
+            std::thread::sleep(Duration::from_millis(100));
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            waiter.join().unwrap()
+        });
+        assert_eq!(error.as_deref(), Some(OAUTH_ERR_CANCELLED));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn issuer_in_the_callback_is_checked_before_the_code_is_used() {
+        for (advertised, mode, accepted) in [
+            (true, IssMode::Correct, true),
+            (true, IssMode::Wrong, false),
+            (true, IssMode::Absent, false),
+            (false, IssMode::Correct, true),
+            (false, IssMode::Wrong, false),
+            (false, IssMode::Absent, true),
+        ] {
+            let server = MockServer::start();
+            server.set(|s| {
+                s.advertise_iss = advertised;
+                s.iss_mode = mode;
+            });
+            let store = MemoryStore::default();
+            let (result, _) = login_with(&server, &store, "srv", None, Duration::from_secs(10), |target| vec![target]);
+            assert_eq!(result.is_ok(), accepted);
+            if !accepted {
+                assert_eq!(result.unwrap_err(), OAUTH_ERR_ISSUER);
+                assert!(server.read(|s| s.token_requests.is_empty()), "code must not reach the token endpoint");
+                assert!(oauth_load(&store, "srv").unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn error_from_the_authorization_server_is_reported_after_the_issuer_check() {
+        let server = MockServer::start();
+        server.set(|s| s.authorize_error = Some("access_denied"));
+        let store = MemoryStore::default();
+        let (result, pages_seen) = login_with(&server, &store, "srv", None, Duration::from_secs(10), |target| vec![target]);
+        assert!(result.unwrap_err().starts_with(OAUTH_ERR_DENIED));
+        std::thread::sleep(Duration::from_millis(100));
+        // ข้อความจาก server ไม่ถูกสะท้อนลงหน้าเว็บบน loopback
+        let seen = pages_seen.lock().unwrap().clone();
+        assert!(seen[0].1.contains("failed-page") && !seen[0].1.contains("<script>"), "{}", seen[0].1);
+
+        // iss ไม่ตรง: ห้ามแสดง error ของ response นั้นตามสเปก
+        let server = MockServer::start();
+        server.set(|s| {
+            s.authorize_error = Some("access_denied");
+            s.iss_mode = IssMode::Wrong;
+        });
+        let (result, _) = login_with(&server, &store, "srv", None, Duration::from_secs(10), |target| vec![target]);
+        assert_eq!(result.unwrap_err(), OAUTH_ERR_ISSUER);
+    }
+
+    fn login_error(server: &MockServer) -> String {
+        let store = MemoryStore::default();
+        let opened = Arc::new(AtomicBool::new(false));
+        let flag = opened.clone();
+        let cancel = AtomicBool::new(false);
+        let error = oauth_login_flow(&store, "srv", &server.url(), None, &pages(), &cancel, Duration::from_secs(5), &|_: &str| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .err()
+        .expect("login must fail");
+        assert!(!opened.load(std::sync::atomic::Ordering::SeqCst), "browser must not open: {}", error);
+        assert!(oauth_load(&store, "srv").unwrap().is_none());
+        error
+    }
+
+    #[test]
+    fn metadata_with_a_different_issuer_is_not_used() {
+        let server = MockServer::start();
+        server.set(|s| s.metadata_issuer = Some("https://honest.example".to_string()));
+        assert_eq!(login_error(&server), OAUTH_ERR_NO_AS_METADATA);
+    }
+
+    #[test]
+    fn refuses_to_continue_without_pkce_s256() {
+        for methods in [None, Some(vec!["plain"])] {
+            let server = MockServer::start();
+            server.set(|s| s.pkce_methods = methods);
+            assert_eq!(login_error(&server), OAUTH_ERR_NO_PKCE);
+        }
+    }
+
+    #[test]
+    fn dangerous_authorization_endpoints_never_reach_the_browser() {
+        for endpoint in ["file:///C:/Windows/System32/calc.exe", "javascript:alert(1)", "ms-msdt:/id", "http://evil.example/authorize", "https://user:pw@evil.example/a", "not a url"] {
+            let server = MockServer::start();
+            server.set(|s| s.authorization_endpoint = Some(endpoint.to_string()));
+            assert!(login_error(&server).starts_with(OAUTH_ERR_INSECURE_ENDPOINT), "{}", endpoint);
+        }
+    }
+
+    #[test]
+    fn resource_metadata_must_cover_the_server_url() {
+        let server = MockServer::start();
+        server.set(|s| s.resource = Some("https://other.example/mcp".to_string()));
+        assert!(login_error(&server).starts_with(OAUTH_ERR_RESOURCE_MISMATCH));
+    }
+
+    #[test]
+    fn server_without_registration_reports_it_honestly() {
+        let server = MockServer::start();
+        server.set(|s| s.registration_enabled = false);
+        assert_eq!(login_error(&server), OAUTH_ERR_NO_REGISTRATION);
+    }
+
+    #[test]
+    fn plain_http_servers_cannot_use_oauth() {
+        assert!(oauth_server_url("http://mcp.example.com/mcp").is_err());
+        assert!(oauth_server_url("https://user:pw@mcp.example.com/mcp").is_err());
+        assert!(oauth_server_url("ftp://mcp.example.com/").is_err());
+        assert!(oauth_server_url("https://mcp.example.com/mcp").is_ok());
+        assert!(oauth_server_url("http://127.0.0.1:9999/mcp").is_ok());
+    }
+
+    #[test]
+    fn discovered_urls_cannot_point_inside_the_network_from_a_remote_server() {
+        let remote = url::Url::parse("https://mcp.example.com/mcp").unwrap();
+        for bad in [
+            "http://auth.example.com/token",
+            "https://127.0.0.1/token",
+            "https://localhost/token",
+            "https://192.168.1.1/token",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/token",
+            "https://[::ffff:127.0.0.1]/token",
+            "https://auth.example.com/token#fragment",
+            "file:///etc/passwd",
+        ] {
+            assert!(oauth_url_allowed(&remote, bad).is_err(), "{}", bad);
+        }
+        assert!(oauth_url_allowed(&remote, "https://auth.example.com/token").is_ok());
+        // http ใช้ได้เฉพาะตอน server เองอยู่ในเครื่อง (ทดสอบกับ mock)
+        let local = url::Url::parse("http://127.0.0.1:9/mcp").unwrap();
+        assert!(oauth_url_allowed(&local, "http://127.0.0.1:9/token").is_ok());
+        assert!(oauth_url_allowed(&local, "http://evil.example/token").is_err());
+    }
+
+    #[test]
+    fn expired_token_is_refreshed_before_the_request() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        let mut record = oauth_load(&store, "srv").unwrap().unwrap();
+        let old_access = record.access_token.clone().unwrap();
+        let old_refresh = record.refresh_token.clone().unwrap();
+        record.expires_at = Some(now_secs() - 1);
+        oauth_save(&store, "srv", &record).unwrap();
+
+        assert_eq!(post(&server, &store, "srv").status, 200);
+        let refresh = server.read(|s| s.token_requests.last().cloned().unwrap());
+        assert_eq!(refresh["grant_type"], "refresh_token");
+        assert_eq!(refresh["refresh_token"], old_refresh);
+        assert_eq!(refresh["resource"], server.url());
+        // request แรกหลังหมดอายุใช้ token ใหม่ ไม่ได้ส่งตัวเก่าออกไป
+        let header = server.read(|s| s.mcp_auth_headers.last().cloned().flatten()).unwrap();
+        assert_ne!(header, format!("Bearer {}", old_access));
+        // refresh token ที่หมุนมาใหม่ถูกบันทึก
+        let saved = oauth_load(&store, "srv").unwrap().unwrap();
+        assert_ne!(saved.refresh_token.unwrap(), old_refresh);
+        assert!(saved.expires_at.unwrap() > now_secs());
+    }
+
+    #[test]
+    fn token_expiring_within_the_leeway_is_refreshed_early() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        let mut record = oauth_load(&store, "srv").unwrap().unwrap();
+        record.expires_at = Some(now_secs() + OAUTH_EXPIRY_LEEWAY_SECS / 2);
+        oauth_save(&store, "srv", &record).unwrap();
+        post(&server, &store, "srv");
+        assert_eq!(server.read(|s| s.token_requests.last().cloned().unwrap())["grant_type"], "refresh_token");
+    }
+
+    #[test]
+    fn expired_token_without_refresh_needs_a_new_login() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        server.set(|s| s.issue_refresh = false);
+        login(&server, &store, "srv");
+        let mut record = oauth_load(&store, "srv").unwrap().unwrap();
+        record.expires_at = Some(now_secs() - 1);
+        oauth_save(&store, "srv", &record).unwrap();
+        assert!(!oauth_status_of(&store, "srv", &server.url()).unwrap().signed_in);
+
+        let response = post(&server, &store, "srv");
+        assert_eq!(response.status, 401);
+        assert_eq!(server.read(|s| s.mcp_auth_headers.last().cloned().flatten()), None);
+        assert!(oauth_load(&store, "srv").unwrap().unwrap().access_token.is_none());
+    }
+
+    #[test]
+    fn rejected_refresh_token_clears_the_login() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        let mut record = oauth_load(&store, "srv").unwrap().unwrap();
+        record.expires_at = Some(now_secs() - 1);
+        oauth_save(&store, "srv", &record).unwrap();
+        server.set(|s| s.refresh_failure = Some((400, r#"{"error":"invalid_grant"}"#)));
+
+        let response = post(&server, &store, "srv");
+        assert_eq!(response.status, 401);
+        assert!(response.auth_challenge.is_some());
+        assert_eq!(server.read(|s| s.mcp_auth_headers.last().cloned().flatten()), None);
+        let saved = oauth_load(&store, "srv").unwrap().unwrap();
+        assert!(saved.access_token.is_none() && saved.refresh_token.is_none());
+        assert!(!oauth_status_of(&store, "srv", &server.url()).unwrap().signed_in);
+    }
+
+    #[test]
+    fn temporary_refresh_failure_keeps_the_login() {
+        for failure in [(503, "unavailable"), (403, "<html>blocked</html>"), (429, "{}")] {
+            let server = MockServer::start();
+            let store = MemoryStore::default();
+            login(&server, &store, "srv");
+            let mut record = oauth_load(&store, "srv").unwrap().unwrap();
+            record.expires_at = Some(now_secs() - 1);
+            oauth_save(&store, "srv", &record).unwrap();
+            let refresh_before = record.refresh_token.clone();
+            server.set(|s| s.refresh_failure = Some(failure));
+
+            let error = mcp_http_post(&store, &server.url(), &HashMap::new(), "{}", Some(5_000), Some("srv")).err().unwrap();
+            assert!(error.starts_with(OAUTH_ERR_REFRESH), "{}", error);
+            assert_eq!(oauth_load(&store, "srv").unwrap().unwrap().refresh_token, refresh_before);
+
+            // server กลับมาแล้วใช้ต่อได้โดยไม่ต้องล็อกอินใหม่
+            server.set(|s| s.refresh_failure = None);
+            assert_eq!(post(&server, &store, "srv").status, 200);
+        }
+    }
+
+    #[test]
+    fn revoked_token_is_refreshed_once_and_the_request_retried() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        let current = oauth_load(&store, "srv").unwrap().unwrap().access_token.unwrap();
+        server.set(|s| {
+            s.valid_access.remove(&current);
+            // ลืม request ตอนล็อกอิน เทสต์นี้ดูเฉพาะ request หลังจากนี้
+            s.mcp_auth_headers.clear();
+        });
+        assert_eq!(post(&server, &store, "srv").status, 200);
+        let headers = server.read(|s| s.mcp_auth_headers.clone());
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].as_deref(), Some(format!("Bearer {}", current).as_str()));
+        assert_ne!(headers[0], headers[1]);
+
+        // server ไม่รับ token ใหม่ด้วย: ไม่วนลูป คืน 401 ให้ผู้ใช้ล็อกอินใหม่
+        server.set(|s| s.rejects_all_access = true);
+        let before = server.read(|s| s.mcp_auth_headers.len());
+        assert_eq!(post(&server, &store, "srv").status, 401);
+        assert_eq!(server.read(|s| s.mcp_auth_headers.len()), before + 2);
+    }
+
+    #[test]
+    fn concurrent_requests_share_one_refresh() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        let mut record = oauth_load(&store, "srv").unwrap().unwrap();
+        record.expires_at = Some(now_secs() - 1);
+        oauth_save(&store, "srv", &record).unwrap();
+        let statuses: Vec<u16> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..6).map(|_| scope.spawn(|| post(&server, &store, "srv").status)).collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        assert_eq!(statuses, vec![200; 6]);
+        let refreshes = server.read(|s| s.token_requests.iter().filter(|t| t["grant_type"] == "refresh_token").count());
+        assert_eq!(refreshes, 1);
+    }
+
+    #[test]
+    fn token_is_only_sent_to_its_own_resource() {
+        let server = MockServer::start();
+        let other = MockServer::start();
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+
+        // config ถูกแก้ให้ชี้ไป server อื่นโดยใช้ชื่อเดิม
+        let response = mcp_http_post(&store, &other.url(), &HashMap::new(), "{}", Some(5_000), Some("srv")).unwrap();
+        assert_eq!(response.status, 401);
+        assert_eq!(other.read(|s| s.mcp_auth_headers.clone()), vec![None]);
+        assert!(!oauth_status_of(&store, "srv", &other.url()).unwrap().signed_in);
+
+        // path อื่นบน server เดิมที่ไม่อยู่ใต้ resource ก็ไม่ได้ token เช่นกัน
+        let sibling = format!("{}/not-mcp", server.origin());
+        mcp_http_post(&store, &sibling, &HashMap::new(), "{}", Some(5_000), Some("srv")).unwrap();
+        let resource = url::Url::parse(&server.url()).unwrap();
+        assert!(resource_covers(&resource, &url::Url::parse(&format!("{}?read_only=true", server.url())).unwrap()));
+        assert!(resource_covers(&resource, &url::Url::parse(&format!("{}/sub", server.url())).unwrap()));
+        assert!(!resource_covers(&resource, &url::Url::parse(&format!("{}-other", server.url())).unwrap()));
+        assert!(!resource_covers(&resource, &url::Url::parse(&sibling).unwrap()));
+    }
+
+    #[test]
+    fn token_does_not_follow_redirects() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        let target = format!("{}/redirect", server.url());
+        let response = mcp_http_post(&store, &target, &HashMap::new(), "{}", Some(5_000), Some("srv")).unwrap();
+        assert_eq!(response.status, 302);
+        assert_eq!(server.read(|s| s.leaked_requests), 0);
+    }
+
+    #[test]
+    fn oauth_servers_ignore_a_static_authorization_header() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        let headers = HashMap::from([("authorization".to_string(), "Bearer from-config".to_string())]);
+        assert_eq!(mcp_http_post(&store, &server.url(), &headers, "{}", Some(5_000), Some("srv")).unwrap().status, 200);
+        let sent = server.read(|s| s.mcp_auth_headers.last().cloned().flatten()).unwrap();
+        assert!(sent.starts_with("Bearer access-"), "{}", sent);
+
+        // server ที่ไม่ได้ตั้ง OAuth ยังใช้ header ของ config ตามเดิม
+        mcp_http_post(&store, &server.url(), &headers, "{}", Some(5_000), None).unwrap();
+        assert_eq!(server.read(|s| s.mcp_auth_headers.last().cloned().flatten()).unwrap(), "Bearer from-config");
+    }
+
+    #[test]
+    fn logout_removes_every_stored_part() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        // token ยาวเก็บหลายรายการ
+        let mut record = oauth_load(&store, "srv").unwrap().unwrap();
+        record.access_token = Some("x".repeat(20_000));
+        oauth_save(&store, "srv", &record).unwrap();
+        assert!(store.items.lock().unwrap().len() > 5);
+        // ของ server อื่นต้องไม่หายไปด้วย
+        oauth_save(&store, "other", &sample_record(&server)).unwrap();
+
+        oauth_delete(&store, "srv").unwrap();
+        assert!(oauth_load(&store, "srv").unwrap().is_none());
+        assert!(store.items.lock().unwrap().keys().all(|name| !name.starts_with("mcp-oauth.srv.")));
+        assert!(oauth_load(&store, "other").unwrap().is_some());
+        assert_eq!(post(&server, &store, "srv").status, 401);
+        assert_eq!(server.read(|s| s.mcp_auth_headers.last().cloned().flatten()), None);
+        // ลบซ้ำไม่ error (ถอนการติดตั้งตอนไม่ได้ล็อกอิน)
+        oauth_delete(&store, "srv").unwrap();
+    }
+
+    #[test]
+    fn long_tokens_are_split_and_shrinking_leaves_nothing_behind() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        let mut record = sample_record(&server);
+        record.access_token = Some("a".repeat(12_000));
+        record.refresh_token = Some("r".repeat(6_000));
+        oauth_save(&store, "srv", &record).unwrap();
+        assert!(store.items.lock().unwrap().len() >= 9);
+        let loaded = oauth_load(&store, "srv").unwrap().unwrap();
+        assert_eq!(loaded.access_token, record.access_token);
+        assert_eq!(loaded.refresh_token, record.refresh_token);
+
+        record.access_token = Some("short".to_string());
+        record.refresh_token = None;
+        oauth_save(&store, "srv", &record).unwrap();
+        assert_eq!(store.items.lock().unwrap().len(), 1);
+        assert_eq!(oauth_load(&store, "srv").unwrap().unwrap().access_token.as_deref(), Some("short"));
+
+        record.access_token = Some("x".repeat(OAUTH_PART_BYTES * (OAUTH_MAX_PARTS + 1)));
+        assert!(oauth_save(&store, "srv", &record).is_err());
+    }
+
+    #[test]
+    fn broken_vault_data_counts_as_signed_out() {
+        let store = MemoryStore::default();
+        store.set(&oauth_part_name("srv", 0), &[3, b'{']).unwrap();
+        assert!(oauth_load(&store, "srv").unwrap().is_none());
+        store.set(&oauth_part_name("srv", 0), &[1, b'{']).unwrap();
+        assert!(oauth_load(&store, "srv").unwrap().is_none());
+        store.set(&oauth_part_name("srv", 0), &[]).unwrap();
+        assert!(oauth_load(&store, "srv").unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_manager_holds_tokens_longer_than_one_entry() {
+        let key = format!("dextest-{}", uuid::Uuid::new_v4().simple());
+        let server = MockServer::start();
+        let store = CredentialStore;
+        let mut record = sample_record(&server);
+        record.access_token = Some("a".repeat(9_000));
+        if let Err(error) = oauth_save(&store, &key, &record) {
+            // เครื่อง CI บางแบบไม่มี logon session ให้ใช้ Credential Manager
+            assert!(error.contains("logon session"), "{}", error);
+            eprintln!("skipped: {}", error);
+            return;
+        }
+        let loaded = oauth_load(&store, &key);
+        let deleted = oauth_delete(&store, &key);
+        let after = oauth_load(&store, &key);
+        assert_eq!(loaded.unwrap().unwrap().access_token, record.access_token);
+        deleted.unwrap();
+        assert!(after.unwrap().is_none());
+        // เหตุผลที่ต้องแบ่งเก็บ: รายการเดียวรับข้อความ 2,000 ตัวอักษรไม่ได้
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &oauth_part_name(&key, 0)).unwrap();
+        assert!(entry.set_password(&"a".repeat(2_000)).is_err());
+    }
+
+    #[test]
+    fn vault_cannot_be_reached_through_the_api_key_commands() {
+        let name = oauth_part_name("srv", 0);
+        assert!(load_api_keys(vec![name.clone()]).is_err());
+        assert!(save_api_key(name, "overwrite".to_string()).is_err());
+        // `${...}` ใน config เติม prefix mcp-secret- เสมอจึงไม่ถึง vault
+        assert_eq!(expand_env("${mcp-oauth.srv.0}"), "");
+    }
+
+    #[test]
+    fn second_login_reuses_the_registered_client_on_the_same_port() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        let first = oauth_load(&store, "srv").unwrap().unwrap().client;
+        login(&server, &store, "srv");
+        let second = oauth_load(&store, "srv").unwrap().unwrap().client;
+        assert_eq!(server.read(|s| s.registrations.len()), 1);
+        assert_eq!(first.client_id, second.client_id);
+        assert_eq!(first.redirect_uri, second.redirect_uri);
+    }
+
+    #[test]
+    fn busy_port_registers_a_new_client_instead_of_failing_the_strict_redirect_check() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        let first = oauth_load(&store, "srv").unwrap().unwrap().client;
+        let port = url::Url::parse(&first.redirect_uri).unwrap().port().unwrap();
+        let _occupied = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        login(&server, &store, "srv");
+        let second = oauth_load(&store, "srv").unwrap().unwrap().client;
+        assert_eq!(server.read(|s| s.registrations.len()), 2);
+        assert_ne!(first.redirect_uri, second.redirect_uri);
+    }
+
+    #[test]
+    fn abandoned_login_with_a_reused_client_registers_again_next_time() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        // ผู้ใช้ไม่กลับมาจากเบราว์เซอร์ เช่น server ลืม client แล้วแสดงหน้า error ค้างไว้
+        let (result, _) = login_with(&server, &store, "srv", None, Duration::from_millis(300), |_| Vec::new());
+        assert_eq!(result.unwrap_err(), OAUTH_ERR_TIMEOUT);
+        // token ที่ยังใช้ได้ไม่ถูกแตะ
+        assert_eq!(post(&server, &store, "srv").status, 200);
+        login(&server, &store, "srv");
+        assert_eq!(server.read(|s| s.registrations.len()), 2);
+    }
+
+    #[test]
+    fn client_is_registered_again_when_the_authorization_server_changes() {
+        let first = MockServer::start();
+        let store = MemoryStore::default();
+        login(&first, &store, "srv");
+        let second = MockServer::start();
+        login(&second, &store, "srv");
+        assert_eq!(second.read(|s| s.registrations.len()), 1);
+        assert_eq!(oauth_load(&store, "srv").unwrap().unwrap().issuer, second.origin());
+    }
+
+    #[test]
+    fn servers_without_public_clients_get_the_secret_they_issued() {
+        // แบบเดียวกับ metadata ของ Supabase: ไม่รับ `none`
+        let server = MockServer::start();
+        server.set(|s| s.auth_methods = Some(vec!["client_secret_basic", "client_secret_post"]));
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        assert_eq!(server.read(|s| s.registrations[0]["token_endpoint_auth_method"].clone()), "client_secret_post");
+        let token = server.read(|s| s.token_requests[0].clone());
+        assert!(token["client_secret"].starts_with("secret-"));
+        // secret อยู่ใน vault ไม่ได้อยู่ในคำตอบที่ส่งให้ webview
+        let status = serde_json::to_string(&oauth_status_of(&store, "srv", &server.url()).unwrap()).unwrap();
+        assert!(!status.contains("secret-"), "{}", status);
+
+        let server = MockServer::start();
+        server.set(|s| s.auth_methods = Some(vec!["client_secret_basic"]));
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        let basic = server.read(|s| s.token_auth_headers[0].clone()).unwrap();
+        assert!(basic.starts_with("Basic "));
+        assert!(!server.read(|s| s.token_requests[0].contains_key("client_secret")));
+    }
+
+    #[test]
+    fn scope_comes_from_the_challenge_first_and_step_up_keeps_what_was_granted() {
+        let server = MockServer::start();
+        server.set(|s| {
+            s.challenge_scope = Some("read write");
+            s.resource_scopes = Some(vec!["ignored"]);
+            s.as_scopes = Some(vec!["read", "write", "admin", "offline_access"]);
+        });
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        assert_eq!(server.read(|s| s.authorize_requests[0]["scope"].clone()), "read write offline_access");
+
+        // 403 insufficient_scope: ล็อกอินใหม่โดยขอ scope เพิ่ม ต้องลงทะเบียน client ใหม่ให้ครอบ scope ด้วย
+        let (result, _) = login_with(&server, &store, "srv", Some("admin"), Duration::from_secs(10), |target| vec![target]);
+        result.unwrap();
+        let last = server.read(|s| s.authorize_requests.last().cloned().unwrap());
+        assert_eq!(last["scope"], "read write offline_access admin");
+        assert_eq!(server.read(|s| s.registrations.len()), 2);
+    }
+
+    #[test]
+    fn scope_selection_order() {
+        let list = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let supported = list(&["a", "b"]);
+        assert_eq!(select_oauth_scope(Some("x y"), Some(&supported), None, None, None).as_deref(), Some("x y"));
+        assert_eq!(select_oauth_scope(None, Some(&supported), None, None, None).as_deref(), Some("a b"));
+        assert_eq!(select_oauth_scope(Some("  "), Some(&supported), None, None, None).as_deref(), Some("a b"));
+        assert_eq!(select_oauth_scope(None, None, None, None, None), None);
+        // ไม่มี scope อื่น: ไม่ส่ง offline_access ตัวเดียว
+        assert_eq!(select_oauth_scope(None, None, Some(&list(&["offline_access"])), None, None), None);
+        assert_eq!(select_oauth_scope(Some("x"), None, None, Some("old x"), Some("new")).as_deref(), Some("old x new"));
+    }
+
+    #[test]
+    fn auth_method_prefers_a_public_client() {
+        let list = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(choose_client_auth_method(None), "none");
+        assert_eq!(choose_client_auth_method(Some(&list(&["client_secret_basic", "none"]))), "none");
+        assert_eq!(choose_client_auth_method(Some(&list(&["client_secret_basic", "client_secret_post"]))), "client_secret_post");
+        assert_eq!(choose_client_auth_method(Some(&list(&["client_secret_basic"]))), "client_secret_basic");
+        assert_eq!(choose_client_auth_method(Some(&list(&["private_key_jwt"]))), "none");
+    }
+
+    #[test]
+    fn parses_bearer_challenges_as_real_servers_send_them() {
+        let notion = parse_bearer_challenge("Bearer realm=\"OAuth\", resource_metadata=\"https://mcp.notion.com/.well-known/oauth-protected-resource/mcp\", scope=\"default\"").unwrap();
+        assert_eq!(notion.scope.as_deref(), Some("default"));
+        assert_eq!(notion.resource_metadata.as_deref(), Some("https://mcp.notion.com/.well-known/oauth-protected-resource/mcp"));
+
+        let figma = parse_bearer_challenge("Bearer resource_metadata=\"https://mcp.figma.com/.well-known/oauth-protected-resource\",scope=\"mcp:connect\",authorization_uri=\"https://api.figma.com/x\"").unwrap();
+        assert_eq!(figma.scope.as_deref(), Some("mcp:connect"));
+
+        let step_up = parse_bearer_challenge("bearer error=\"insufficient_scope\", scope=\"files:write files:read\", error_description=\"a, b \\\"c\\\"\"").unwrap();
+        assert_eq!(step_up.error.as_deref(), Some("insufficient_scope"));
+        assert_eq!(step_up.scope.as_deref(), Some("files:write files:read"));
+
+        let unquoted = parse_bearer_challenge("Bearer error=invalid_token").unwrap();
+        assert_eq!(unquoted.error.as_deref(), Some("invalid_token"));
+
+        let spaced = parse_bearer_challenge("Bearer scope = \"a b\"").unwrap();
+        assert_eq!(spaced.scope.as_deref(), Some("a b"));
+
+        // scheme อื่นปนมา: อ่านเฉพาะของ Bearer
+        let mixed = parse_bearer_challenge("Basic realm=\"x\", scope=\"wrong\", Bearer scope=\"right\", Negotiate abc==").unwrap();
+        assert_eq!(mixed.scope.as_deref(), Some("right"));
+
+        assert_eq!(parse_bearer_challenge("Bearer"), Some(AuthChallenge::default()));
+        assert_eq!(parse_bearer_challenge("Basic realm=\"x\""), None);
+        assert_eq!(parse_bearer_challenge(""), None);
+    }
+
+    #[test]
+    fn builds_well_known_urls_in_the_order_the_spec_lists() {
+        let url = |raw: &str| url::Url::parse(raw).unwrap();
+        assert_eq!(
+            protected_resource_candidates(&url("https://example.com/public/mcp")),
+            vec!["https://example.com/.well-known/oauth-protected-resource/public/mcp", "https://example.com/.well-known/oauth-protected-resource"]
+        );
+        assert_eq!(protected_resource_candidates(&url("https://example.com")), vec!["https://example.com/.well-known/oauth-protected-resource"]);
+        assert_eq!(
+            protected_resource_candidates(&url("https://mcp.supabase.com/mcp?read_only=true"))[0],
+            "https://mcp.supabase.com/.well-known/oauth-protected-resource/mcp?read_only=true"
+        );
+        assert_eq!(
+            authorization_server_candidates(&url("https://auth.example.com/tenant1")),
+            vec![
+                "https://auth.example.com/.well-known/oauth-authorization-server/tenant1",
+                "https://auth.example.com/.well-known/openid-configuration/tenant1",
+                "https://auth.example.com/tenant1/.well-known/openid-configuration",
+            ]
+        );
+        assert_eq!(
+            authorization_server_candidates(&url("https://auth.example.com/")),
+            vec!["https://auth.example.com/.well-known/oauth-authorization-server", "https://auth.example.com/.well-known/openid-configuration"]
+        );
+    }
+
+    #[test]
+    fn tokens_with_control_characters_are_refused() {
+        let server = MockServer::start();
+        let mut record = sample_record(&server);
+        let response = TokenResponse {
+            access_token: Some("good\r\nX-Injected: 1".to_string()),
+            token_type: Some("Bearer".to_string()),
+            expires_in: None,
+            refresh_token: None,
+            scope: None,
+            error: None,
+            error_description: None,
+        };
+        assert!(apply_token_response(&mut record, response, 0).is_err());
+
+        let lifetime = TokenResponse {
+            access_token: Some("good".to_string()),
+            token_type: Some("bearer".to_string()),
+            expires_in: Some(serde_json::json!("120")),
+            refresh_token: None,
+            scope: None,
+            error: None,
+            error_description: None,
+        };
+        apply_token_response(&mut record, lifetime, 1000).unwrap();
+        assert_eq!(record.expires_at, Some(1120));
+        // ไม่ได้ refresh token ใหม่ = เก็บตัวเดิม
+        assert_eq!(record.refresh_token.as_deref(), Some("refresh-seed"));
+
+        let not_bearer = TokenResponse {
+            access_token: Some("good".to_string()),
+            token_type: Some("mac".to_string()),
+            expires_in: None,
+            refresh_token: None,
+            scope: None,
+            error: None,
+            error_description: None,
+        };
+        assert!(apply_token_response(&mut record, not_bearer, 0).is_err());
+    }
+
+    #[test]
+    fn invalid_client_at_the_token_endpoint_registers_again_next_time() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        login(&server, &store, "srv");
+        server.set(|s| s.token_failure = Some((401, r#"{"error":"invalid_client"}"#)));
+        let (result, _) = login_with(&server, &store, "srv", None, Duration::from_secs(10), |target| vec![target]);
+        assert!(result.unwrap_err().starts_with(OAUTH_ERR_TOKEN));
+        server.set(|s| s.token_failure = None);
+        login(&server, &store, "srv");
+        assert_eq!(server.read(|s| s.registrations.len()), 2);
+    }
+
+    #[test]
+    fn signed_in_status_follows_the_stored_record() {
+        let server = MockServer::start();
+        let store = MemoryStore::default();
+        assert!(!oauth_status_of(&store, "srv", &server.url()).unwrap().signed_in);
+        login(&server, &store, "srv");
+        let status = oauth_status_of(&store, "srv", &server.url()).unwrap();
+        assert!(status.signed_in);
+        assert_eq!(status.scope.as_deref(), Some("files:read"));
+        // access token หมดอายุแต่ยังต่ออายุได้ = ยังถือว่าล็อกอินอยู่
+        let mut record = oauth_load(&store, "srv").unwrap().unwrap();
+        record.expires_at = Some(now_secs() - 1);
+        oauth_save(&store, "srv", &record).unwrap();
+        assert!(oauth_status_of(&store, "srv", &server.url()).unwrap().signed_in);
+    }
+
+    #[test]
+    fn server_names_are_validated_before_touching_the_vault() {
+        let store = MemoryStore::default();
+        assert!(oauth_load(&store, "../other").is_err());
+        assert!(oauth_delete(&store, "a.b").is_err());
+        assert!(oauth_bearer(&store, "", "https://example.com").is_err());
     }
 }

@@ -73,6 +73,36 @@ export interface FileEdit {
   replace_all?: boolean;
 }
 
+/** `WWW-Authenticate: Bearer ...` ของ response 401/403 ที่ฝั่ง Rust แยกส่วนให้แล้ว */
+export interface McpAuthChallenge {
+  error: string | null;
+  scope: string | null;
+  resource_metadata: string | null;
+}
+
+export interface McpHttpResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+  auth_challenge?: McpAuthChallenge | null;
+}
+
+/** สถานะการล็อกอินของ MCP server — token อยู่ฝั่ง Rust เท่านั้น ไม่มีวันอยู่ใน object นี้ */
+export interface McpOauthStatus {
+  signed_in: boolean;
+  /** unix seconds */
+  expires_at: number | null;
+  can_refresh: boolean;
+  issuer: string | null;
+  scope: string | null;
+}
+
+/** ข้อความในหน้าเว็บที่เบราว์เซอร์แสดงหลังล็อกอินเสร็จ */
+export interface McpOauthPages {
+  success: string;
+  failure: string;
+}
+
 export const tauriBridge = {
   async getInitialEnv(): Promise<{ cwd: string; apiKey: string; keys?: Record<string, string>; platform: string }> {
     try {
@@ -106,14 +136,37 @@ export const tauriBridge = {
     await invoke('mcp_stop', { id });
   },
 
-  /** POST ผ่าน Rust (ไม่ติด CORS) — `${VAR}` ใน url/header ถูกแทนด้วย environment variable */
+  /**
+   * POST ผ่าน Rust (ไม่ติด CORS) — `${VAR}` ใน url/header ถูกแทนด้วย environment variable
+   * oauthKey = server ใช้ OAuth: ฝั่ง Rust ใส่ Authorization และต่ออายุ token เอง
+   */
   async mcpHttpRequest(
     url: string,
     headers: Record<string, string>,
     body: string,
-    timeoutMs?: number
-  ): Promise<{ status: number; headers: Record<string, string>; body: string }> {
-    return await invoke('mcp_http_request', { url, headers, body, timeoutMs });
+    timeoutMs?: number,
+    oauthKey?: string
+  ): Promise<McpHttpResponse> {
+    return await invoke('mcp_http_request', { url, headers, body, timeoutMs, oauthKey });
+  },
+
+  /** เปิดเบราว์เซอร์ของระบบให้ผู้ใช้ล็อกอิน แล้วรอจนกลับมา (throw รหัส OAUTH_* ถ้าไม่สำเร็จ) */
+  async mcpOauthLogin(key: string, url: string, pages: McpOauthPages, scope?: string): Promise<McpOauthStatus> {
+    return await invoke('mcp_oauth_login', { key, url, pages, scope });
+  },
+
+  /** หยุดรอการล็อกอินที่ค้างอยู่ */
+  async mcpOauthCancel(key: string): Promise<void> {
+    await invoke('mcp_oauth_cancel', { key });
+  },
+
+  /** ลบ token และ client ที่ลงทะเบียนไว้ของ server นี้ */
+  async mcpOauthLogout(key: string): Promise<void> {
+    await invoke('mcp_oauth_logout', { key });
+  },
+
+  async mcpOauthStatus(key: string, url: string): Promise<McpOauthStatus> {
+    return await invoke('mcp_oauth_status', { key, url });
   },
 
   async onMcpEvent(

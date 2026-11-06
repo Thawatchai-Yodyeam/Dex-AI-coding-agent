@@ -28,7 +28,7 @@ Works with many providers (Claude · GPT · Gemini · DeepSeek · Qwen · Ollama
 | 🛠️ **Works on real files** | Reads long files in pages with line numbers, makes several edits at once, searches with regex or glob, and runs PowerShell, with a diff to review before you approve. |
 | ⏱️ **Long and background commands** | Timeouts of up to 30 minutes, and dev servers can run in the background (stop them from the Terminal). |
 | 🧩 **Skills and MCP** | Loads specialised instructions from `SKILL.md` and connects to MCP servers (stdio or HTTP) using a Claude Desktop style config. |
-| 🛍️ **Customizations** | A marketplace in the sidebar for installing ready-made MCP servers and skills, with their keys kept in Credential Manager. |
+| 🛍️ **Customizations** | A marketplace in the sidebar for installing ready-made MCP servers and skills. Hosted servers sign in with your browser, and keys and tokens stay in Credential Manager. |
 | ↩️ **Undo file edits** | The **Undo file changes** button (or `/undo`) reverts files changed by tools and, if the workspace is a git repo, by shell commands too. |
 | 🔁 **Regenerate and edit** | Regenerate an answer, or edit an earlier message and resend from there. The agent still remembers the tools it used in earlier turns. |
 | 💾 **Picks up where you left off** | Full history, including tool results, is saved per chat, so you can switch chats or reopen the app and keep working. |
@@ -123,6 +123,7 @@ Go to ⚙️ Settings → Skills and MCP and paste a config in the same format a
 ```
 
 - `${NAME}` in args, env, url and headers is replaced by a key saved in Customizations or by an environment variable, so tokens need not be kept in settings.
+- Remote servers that support it can sign in with your browser instead: use `{ "type": "http", "url": "https://…", "auth": "oauth" }` and press **Sign in** next to the server. This follows the [MCP authorization spec](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization) with dynamic client registration, so a server must offer a `registration_endpoint`. For CI, keep using a token in `headers`.
 - MCP tools are named `mcp__<server>__<tool>` and **always ask before running**, except those that declare `readOnlyHint` in Auto-Pilot mode or have an allow rule of type *MCP tool*.
 - stdio and Streamable HTTP are supported (the older SSE transport is not). Connection status and errors appear on the settings page.
 
@@ -134,9 +135,10 @@ Open **Customizations** in the sidebar to browse the **Marketplace** and manage 
 - **MCP plugins** add an entry to the same config as ⚙️ Settings → Skills and MCP, so you can still edit them there. Their tools ask before running under the usual rules.
 - **Skill plugins** write `~/.dex/skills/<name>/SKILL.md`. They contain instructions only, and nothing runs. Dex never overwrites or deletes a skill you wrote yourself.
 - **Keys** go to Windows Credential Manager as `mcp-secret-<NAME>`, and the config stores only `${NAME}`. A saved key takes priority over an environment variable of the same name. Uninstalling a plugin deletes its keys.
+- **Sign-in:** plugins marked `auth: 'oauth'` open your system browser when you install them, so there is no key to create. Tokens go to Credential Manager as `mcp-oauth.<server>.<part>`, split into parts because one entry holds at most 2,560 bytes. Rust adds the `Authorization` header itself, and uninstalling or signing out deletes the tokens from this computer. To remove the access completely, do it in the settings of that service.
 - **Requirements:** `npx` plugins need [Node.js](https://nodejs.org/) and `uvx` plugins need [uv](https://docs.astral.sh/uv/getting-started/installation/). Remote plugins and skills need neither.
 
-To add a plugin, add it to `src/services/marketplace/catalog.ts`. `marketplace.test.ts` checks that its config parses and that it declares the keys it uses. Pass keys through `env` or `headers`, never `args`, because other programs on the computer can read process arguments.
+To add a plugin, add it to `src/services/marketplace/catalog.ts`. `marketplace.test.ts` checks that its config parses and that it declares the keys it uses. Pass keys through `env` or `headers`, never `args`, because other programs on the computer can read process arguments. Use `remoteOauth` only after checking the vendor's docs and its live metadata for `registration_endpoint` and `S256`.
 
 ### Project instructions (`DEX.md`)
 
@@ -192,6 +194,7 @@ Dex edits real files on your machine, so it has several layers of protection:
 - **In-app browser:** pages in the pane cannot call Dex's commands (Tauri blocks external origins), and the pane cannot open Dex's own pages or `file://`. localhost opens straight away in Auto-Pilot, other sites ask first under the same domain rules as `web_fetch`, and running JavaScript on pages other than localhost needs approval every time.
 - **Dex Design:** AI-written design pages open from a `127.0.0.1` server as an external origin, so they cannot call Dex's commands. You type comments in the app, not in the page, so a page cannot write requests on your behalf, and text from the page reaches the model marked as data. The server serves only project files through a URL with a random token, and a CSP stops pages sending data out with `fetch` or forms (images, fonts and libraries can still load from CDNs). File writes follow the same permission rules and Supervised mode as normal edits.
 - **API keys:** stored in Windows Credential Manager, not localStorage.
+- **MCP sign-in:** the whole OAuth flow runs in Rust, so the webview never receives a token and cannot choose where a refresh token is sent. The browser redirect is received on `127.0.0.1` only and any request with a wrong `state` is discarded. A token is sent only to the resource it was issued for, never over plain HTTP to another computer, and never along a redirect. Addresses that a server sends for sign-in must be `https`, so a server cannot make Dex open a `file:` or similar link.
 
 ## 🧩 Architecture
 
@@ -252,6 +255,7 @@ src/
       config.ts             reads Claude Desktop style config
       client.ts             JSON-RPC client + stdio / Streamable HTTP transports
       manager.ts            starts/stops servers, merges tools as mcp__server__tool
+      oauth.ts              sign-in helpers for the UI (the tokens themselves stay in Rust)
     marketplace/
       catalog.ts            the plugins in the Marketplace (data only)
       skillPacks.ts         instructions of the skills that ship with the Marketplace

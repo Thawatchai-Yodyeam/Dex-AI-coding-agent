@@ -2136,6 +2136,18 @@ pre,
   color: var(--danger, #c0392b);
 }
 
+.ext-status.is-auth {
+  color: var(--warning, #b7791f);
+}
+
+.mcp-signin {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
 .mcp-errors {
   margin: 0;
   padding-left: 18px;
@@ -3759,6 +3771,29 @@ pre,
 
 .plugin-secrets .field-hint {
   margin: 0 0 10px;
+}
+
+.plugin-oauth .field-hint {
+  margin: 0 0 8px;
+}
+
+.plugin-oauth-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.plugin-oauth-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.plugin-oauth-scope {
+  overflow-wrap: anywhere;
 }
 
 .plugin-secret + .plugin-secret {

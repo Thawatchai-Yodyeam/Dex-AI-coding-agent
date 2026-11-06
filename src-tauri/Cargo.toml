@@ -29,6 +29,9 @@ url = "2"
 base64 = "0.22"
 include_dir = "0.7"
 uuid = { version = "1", features = ["v4"] }
+# PKCE และ state ของ OAuth — ทั้งสองตัวอยู่ใน dependency tree อยู่แล้ว
+sha2 = "0.10"
+getrandom = "0.3"
 
 # เรียก DevTools protocol ของ WebView2 ใน browser pane — ต้องเป็นเวอร์ชันเดียวกับที่ wry ใช้
 [target.'cfg(windows)'.dependencies]
