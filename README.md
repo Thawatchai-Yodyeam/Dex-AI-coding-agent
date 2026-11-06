@@ -137,9 +137,10 @@ Open **Customizations** in the sidebar to browse the **Marketplace** and manage 
 - **Tool limits:** OpenAI refuses more than 128 tools in a request and the Gemini API more than 512. Other providers document no fixed limit. Dex does not block a request itself, because limits change. When a provider refuses the tool list, the chat explains how many tools to turn off instead of showing the raw API error.
 - **Skill plugins** write `~/.dex/skills/<name>/SKILL.md`. They contain instructions only, and nothing runs. Dex never overwrites or deletes a skill you wrote yourself.
 - **Keys** go to Windows Credential Manager as `mcp-secret-<NAME>`, and the config stores only `${NAME}`. A saved key takes priority over an environment variable of the same name. Uninstalling a plugin deletes its keys.
-- **Requirements:** `npx` plugins need [Node.js](https://nodejs.org/) and `uvx` plugins need [uv](https://docs.astral.sh/uv/getting-started/installation/). Remote plugins and skills need neither.
+- **Requirements:** `npx` plugins need [Node.js](https://nodejs.org/) and `uvx` plugins need [uv](https://docs.astral.sh/uv/getting-started/installation/). Remote plugins and skills need neither. Dex checks for the program before you install, and you need to reopen Dex after installing one so it can see the new `PATH`.
+- **Versions:** `npx` and `uvx` plugins run an exact package version, because servers start on their own each time Dex opens. When a newer Dex ships a new version, the plugin shows **Update** with the old and new command. Nothing updates until you choose it, and your enabled or disabled setting stays as it was. Pinning covers the plugin's own package; `npx` and `uvx` may still resolve its dependencies to newer versions.
 
-To add a plugin, add it to `src/services/marketplace/catalog.ts`. `marketplace.test.ts` checks that its config parses and that it declares the keys it uses. Pass keys through `env` or `headers`, never `args`, because other programs on the computer can read process arguments.
+To add a plugin, add it to `src/services/marketplace/catalog.ts`. `marketplace.test.ts` checks that its config parses, that it declares the keys it uses and that it pins a version. Pass keys through `env` or `headers`, never `args`, because other programs on the computer can read process arguments. When you change a version, check flags and variable names in that release's package, since a repository's README can describe changes that are not released yet.
 
 ### Project instructions (`DEX.md`)
 
