@@ -236,6 +236,25 @@ export const tauriBridge = {
     await invoke('delete_chat_session', { sessionId });
   },
 
+  /** checkpoint ของหนึ่งเทิร์น (JSON) — หนึ่งไฟล์ต่อข้อความ assistant ในโฟลเดอร์ของแชท */
+  async saveCheckpoint(sessionId: string, messageId: string, data: string): Promise<void> {
+    await invoke('save_checkpoint', { sessionId, messageId, data });
+  },
+
+  /** JSON ของ checkpoint ทุกเทิร์นในแชท (ไม่เรียงลำดับ) */
+  async loadCheckpoints(sessionId: string): Promise<string[]> {
+    return await invoke('load_checkpoints', { sessionId });
+  },
+
+  async deleteCheckpoint(sessionId: string, messageId: string): Promise<void> {
+    await invoke('delete_checkpoint', { sessionId, messageId });
+  },
+
+  /** ลบ checkpoint ทั้งแชท (ตอนลบ/ล้างแชท) */
+  async deleteCheckpoints(sessionId: string): Promise<void> {
+    await invoke('delete_checkpoints', { sessionId });
+  },
+
   async checkSecurity(
     command: string,
     workspace?: string

@@ -297,14 +297,22 @@ describe('executeTool file checkpoints', () => {
 
   function setup() {
     const checkpoints: [string, string | null | undefined][] = [];
+    const sensitive: string[] = [];
     const callbacks: AgentCallbacks = {
       onTextChunk: () => {},
       onToolStart: () => {},
       onToolUpdate: () => {},
       onRequestApproval: async () => 'once',
-      onFileCheckpoint: (path, original) => checkpoints.push([path, original]),
+      onFileCheckpoint: (path, original, isSensitive) => {
+        checkpoints.push([path, original]);
+        if (isSensitive) sensitive.push(path);
+      },
     };
-    return { checkpoints, run: (name: string, args: Record<string, any>) => executeTool(name, args, settings, callbacks) };
+    return {
+      checkpoints,
+      sensitive,
+      run: (name: string, args: Record<string, any>) => executeTool(name, args, settings, callbacks),
+    };
   }
 
   beforeEach(() => vi.clearAllMocks());
@@ -331,12 +339,32 @@ describe('executeTool file checkpoints', () => {
   });
 
   it('asks for sensitive-file approval before snapshotting it', async () => {
-    const { checkpoints, run } = setup();
-    bridge.snapshotFile.mockRejectedValueOnce('SENSITIVE_FILE: secret');
+    const { checkpoints, sensitive, run } = setup();
+    // ครั้งแรกก่อนอนุมัติ และครั้งที่ลองแบบไม่แตะไฟล์ลับหลังอนุมัติ ต่างก็ถูกปฏิเสธ
+    bridge.snapshotFile.mockRejectedValueOnce('SENSITIVE_FILE: secret').mockRejectedValueOnce('SENSITIVE_FILE: secret');
     await run('write_file', { path: '.env', content: 'x' });
     expect(bridge.snapshotFile).toHaveBeenLastCalledWith('D:\\proj/.env', 'D:\\proj', true);
     expect(checkpoints).toEqual([['D:\\proj/.env', 'before']]);
+    expect(sensitive).toEqual(['D:\\proj/.env']);
     expect(bridge.writeFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not mark an ordinary file as sensitive because an exact allow rule trusts it', async () => {
+    const { checkpoints, sensitive } = setup();
+    const trusting = { ...settings, permissionRules: [{ id: 'r', tool: 'edit', pattern: 'a.ts', action: 'allow' }] } as unknown as AppSettings;
+    const callbacks: AgentCallbacks = {
+      onTextChunk: () => {},
+      onToolStart: () => {},
+      onToolUpdate: () => {},
+      onRequestApproval: async () => 'once',
+      onFileCheckpoint: (path, original, isSensitive) => {
+        checkpoints.push([path, original]);
+        if (isSensitive) sensitive.push(path);
+      },
+    };
+    await executeTool('write_file', { path: 'a.ts', content: 'x' }, trusting, callbacks);
+    expect(checkpoints).toEqual([['D:\\proj/a.ts', 'before']]);
+    expect(sensitive).toEqual([]);
   });
 });
 

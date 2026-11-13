@@ -41,7 +41,7 @@ interface ChatMessageItemProps {
   isStreaming?: boolean;
   onApproveTool?: (toolId: string, decision: Exclude<ApprovalDecision, 'reject'>) => void;
   onRejectTool?: (toolId: string) => void;
-  /** มี checkpoint ในหน่วยความจำให้ย้อน */
+  /** มี checkpoint ของเทิร์นนี้ให้ย้อน */
   canUndo?: boolean;
   onUndo?: (messageId: string) => void;
   /** มีเฉพาะคำตอบล่าสุดตอนที่ไม่ได้รันอยู่ */

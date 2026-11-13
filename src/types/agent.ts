@@ -182,7 +182,7 @@ export interface ChatMessage {
   tokenUsage?: TokenUsage;
   durationMs?: number;
   isError?: boolean;
-  /** ไฟล์ที่ agent แก้ในเทิร์นนี้ (เนื้อหาเดิมเก็บในหน่วยความจำ — undo ได้เฉพาะระหว่างที่แอปยังเปิดอยู่) */
+  /** ไฟล์ที่ agent แก้ในเทิร์นนี้ (เนื้อหาเดิมอยู่ใน checkpointStore — ย้อนได้แม้เปิดแอปใหม่ จนกว่าจะหมดอายุ) */
   checkpoint?: TurnCheckpointInfo;
   /** รูปที่แนบมากับข้อความผู้ใช้ — `data` ไม่ถูกบันทึกลงเครื่อง (ดู stripImageData) */
   images?: ImageAttachment[];

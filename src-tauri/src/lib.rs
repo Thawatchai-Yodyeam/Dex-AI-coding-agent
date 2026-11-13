@@ -3358,6 +3358,69 @@ async fn delete_chat_session(app: AppHandle, session_id: String) -> Result<(), S
     delete_session_file(&app, CHATS_DIR, &session_id)
 }
 
+// 7.3 checkpoint ของแต่ละเทิร์น (เนื้อหาไฟล์ก่อน agent แก้) — checkpoints/<session>/<message>.json
+// แยกไฟล์ต่อเทิร์น: เทิร์นที่แก้หลายไฟล์ถูกเขียนซ้ำเฉพาะของตัวเอง และลบทั้งแชทได้ด้วยการลบโฟลเดอร์เดียว
+const CHECKPOINTS_DIR: &str = "checkpoints";
+
+fn checkpoint_dir(root: &Path, session_id: &str) -> Result<PathBuf, String> {
+    if !valid_provider_id(session_id) {
+        return Err(format!("session id ไม่ถูกต้อง: {}", session_id));
+    }
+    Ok(root.join(session_id))
+}
+
+fn checkpoint_path(root: &Path, session_id: &str, message_id: &str) -> Result<PathBuf, String> {
+    if !valid_provider_id(message_id) {
+        return Err(format!("message id ไม่ถูกต้อง: {}", message_id));
+    }
+    Ok(checkpoint_dir(root, session_id)?.join(format!("{}.json", message_id)))
+}
+
+fn write_checkpoint(root: &Path, session_id: &str, message_id: &str, data: &str) -> Result<(), String> {
+    let path = checkpoint_path(root, session_id, message_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("สร้างโฟลเดอร์ไม่สำเร็จ: {}", e))?;
+    }
+    write_atomic(&path, data.as_bytes()).map_err(|e| format!("บันทึก checkpoint ไม่สำเร็จ: {}", e))
+}
+
+fn remove_checkpoint(root: &Path, session_id: &str, message_id: &str) -> Result<(), String> {
+    match fs::remove_file(checkpoint_path(root, session_id, message_id)?) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("ลบ checkpoint ไม่สำเร็จ: {}", e)),
+    }
+}
+
+fn remove_checkpoints(root: &Path, session_id: &str) -> Result<(), String> {
+    match fs::remove_dir_all(checkpoint_dir(root, session_id)?) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("ลบ checkpoint ไม่สำเร็จ: {}", e)),
+    }
+}
+
+// async = ไม่รันบน main thread — checkpoint หนึ่งเทิร์นอาจมีเนื้อหาไฟล์หลาย MB
+#[tauri::command]
+async fn save_checkpoint(app: AppHandle, session_id: String, message_id: String, data: String) -> Result<(), String> {
+    write_checkpoint(&app_data_subdir(&app, CHECKPOINTS_DIR)?, &session_id, &message_id, &data)
+}
+
+#[tauri::command]
+async fn load_checkpoints(app: AppHandle, session_id: String) -> Result<Vec<String>, String> {
+    Ok(read_json_files(&checkpoint_dir(&app_data_subdir(&app, CHECKPOINTS_DIR)?, &session_id)?))
+}
+
+#[tauri::command]
+async fn delete_checkpoint(app: AppHandle, session_id: String, message_id: String) -> Result<(), String> {
+    remove_checkpoint(&app_data_subdir(&app, CHECKPOINTS_DIR)?, &session_id, &message_id)
+}
+
+#[tauri::command]
+async fn delete_checkpoints(app: AppHandle, session_id: String) -> Result<(), String> {
+    remove_checkpoints(&app_data_subdir(&app, CHECKPOINTS_DIR)?, &session_id)
+}
+
 // 8. เปิดหน้าต่างเลือกโฟลเดอร์แบบ Native บน Windows
 // เป็น async command: คำสั่ง sync ของ Tauri รันบน main thread ซึ่งจะทำให้ UI ค้างตลอดเวลาที่ dialog เปิดอยู่
 #[tauri::command]
@@ -4182,6 +4245,10 @@ pub fn run() {
             save_chat_session,
             load_chat_sessions,
             delete_chat_session,
+            save_checkpoint,
+            load_checkpoints,
+            delete_checkpoint,
+            delete_checkpoints,
             select_folder,
             edit_file,
             snapshot_file,
@@ -4788,6 +4855,38 @@ mod tests {
         assert!(snapshot_file(ws.join(".env").to_string_lossy().to_string(), ws_str, None).is_err());
 
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn checkpoints_are_stored_per_turn_and_removed_per_chat() {
+        let root = std::env::temp_dir().join(format!("dex_ckpt_store_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+
+        write_checkpoint(&root, "session-1", "asst-1", "{\"a\":1}").unwrap();
+        write_checkpoint(&root, "session-1", "asst-2", "{\"a\":2}").unwrap();
+        write_checkpoint(&root, "session-1", "asst-2", "{\"a\":3}").unwrap();
+        write_checkpoint(&root, "session-2", "asst-9", "{\"a\":9}").unwrap();
+
+        let mut loaded = read_json_files(&checkpoint_dir(&root, "session-1").unwrap());
+        loaded.sort();
+        assert_eq!(loaded, vec!["{\"a\":1}", "{\"a\":3}"]);
+
+        remove_checkpoint(&root, "session-1", "asst-1").unwrap();
+        remove_checkpoint(&root, "session-1", "asst-1").unwrap();
+        assert_eq!(read_json_files(&checkpoint_dir(&root, "session-1").unwrap()), vec!["{\"a\":3}"]);
+
+        remove_checkpoints(&root, "session-1").unwrap();
+        remove_checkpoints(&root, "session-1").unwrap();
+        assert!(read_json_files(&checkpoint_dir(&root, "session-1").unwrap()).is_empty());
+        assert_eq!(read_json_files(&checkpoint_dir(&root, "session-2").unwrap()).len(), 1);
+
+        // id ที่พาออกนอกโฟลเดอร์ต้องถูกปฏิเสธ
+        assert!(write_checkpoint(&root, "..", "asst-1", "x").is_err());
+        assert!(write_checkpoint(&root, "session-1", "../../evil", "x").is_err());
+        assert!(remove_checkpoints(&root, "..").is_err());
+        assert!(remove_checkpoints(&root, "").is_err());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

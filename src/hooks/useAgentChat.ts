@@ -1,5 +1,12 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import { tauriBridge } from '../services/tauriBridge';
+import {
+  deleteCheckpoint,
+  loadCheckpoints,
+  newCheckpoint,
+  saveCheckpoint,
+  type TurnCheckpoint,
+} from '../services/checkpointStore';
 import { AgentAbortError, type MultiProviderAgentService } from '../services/agent';
 import type {
   AppSettings,
@@ -46,7 +53,7 @@ export interface UseAgentChatReturn {
   handleStopExecution: () => void;
   handleApproveTool: (toolId: string, decision?: Exclude<ApprovalDecision, 'reject'>) => void;
   handleRejectTool: (toolId: string) => void;
-  /** มี checkpoint ในหน่วยความจำให้ย้อนได้หรือไม่ */
+  /** มี checkpoint ของเทิร์นนี้ให้ย้อนได้หรือไม่ (รวมที่โหลดกลับมาจากดิสก์หลังเปิดแอปใหม่) */
   canUndoTurn: (messageId: string) => boolean;
   /** ย้อนไฟล์ทั้งหมดที่ agent แก้ ตั้งแต่เทิร์นนี้ถึงเทิร์นล่าสุด */
   handleUndoTurn: (messageId: string) => Promise<void>;
@@ -62,17 +69,6 @@ export interface UseAgentChatReturn {
 export interface BackgroundCommand {
   id: string;
   command: string;
-}
-
-/** เนื้อหาเดิมของไฟล์ก่อนเทิร์นหนึ่งแก้ (null = ไฟล์ใหม่) */
-interface TurnCheckpoint {
-  cwd: string;
-  originals: Map<string, string | null>;
-  /**
-   * git snapshot ก่อนคำสั่ง shell ตัวแรกของเทิร์น — ย้อนแล้วได้สภาพก่อน shell ทั้ง workspace
-   * `pathsBefore` = ไฟล์ที่ tool แก้ไปก่อน snapshot (ต้องย้อนต่อจาก snapshot อีกชั้นถึงจะได้สภาพก่อนเทิร์น)
-   */
-  git?: { tree: string; pathsBefore: Set<string> };
 }
 
 const STREAM_FLUSH_MS = 40;
@@ -127,8 +123,10 @@ export function useAgentChat({
   const activeCommandIdRef = useRef<string | null>(null);
   const approvalResolversRef = useRef<Map<string, (decision: ApprovalDecision) => void>>(new Map());
   const abortControllerRef = useRef<AbortController | null>(null);
-  // checkpoint ต่อข้อความ assistant — อยู่ในหน่วยความจำเท่านั้น (เนื้อหาไฟล์ใหญ่เกิน localStorage)
+  // checkpoint ต่อข้อความ assistant — สำเนาอยู่บนดิสก์ด้วย (checkpointStore) จึงย้อนได้หลังปิดแอปหรือแอปล่ม
   const checkpointsRef = useRef<Map<string, TurnCheckpoint>>(new Map());
+  // canUndoTurn อ่านจาก ref — ต้อง render ใหม่เมื่อ checkpoint จากดิสก์โหลดเสร็จ
+  const [, setCheckpointsLoaded] = useState(0);
   // ข้อความแจ้ง agent ที่จะแนบไปกับ prompt ถัดไป (เช่น ผู้ใช้ย้อนไฟล์แล้ว) — ไม่แสดงใน UI
   const pendingAgentNotesRef = useRef<string[]>([]);
   const messagesRef = useRef(messages);
@@ -163,6 +161,22 @@ export function useAgentChat({
   const handleRejectTool = useCallback((toolId: string) => resolveApproval(toolId, 'reject'), [resolveApproval]);
 
   const canUndoTurn = useCallback((messageId: string) => checkpointsRef.current.has(messageId), []);
+
+  // โหลด checkpoint ของแชทที่เปิดอยู่ — ของที่อยู่ในหน่วยความจำแล้วใหม่กว่าเสมอ (รวมไฟล์ลับที่ไม่ได้ลงดิสก์)
+  useEffect(() => {
+    let cancelled = false;
+    loadCheckpoints(sessionId)
+      .then((list) => {
+        if (cancelled) return;
+        const fresh = list.filter((c) => !checkpointsRef.current.has(c.messageId));
+        for (const c of fresh) checkpointsRef.current.set(c.messageId, c);
+        if (fresh.length > 0) setCheckpointsLoaded((n) => n + 1);
+      })
+      .catch((e) => console.warn('Failed to load checkpoints:', e));
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
 
   const appendAssistantNote = (content: string, isError = false) =>
     setMessages((prev) => [...prev, { id: `msg-${Date.now()}`, role: 'assistant', content, timestamp: Date.now(), isError }]);
@@ -202,7 +216,14 @@ export function useAgentChat({
           failures.push(`\`${path}\`: ${err?.message || String(err)}`);
         }
       }
+      // ไฟล์ลับไม่ถูกเขียนลงดิสก์ — หลังเปิดแอปใหม่จึงไม่มีเนื้อหาเดิมให้ย้อน
+      for (const path of ckpt.lost) {
+        failures.push(
+          `\`${path}\`: ${settings.language === 'en' ? 'secret file, its earlier content was not saved to disk' : 'ไฟล์ลับ ไม่ได้บันทึกเนื้อหาเดิมลงดิสก์'}`
+        );
+      }
       checkpointsRef.current.delete(m.id);
+      void deleteCheckpoint(ckpt);
     }
 
     const revertedIds = new Set(turns.map((m) => m.id));
@@ -258,7 +279,9 @@ export function useAgentChat({
     }
     if (prompt === '/undo') {
       setInputPrompt('');
-      const last = [...messagesRef.current].reverse().find((m) => checkpointsRef.current.has(m.id));
+      const last = [...messagesRef.current]
+        .reverse()
+        .find((m) => checkpointsRef.current.has(m.id) && !m.checkpoint?.revertedAt);
       if (last) await handleUndoTurn(last.id);
       else appendAssistantNote(settings.language === 'en' ? 'Nothing to undo.' : 'ไม่มีการแก้ไฟล์ให้ย้อน');
       return;
@@ -314,12 +337,15 @@ export function useAgentChat({
       setMessages((prev) => prev.map((msg) => (msg.id === assistantMsgId ? fn(msg) : msg)));
 
     // checkpoint ของเทิร์นนี้: จำเนื้อหาก่อนการแก้ครั้งแรกของแต่ละไฟล์เท่านั้น
-    const turnCheckpoint: TurnCheckpoint = { cwd: settings.cwd, originals: new Map() };
-    const onFileCheckpoint = (path: string, original: string | null | undefined) => {
+    const turnCheckpoint = newCheckpoint(sessionId, assistantMsgId, settings.cwd, now);
+    const onFileCheckpoint = (path: string, original: string | null | undefined, sensitive = false) => {
       const skipped = original === undefined;
       if (!skipped && !turnCheckpoint.originals.has(path)) {
         turnCheckpoint.originals.set(path, original);
+        if (sensitive) turnCheckpoint.memoryOnly.add(path);
         checkpointsRef.current.set(assistantMsgId, turnCheckpoint);
+        // เขียนลงดิสก์ทันที ไม่รอจบเทิร์น — แอปล่มกลางเทิร์นคือตอนที่ต้องใช้ undo ที่สุด
+        void saveCheckpoint(turnCheckpoint);
       }
       updateAssistant((msg) => {
         const info = msg.checkpoint ?? { files: [] };
@@ -341,6 +367,7 @@ export function useAgentChat({
       if (!tree) return;
       turnCheckpoint.git = { tree, pathsBefore: new Set(turnCheckpoint.originals.keys()) };
       checkpointsRef.current.set(assistantMsgId, turnCheckpoint);
+      void saveCheckpoint(turnCheckpoint);
       updateAssistant((msg) => ({ ...msg, checkpoint: { ...(msg.checkpoint ?? { files: [] }), shell: true } }));
     };
 
@@ -528,7 +555,12 @@ export function useAgentChat({
       agent.setHistory(list.slice(0, index).map((m) => ({ role: m.role, content: m.content })));
     }
     const kept = list.slice(0, index);
-    for (const m of list.slice(index)) checkpointsRef.current.delete(m.id);
+    for (const m of list.slice(index)) {
+      const ckpt = checkpointsRef.current.get(m.id);
+      if (!ckpt) continue;
+      checkpointsRef.current.delete(m.id);
+      void deleteCheckpoint(ckpt);
+    }
     messagesRef.current = kept;
     setMessages(kept);
     await handleSendMessage(text, original.images ?? []);

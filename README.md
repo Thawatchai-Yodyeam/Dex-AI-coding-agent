@@ -29,7 +29,7 @@ Works with many providers (Claude · GPT · Gemini · DeepSeek · Qwen · Ollama
 | ⏱️ **Long and background commands** | Timeouts of up to 30 minutes, and dev servers can run in the background (stop them from the Terminal). |
 | 🧩 **Skills and MCP** | Loads specialised instructions from `SKILL.md` and connects to MCP servers (stdio or HTTP) using a Claude Desktop style config. |
 | 🛍️ **Customizations** | A marketplace in the sidebar for installing ready-made MCP servers and skills. Hosted servers sign in with your browser, and keys and tokens stay in Credential Manager. |
-| ↩️ **Undo file edits** | The **Undo file changes** button (or `/undo`) reverts files changed by tools and, if the workspace is a git repo, by shell commands too. |
+| ↩️ **Undo file edits** | The **Undo file changes** button (or `/undo`) reverts files changed by tools and, if the workspace is a git repo, by shell commands too. Checkpoints are saved to disk, so undo still works after you reopen the app or it crashes. |
 | 🔁 **Regenerate and edit** | Regenerate an answer, or edit an earlier message and resend from there. The agent still remembers the tools it used in earlier turns. |
 | 💾 **Picks up where you left off** | Full history, including tool results, is saved per chat, so you can switch chats or reopen the app and keep working. |
 | 📎 **`@file`** | Type `@` in the chat box and pick a file. Its contents are attached right away, so the agent spends no step reading it. |
@@ -163,9 +163,12 @@ The file is read again every turn, so edits apply immediately (up to 20,000 char
 - Undoing an older turn also undoes every turn after it, so files really return to their state before that turn.
 - If the workspace is a git repo, Dex takes a snapshot before the first shell command that might change files (shown as **incl. shell commands**), so undo also restores files that shell commands changed, created or deleted. The snapshot uses a temporary index, does not touch your stage, stash or branch, and skips files in `.gitignore`.
 - After an undo, the agent is told in the next turn, so it knows to read those files again.
+- Checkpoints are written to the app data folder (`checkpoints/<chat>/<turn>.json`) as soon as a file is about to change, so undo still works after you close the app or it crashes in the middle of a turn. They are deleted when you undo the turn, regenerate from it, or clear or delete the chat.
+- Saved checkpoints are kept for 7 days. Undoing an old turn overwrites what you changed in those files since then, and a turn marked **incl. shell commands** puts the whole workspace back to its snapshot, so check the date of the turn before you undo it. Git may also clean up an old snapshot, in which case only the files the agent edited with its own tools are restored.
+- The earlier content of secret files such as `.env` is kept in memory only and never written to app data. After reopening the app, undo tells you that it could not restore them.
 
 > [!NOTE]
-> Checkpoints are kept in memory, so undo is no longer possible after closing the app. Files over 5 MB and non-text files show a warning that they cannot be undone.
+> Files over 5 MB and non-text files show a warning that they cannot be undone.
 
 ### Dex Design
 
@@ -234,6 +237,7 @@ src/
   services/
     tauriBridge.ts          calls to Rust commands
     sessionStore.ts         one file per chat in app data (moved from localStorage automatically)
+    checkpointStore.ts      one file per turn with the files' earlier content, for undo after a restart
     agent/
       AgentService.ts       native per-provider history, export/restore/rewind, step limit, merges a turn's tools
       tools.ts              tool schemas + handlers + approval policy + runs read-only tools in parallel
@@ -270,7 +274,7 @@ src/
     notify.ts               Windows notifications
     i18n.ts                 Thai and English strings
 src-tauri/src/lib.rs        Rust commands: shell (timeout/background), files (sandbox, paging, multi-edit),
-                            search (regex/glob), git snapshot, keyring, skills, MCP transport, web_fetch,
+                            search (regex/glob), git snapshot, checkpoint files, keyring, skills, MCP transport, web_fetch,
                             browser pane (child webview + WebView2 DevTools protocol), design server (+ unit tests)
 ```
 

@@ -542,14 +542,22 @@ async function withSensitiveRetry<T>(
 async function checkpointBeforeWrite(env: ToolEnv, path: string, allowSensitive: boolean) {
   if (!env.callbacks.onFileCheckpoint) return;
   let original: string | null | undefined;
+  // ลองแบบไม่แตะไฟล์ลับก่อนเสมอ — รู้ได้ว่าไฟล์นี้เป็นไฟล์ลับจริงไหม (UI จะไม่เขียนเนื้อหาไฟล์ลับลง app data)
+  let sensitive = false;
   try {
-    original = await tauriBridge.snapshotFile(path, env.settings.cwd, allowSensitive);
+    original = await tauriBridge.snapshotFile(path, env.settings.cwd, false);
   } catch (err) {
-    // ไฟล์ลับที่ยังไม่ได้อนุญาต → ปล่อยให้ op จริงโยน SENSITIVE_FILE เพื่อเข้าขั้นขออนุมัติ
-    if (isSensitiveFileError(err)) throw err;
-    original = undefined;
+    if (!isSensitiveFileError(err)) {
+      original = undefined;
+    } else if (!allowSensitive) {
+      // ไฟล์ลับที่ยังไม่ได้อนุญาต → ปล่อยให้ op จริงโยน SENSITIVE_FILE เพื่อเข้าขั้นขออนุมัติ
+      throw err;
+    } else {
+      sensitive = true;
+      original = await tauriBridge.snapshotFile(path, env.settings.cwd, true).catch(() => undefined);
+    }
   }
-  env.callbacks.onFileCheckpoint(path, original);
+  env.callbacks.onFileCheckpoint(path, original, sensitive);
 }
 
 /** edits อาจมาเป็น JSON string (บางโมเดลส่ง array ซ้อนเป็นสตริง) และรองรับชื่อ field แบบ camelCase */

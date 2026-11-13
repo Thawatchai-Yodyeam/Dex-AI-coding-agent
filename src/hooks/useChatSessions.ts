@@ -3,6 +3,7 @@ import type { AppSettings, ChatMessage, ChatSession, TokenUsage } from '../types
 import type { MultiProviderAgentService } from '../services/agent';
 import { tauriBridge } from '../services/tauriBridge';
 import { ACTIVE_SESSION_STORAGE_KEY, sessionStore, type StoredSessions } from '../services/sessionStore';
+import { deleteSessionCheckpoints } from '../services/checkpointStore';
 
 const PERSIST_DEBOUNCE_MS = 500;
 /** ระหว่างสตรีม messages เปลี่ยนตลอด debounce จะเลื่อนไปเรื่อย ๆ — บันทึกอย่างน้อยทุกเท่านี้ */
@@ -90,8 +91,11 @@ export function useChatSessions(
       .catch((e) => console.warn('Failed to load chat history:', e));
   };
 
-  const forgetAgentHistory = (sessionId: string) =>
-    tauriBridge.deleteSessionHistory(sessionId).catch((e) => console.warn('Failed to delete chat history:', e));
+  /** ลบประวัติแบบ native และ checkpoint ของแชท — ข้อความที่ checkpoint ผูกอยู่หายไปแล้ว จึงไม่มีทางกดย้อนได้อีก */
+  const forgetAgentHistory = (sessionId: string) => {
+    void deleteSessionCheckpoints(sessionId);
+    return tauriBridge.deleteSessionHistory(sessionId).catch((e) => console.warn('Failed to delete chat history:', e));
+  };
 
   const [saveError, setSaveError] = useState<string | null>(null);
   // แชทที่บันทึกแล้ว เทียบด้วย reference (แชทถูกแทนด้วย object ใหม่ทุกครั้งที่เปลี่ยน) — เขียนเฉพาะแชทที่เปลี่ยน

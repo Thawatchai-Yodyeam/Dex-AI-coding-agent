@@ -19,8 +19,9 @@ export interface AgentCallbacks {
   /**
    * ก่อน agent เขียน/แก้ไฟล์ — `original` = เนื้อหาเดิม (null = ไฟล์ใหม่)
    * `undefined` = เก็บ checkpoint ไม่ได้ (ไฟล์ใหญ่/ไม่ใช่ข้อความ)
+   * `sensitive` = ไฟล์ลับที่ผู้ใช้อนุญาตให้แก้ — เนื้อหาเดิมต้องอยู่ในหน่วยความจำเท่านั้น ห้ามเขียนลงดิสก์
    */
-  onFileCheckpoint?: (path: string, original: string | null | undefined) => void;
+  onFileCheckpoint?: (path: string, original: string | null | undefined, sensitive?: boolean) => void;
   /** ก่อนรันคำสั่ง shell ที่ไม่ใช่แบบอ่านอย่างเดียว — UI ถือโอกาส snapshot workspace ไว้ย้อน */
   onBeforeShellCommand?: () => Promise<void>;
   /** API ล้มชั่วคราว กำลังรอลองใหม่ — ข้อความของ step นั้นจะถูกส่งมาใหม่ตั้งแต่ต้นผ่าน onTextChunk */
