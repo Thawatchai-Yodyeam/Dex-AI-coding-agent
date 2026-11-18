@@ -20,6 +20,7 @@ import { evaluateRules, isSensitiveFileError, relativeToWorkspace, suggestShellP
 import { PLAN_MODE_BLOCKED, blockedInPlanMode } from './planMode';
 import { supportsImages } from '../../types/agent';
 import type { AgentCallbacks, PermissionStore } from './types';
+import type { SubagentResult } from './subagent';
 
 const SHELL_DEFAULT_TIMEOUT_SECS = 120;
 /** ต้องตรงกับ MAX_TIMEOUT_SECS ฝั่ง Rust */
@@ -445,6 +446,8 @@ export interface ToolContext {
   signal?: AbortSignal;
   /** ตัวคุม browser pane (เทสต์ใส่ของปลอม) */
   browser?: BrowserDriver;
+  /** รัน subagent แบบอ่านอย่างเดียว (AgentService ใส่ให้ — ไม่มีใน subagent เอง จึงซ้อนกันไม่ได้) */
+  runSubagent?: (prompt: string, record: ToolCallRecord, callbacks: AgentCallbacks) => Promise<SubagentResult>;
 }
 
 /** ส่วนที่ tools.ts ต้องใช้จาก MCP manager (แยก interface ไว้ให้เทสต์ mock ได้ง่าย) */
@@ -1416,6 +1419,7 @@ const PARALLEL_SAFE_TOOLS: ReadonlySet<string> = new Set([
   'read_background_output',
   'use_skill',
   'web_fetch',
+  'subagent',
 ]);
 
 /**
@@ -1444,8 +1448,19 @@ export async function runToolCalls<C, R>(
   return results;
 }
 
-/** tool ที่มีเฉพาะบางเทิร์น (ไม่อยู่ใน TOOL_DEFINITIONS): use_skill เมื่อมี skill */
+/** tool ที่มีเฉพาะบางเทิร์น (ไม่อยู่ใน TOOL_DEFINITIONS): use_skill เมื่อมี skill, subagent ในแชทหลัก */
 const EXTRA_HANDLERS: Record<string, ToolHandler> = {
+  async subagent(args, env) {
+    const prompt = str(args.prompt ?? args.task).trim();
+    if (!prompt) return failTool(env, 'subagent needs a prompt');
+    if (!env.context.runSubagent) return failTool(env, 'A subagent cannot start another subagent. Do the work yourself.');
+    markRunning(env);
+    const res = await env.context.runSubagent(prompt, env.record, env.callbacks);
+    env.record.output = res.report;
+    env.record.status = 'completed';
+    return { report: res.report, tool_calls: res.toolCalls };
+  },
+
   async use_skill(args, env) {
     markRunning(env);
     const name = str(args.name ?? args.skill).trim();

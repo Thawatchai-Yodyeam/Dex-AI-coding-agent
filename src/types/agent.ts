@@ -164,6 +164,8 @@ export interface ToolCallRecord {
   approvalReason?: ApprovalReason;
   /** กฎที่จะบันทึกถ้าผู้ใช้กด "อนุญาตตลอดแชทนี้"/"อนุญาตเสมอ" — ไม่มี = เลือกได้แค่ครั้งนี้ */
   suggestedRule?: Pick<PermissionRule, 'tool' | 'pattern'>;
+  /** tool ที่ subagent เรียก — id ของการ์ด subagent ที่เป็นเจ้าของ (UI แสดงเยื้องเข้าไปใต้การ์ดนั้น) */
+  parentId?: string;
   /** ตำแหน่งใน ChatMessage.content ตอนที่ tool นี้เริ่ม — ใช้วาง tool card แทรกระหว่างข้อความตามลำดับจริง */
   contentOffset?: number;
   /** ตำแหน่งใน ChatMessage.thought ตอนที่ tool นี้เริ่ม — แบ่งความคิดตาม step */

@@ -20,6 +20,8 @@ const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   'update_todos',
   'web_fetch',
   'use_skill',
+  // subagent อ่านอย่างเดียวในตัวเอง (ดู subagent.ts)
+  'subagent',
 ]);
 
 /** tool ที่มีหลาย action: เฉพาะ action ที่แค่อ่านหรือแค่เปิดดู */

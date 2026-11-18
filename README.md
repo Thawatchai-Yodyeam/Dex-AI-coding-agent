@@ -39,6 +39,7 @@ Works with many providers (Claude · GPT · Gemini · DeepSeek · Qwen · Ollama
 | 📄 **Word documents** | The `docx` tool reads and edits `.docx` files through the built-in G-docx editor, keeping the formatting it does not touch. |
 | 📋 **Project instructions** | Put a `DEX.md` or `AGENTS.md` in the project root and the agent follows it every turn. |
 | 🖼️ **Image attachments** | Paste with `Ctrl+V`, drag a file in, or use the attach button. Large images are resized automatically. |
+| 🤖 **Subagents** | For broad research, the agent hands a brief to a read-only subagent that works in its own context and returns only a report, so the chat fills up more slowly. Several run in parallel. |
 | 📋 **Plan mode** | Press **Plan** (top right) or type `/plan`, and the agent reads the code and proposes a plan without changing anything. Approve it with one click to start. |
 | 🔐 **Asks before anything risky** | Auto-Pilot and Supervised modes, your own allow/deny rules, protection for secret files like `.env`, and API keys stored in Windows Credential Manager. |
 | 💰 **Economical and resilient** | Claude prompt caching, automatic retries when an API is briefly down, summaries of old conversation when context runs low (recent turns stay whole), and a check-in every 50 steps. |
@@ -159,6 +160,16 @@ Create this file in the workspace root. The app uses the first one it finds, in 
 
 The file is read again every turn, so edits apply immediately (up to 20,000 characters).
 
+### Subagents
+
+When a question means reading many files, such as mapping how a feature works across the codebase, the agent can call the `subagent` tool with a written brief instead of reading everything itself.
+
+- A subagent starts with an empty history, uses the same model, and returns one report. Only that report enters the chat's history, so the files it read do not use up the chat's context.
+- It is read-only: it can read and search files, run read-only shell commands, fetch web pages, and use skills and MCP tools that declare `readOnlyHint`. It cannot edit files, start background commands, use the browser pane, Word documents or designs, or start another subagent. Shell commands that would change something are refused before you are asked.
+- Its tool calls appear in the chat, indented under the **Subagent** card, and ask for approval under your usual rules. Expand the card to read the brief and the report.
+- Several subagent calls in one step run in parallel. Each stops after 40 steps and reports what it found so far.
+- Its tokens are counted in the turn's total. Subagents work in Plan mode too, since they change nothing.
+
 ### Plan mode
 
 Turn it on with the **Plan** button at the top right or by typing `/plan`. The setting is remembered until you turn it off.
@@ -257,6 +268,7 @@ src/
       history.ts            converts/trims history + clears old tool results to fit the context budget
       compaction.ts         summarises old turns with the model when history is nearly full
       planMode.ts           which tools Plan mode lets through + the notes sent to the agent
+      subagent.ts           read-only subagent: its tools, system prompt and run loop
       mentions.ts           attaches the contents of files the user @-mentions
       retry.ts              retries on 429/5xx/529/network loss (exponential backoff + retry-after)
       skills.ts             finds/reads SKILL.md, use_skill tool, /skill-name

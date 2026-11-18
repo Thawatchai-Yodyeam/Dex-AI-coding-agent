@@ -1295,6 +1295,19 @@ pre,
   overflow: hidden;
 }
 
+/* tool ที่ subagent เรียก — เยื้องใต้การ์ดของ subagent */
+.tool-card.is-subagent-step {
+  margin-left: 22px;
+  border-style: dashed;
+}
+
+.tool-section-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin: 8px 0 4px;
+}
+
 .tool-card.status-pending_approval {
   border-color: var(--accent-border);
 }

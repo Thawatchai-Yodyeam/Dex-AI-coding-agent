@@ -28,6 +28,7 @@ import {
   AppWindow,
   Palette,
   Play,
+  Bot,
 } from 'lucide-react';
 import { designCanvas } from '../services/design/canvas';
 import type { ApprovalDecision, ChatMessage, ToolCallRecord } from '../types/agent';
@@ -211,6 +212,7 @@ const TOOL_ICONS: Record<string, React.ComponentType<{ size?: number; 'aria-hidd
   browser: AppWindow,
   docx: FileText,
   design: Palette,
+  subagent: Bot,
 };
 
 /** action ของ tool design ที่มีหน้าให้เปิดดู */
@@ -249,6 +251,8 @@ const ToolCard: React.FC<{
             ? [tool.args.action, tool.args.path].filter(Boolean).join(' ').slice(0, 160)
             : tool.name === 'design'
               ? [tool.args.action, tool.args.project ?? tool.args.title, tool.args.path].filter(Boolean).join(' ').slice(0, 160)
+            : tool.name === 'subagent'
+              ? String(tool.args.description ?? '').slice(0, 160)
             : tool.args.command ||
           tool.args.path ||
           tool.args.url ||
@@ -269,14 +273,17 @@ const ToolCard: React.FC<{
 
   const statusText: Record<ToolCallRecord['status'], string> = {
     running: t.toolRunning,
-    completed: tool.output && tool.name !== 'run_shell_command' && tool.name !== 'write_file' && !isEdit ? tool.output : t.toolSuccess,
+    completed:
+      tool.output && tool.name !== 'run_shell_command' && tool.name !== 'write_file' && tool.name !== 'subagent' && !isEdit
+        ? tool.output
+        : t.toolSuccess,
     failed: t.toolFailed,
     rejected: t.toolRejected,
     pending_approval: t.toolPending,
   };
 
   return (
-    <div className={`tool-card status-${tool.status}`}>
+    <div className={`tool-card status-${tool.status} ${tool.parentId ? 'is-subagent-step' : ''}`}>
       <button
         type="button"
         className="tool-row"
@@ -342,6 +349,18 @@ const ToolCard: React.FC<{
             <DiffViewer filePath={tool.args.path} originalText="" replacementText={tool.args.content} />
           )}
           {isMcp && <pre className="tool-command">{JSON.stringify(tool.args, null, 2)}</pre>}
+          {tool.name === 'subagent' && typeof tool.args.prompt === 'string' && (
+            <>
+              <div className="tool-section-label">{t.subagentBrief}</div>
+              <pre className="tool-command">{tool.args.prompt}</pre>
+            </>
+          )}
+          {tool.name === 'subagent' && tool.output && (
+            <>
+              <div className="tool-section-label">{t.subagentReport}</div>
+              <pre className="tool-output">{tool.output}</pre>
+            </>
+          )}
           {tool.output && (tool.name === 'run_shell_command' || tool.name === 'read_background_output' || isMcp) && (
             <pre className="tool-output">{tool.output}</pre>
           )}
@@ -561,6 +580,13 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
   const working = isStreaming && !thinkingNow ? workingLabel(message, t, lastSegment?.kind === 'text') : null;
   const components = markdownComponents(t);
   const checkpoint = message.checkpoint;
+  const stepsBySubagent = new Map<string, ToolCallRecord[]>();
+  for (const tool of tools) {
+    if (!tool.parentId) continue;
+    const list = stepsBySubagent.get(tool.parentId) ?? [];
+    list.push(tool);
+    stepsBySubagent.set(tool.parentId, list);
+  }
 
   return (
     <div className={`msg msg-assistant ${message.isError ? 'is-error' : ''}`}>
@@ -577,18 +603,22 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
           );
         }
         if (segment.kind === 'tools') {
+          const card = (tool: ToolCallRecord) => (
+            <ToolCard
+              key={tool.id}
+              tool={tool}
+              t={t}
+              live={isStreaming}
+              onApprove={onApproveTool ? (decision) => onApproveTool(tool.id, decision) : undefined}
+              onReject={onRejectTool ? () => onRejectTool(tool.id) : undefined}
+            />
+          );
+          // tool ของ subagent แสดงใต้การ์ดของมันเสมอ — subagent หลายตัวที่รันพร้อมกันจะไม่ปนกัน
           return (
             <div className="tool-list" key={`tools-${segment.step}`}>
-              {segment.tools.map((tool) => (
-                <ToolCard
-                  key={tool.id}
-                  tool={tool}
-                  t={t}
-                  live={isStreaming}
-                  onApprove={onApproveTool ? (decision) => onApproveTool(tool.id, decision) : undefined}
-                  onReject={onRejectTool ? () => onRejectTool(tool.id) : undefined}
-                />
-              ))}
+              {segment.tools
+                .filter((tool) => !tool.parentId || !tools.some((p) => p.id === tool.parentId))
+                .map((tool) => [card(tool), ...(stepsBySubagent.get(tool.id) ?? []).map(card)])}
             </div>
           );
         }

@@ -3,7 +3,7 @@ import { Check, ChevronDown, ChevronUp, Plug, Plus, RotateCcw, Search, Settings2
 import { useMcpStatuses } from '../hooks/useMcpStatuses';
 import { toolLimitOf } from '../services/agent/providers/toolLimits';
 import { loadSkills, USE_SKILL_TOOL } from '../services/agent/skills';
-import { TOOL_DEFINITIONS } from '../services/agent/tools';
+import { CHAT_BUILTIN_TOOLS } from '../services/agent/subagent';
 import { isMcpEntryDisabled, readMcpEntries, withMcpEntry, withMcpEntryDisabled, withMcpToolsDisabled } from '../services/mcp/config';
 import { mcpManager, type McpServerStatus } from '../services/mcp/manager';
 import { describeOauthError, mcpStatusLabel } from '../services/mcp/oauth';
@@ -159,7 +159,7 @@ export const CustomizationsPage: React.FC<CustomizationsPageProps> = ({
   // ชุดเดียวกับที่ AgentService ส่งให้โมเดล — ตัวเลขในหน้านี้จึงตรงกับของจริง
   const disabledSkills = new Set((settings.disabledSkills ?? []).map((name) => name.toLowerCase()));
   const usesSkillTool = skills.some((skill) => !disabledSkills.has(skill.name.toLowerCase()));
-  const usage = summarizeToolUsage(statuses, [...TOOL_DEFINITIONS, ...(usesSkillTool ? [USE_SKILL_TOOL] : [])]);
+  const usage = summarizeToolUsage(statuses, [...CHAT_BUILTIN_TOOLS, ...(usesSkillTool ? [USE_SKILL_TOOL] : [])]);
   const providerName = PROVIDERS_CATALOG.find((p) => p.id === settings.provider)?.name ?? settings.provider;
   const hasMcpServers = Object.keys(readMcpEntries(settings.mcpConfig) ?? {}).length > 0;
 

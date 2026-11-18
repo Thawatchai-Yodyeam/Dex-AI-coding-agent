@@ -14,7 +14,8 @@ import { runAnthropicTurn } from './providers/anthropic';
 import { runGoogleTurn } from './providers/google';
 import { runOpenAITurn } from './providers/openai';
 import { withToolLimitErrors } from './providers/toolLimits';
-import { loadSkills, USE_SKILL_TOOL } from './skills';
+import { loadSkills, skillsPromptSection, USE_SKILL_TOOL } from './skills';
+import { CHAT_BUILTIN_TOOLS, runSubagent, subagentSystemPrompt, subagentTools } from './subagent';
 import {
   TOOL_DEFINITIONS,
   compactToolResult,
@@ -27,6 +28,7 @@ import type { SkillInfo } from '../tauriBridge';
 import {
   AgentAbortError,
   addUsage,
+  emptyUsage,
   imagesWithData,
   throwIfAborted,
   type AgentCallbacks,
@@ -321,14 +323,45 @@ export class MultiProviderAgentService {
     const [project, skills] = await Promise.all([this.loadProjectInstructions(), this.listSkills()]);
     throwIfAborted(signal);
     const mcp = this.mcp;
+    const mcpTools = mcp?.toolDefinitions() ?? [];
     const tools: ToolDefinition[] = [
-      ...TOOL_DEFINITIONS,
+      ...CHAT_BUILTIN_TOOLS,
       ...(skills.length > 0 ? [USE_SKILL_TOOL] : []),
-      ...(mcp?.toolDefinitions() ?? []),
+      ...mcpTools,
     ];
-    const toolContext: ToolContext = { skills, signal, ...(mcp ? { mcp } : {}) };
-
     const format = formatFor(provider);
+    // token ที่ subagent ใช้ นับรวมกับของเทิร์นนี้ (คนจ่ายเงินคนเดียวกัน)
+    const subagentUsage = emptyUsage();
+    const subTools = subagentTools(TOOL_DEFINITIONS, mcpTools, skills, (name) => mcp?.isReadOnly(name) ?? false);
+    const subagentContext: ToolContext = { skills, signal, ...(mcp ? { mcp } : {}) };
+    const toolContext: ToolContext = {
+      ...subagentContext,
+      runSubagent: async (prompt, record, parentCallbacks) => {
+        const res = await runSubagent(
+          {
+            // อ่านอย่างเดียวด้วยกฎของโหมดวางแผน — คำสั่ง shell ที่แก้อะไรถูกกันก่อนถึงขั้นขออนุมัติ
+            settings: { ...settings, planMode: true },
+            apiKey,
+            systemPrompt: subagentSystemPrompt(settings, skillsPromptSection([...skills])),
+            tools: subTools,
+            driver: DRIVERS[format],
+            runTool: async (name, args, callbacks) =>
+              compactToolResult(
+                await executeTool(name, args, { ...settings, planMode: true }, callbacks, permissions, subagentContext),
+                name
+              ),
+            mcp: mcp ?? undefined,
+            signal,
+          },
+          prompt,
+          record,
+          parentCallbacks
+        );
+        addUsage(subagentUsage, res.usage);
+        return res;
+      },
+    };
+
     const turnVersion = ++this.version;
     this.turnVersion = turnVersion;
     this.history = pruneHistory(this.historyFor(format), format, MAX_HISTORY_MESSAGES);
@@ -386,6 +419,7 @@ export class MultiProviderAgentService {
 
       const result = await DRIVERS[format](ctx, input);
       if (compactionUsage) addUsage(result.usage, compactionUsage);
+      if (subagentUsage.totalTokens > 0) addUsage(result.usage, subagentUsage);
       return { text: result.text, tokenUsage: result.usage, durationMs: Date.now() - startTime };
     } catch (err) {
       // ย้อนประวัติให้สะอาด แล้วจำสิ่งที่ผู้ใช้ถามและที่ตอบไปแล้วแบบ text-only

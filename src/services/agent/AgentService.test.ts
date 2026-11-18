@@ -9,7 +9,7 @@ import { parseMcpConfig } from '../mcp/config';
 import { McpManager } from '../mcp/manager';
 import { summarizeToolUsage } from '../mcp/toolUsage';
 import { MultiProviderAgentService, STEPS_PER_CONFIRM } from './AgentService';
-import { TOOL_DEFINITIONS } from './tools';
+import { CHAT_BUILTIN_TOOLS } from './subagent';
 import { AgentAbortError } from './types';
 import type { AgentCallbacks } from './types';
 
@@ -347,7 +347,7 @@ describe('disabled MCP tools reach no provider', () => {
     });
     const { agent, manager } = await agentWith(openai);
     await agent.sendMessage({ text: 'hi' }, noCallbacks());
-    const usage = summarizeToolUsage(manager.statuses(), TOOL_DEFINITIONS);
+    const usage = summarizeToolUsage(manager.statuses(), CHAT_BUILTIN_TOOLS);
     expect(bodies[0].tools).toHaveLength(usage.totalTools);
     expect(usage.mcpTools).toBe(1);
     fetchSpy.mockRestore();
@@ -533,5 +533,81 @@ describe('rewindBeforeUserTurn', () => {
     expect(agent.rewindBeforeUserTurn('first question', 2)).toBe(true);
     expect(agent.exportHistory()).toBeNull();
     expect(new MultiProviderAgentService(settings()).rewindBeforeUserTurn('x', 1)).toBe(false);
+  });
+});
+
+describe('subagent', () => {
+  /** SSE ของ Chat Completions หนึ่งคำตอบ: เรียก tool หรือส่งข้อความ พร้อม usage */
+  function sse(reply: { tool?: [string, Record<string, unknown>]; text?: string }, tokens: number) {
+    const delta = reply.tool
+      ? { tool_calls: [{ index: 0, id: `c${Math.random()}`, function: { name: reply.tool[0], arguments: JSON.stringify(reply.tool[1]) } }] }
+      : { content: reply.text };
+    const chunks = [
+      { choices: [{ delta }] },
+      { choices: [], usage: { prompt_tokens: tokens, completion_tokens: 0, total_tokens: tokens } },
+    ];
+    return new Response(chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join('') + 'data: [DONE]\n\n', { status: 200 });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    bridge.readFile.mockRejectedValue(new Error('not found'));
+  });
+
+  it('runs read-only in its own context, returns only its report and counts its tokens', async () => {
+    const b = bridge as any;
+    b.checkSecurity = vi.fn(async () => ({ safe: true, high_risk: false, is_read_only: false, has_chaining: false }));
+    b.executeCommand = vi.fn();
+    const bodies: any[] = [];
+    const replies = [
+      sse({ tool: ['subagent', { description: 'Look around', prompt: 'Find the auth code' }] }, 100),
+      sse({ tool: ['run_shell_command', { command: 'npm install' }] }, 10),
+      sse({ text: 'Auth lives in src/auth.ts:12.' }, 20),
+      sse({ text: 'Done.' }, 200),
+    ];
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      bodies.push(JSON.parse(String(init!.body)));
+      return replies.shift()!;
+    });
+    const started: { name: string; parentId?: string }[] = [];
+    const asked: string[] = [];
+    const agent = new MultiProviderAgentService(settings({ provider: 'openai', model: 'gpt-6.1-sol', apiKeys: { openai: 'k' } as any }));
+    const res = await agent.sendMessage(
+      { text: 'how does auth work?' },
+      {
+        onTextChunk: () => {},
+        onToolStart: (t) => started.push({ name: t.name, parentId: t.parentId }),
+        onToolUpdate: () => {},
+        onRequestApproval: async (t) => {
+          asked.push(t.name);
+          return 'once';
+        },
+      }
+    );
+
+    expect(res.text).toBe('Done.');
+    expect(res.tokenUsage.totalTokens).toBe(330);
+    // คำสั่งที่แก้ไฟล์ถูกกันก่อนถึงขั้นถามผู้ใช้ และไม่ได้รันจริง
+    expect(asked).toEqual([]);
+    expect(b.executeCommand).not.toHaveBeenCalled();
+    expect(started).toEqual([
+      { name: 'subagent', parentId: undefined },
+      { name: 'run_shell_command', parentId: expect.stringMatching(/^tool-/) },
+    ]);
+
+    const [main1, sub1, sub2, main2] = bodies;
+    expect(main1.tools.map((t: any) => t.function.name)).toContain('subagent');
+    const subTools = sub1.tools.map((t: any) => t.function.name);
+    expect(subTools).not.toContain('subagent');
+    expect(subTools).not.toContain('write_file');
+    // subagent เริ่มจากประวัติว่าง: system + brief เท่านั้น
+    expect(sub1.messages.map((m: any) => m.role)).toEqual(['system', 'user']);
+    expect(sub1.messages[1].content).toContain('Find the auth code');
+    expect(JSON.stringify(sub2.messages)).toContain('Plan mode is on');
+    // แชทหลักได้แค่รายงาน ไม่เห็นผลของ tool ที่ subagent เรียก
+    const mainSeen = JSON.stringify(main2.messages);
+    expect(mainSeen).toContain('Auth lives in src/auth.ts:12.');
+    expect(mainSeen).not.toContain('npm install');
+    fetchSpy.mockRestore();
   });
 });
