@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { X, KeyRound, SlidersHorizontal, ShieldCheck, Puzzle, ImagePlus, Ban } from 'lucide-react';
+import { X, KeyRound, SlidersHorizontal, ShieldCheck, Puzzle, ImagePlus, Ban, Brain } from 'lucide-react';
+import { MEMORY_MAX_CHARS } from '../services/agent/memory';
 import { fileToWallpaper } from '../utils/images';
 import { WALLPAPER_PRESETS, presetValue, resolveWallpaper } from '../utils/wallpapers';
 import { McpSettings } from './McpSettings';
@@ -11,7 +12,15 @@ import { tauriBridge } from '../services/tauriBridge';
 import { translations } from '../utils/i18n';
 import { PermissionRulesEditor } from './PermissionRulesEditor';
 
-export type SettingsTab = 'general' | 'keys' | 'permissions' | 'extensions';
+export type SettingsTab = 'general' | 'keys' | 'permissions' | 'memory' | 'extensions';
+
+/** memory หนึ่งขอบเขตในฟอร์ม: ค่าที่โหลดมา (เทียบว่าแก้ไหม) + ที่กำลังแก้ */
+interface MemoryDraft {
+  path: string;
+  loaded: string;
+  value: string;
+}
+const EMPTY_MEMORY: MemoryDraft = { path: '', loaded: '', value: '' };
 type Tab = SettingsTab;
 
 interface SettingsModalProps {
@@ -31,6 +40,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
   // key ของ search API ไม่อยู่ใน settings — พิมพ์แล้วบันทึกลง Credential Manager ตรง ๆ ตอนกดบันทึก
   const [searchKey, setSearchKey] = useState('');
   const [searchKeyStatus, setSearchKeyStatus] = useState<Record<string, boolean>>({});
+  // memory อยู่ในไฟล์ ไม่อยู่ใน settings — โหลดตอนเปิด บันทึกเฉพาะที่แก้ตอนกดบันทึก
+  const [userMemory, setUserMemory] = useState<MemoryDraft>(EMPTY_MEMORY);
+  const [projectMemory, setProjectMemory] = useState<MemoryDraft>(EMPTY_MEMORY);
   const dialogRef = useRef<HTMLDivElement>(null);
   const wallpaperInputRef = useRef<HTMLInputElement>(null);
 
@@ -41,6 +53,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
       setSaved(false);
       setWallpaperError(false);
       setSearchKey('');
+      setUserMemory(EMPTY_MEMORY);
+      setProjectMemory(EMPTY_MEMORY);
+      const toDraft = (m: { path: string; content: string }): MemoryDraft => ({ path: m.path, loaded: m.content, value: m.content });
+      tauriBridge.readMemory('user').then((m) => setUserMemory(toDraft(m))).catch(() => {});
+      if (settings.cwd) tauriBridge.readMemory('project', settings.cwd).then((m) => setProjectMemory(toDraft(m))).catch(() => {});
       tauriBridge
         .webSearchKeyStatus()
         .then(setSearchKeyStatus)
@@ -76,7 +93,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
       .catch((e) => console.error('Failed to remove web search key:', e));
   };
 
+  const memoryTooLong = [userMemory, projectMemory].some((m) => m.value.length > MEMORY_MAX_CHARS);
+
   const handleSave = () => {
+    if (memoryTooLong) {
+      setTab('memory');
+      return;
+    }
+    // memory ของ workspace ที่เปิดตอนเปิดหน้านี้ — ถ้าเปลี่ยน workspace ในฟอร์ม ก็ยังเขียนไฟล์ของ workspace เดิม
+    const writes: Promise<unknown>[] = [];
+    if (userMemory.value !== userMemory.loaded) writes.push(tauriBridge.writeMemory('user', undefined, userMemory.value));
+    if (settings.cwd && projectMemory.value !== projectMemory.loaded) {
+      writes.push(tauriBridge.writeMemory('project', settings.cwd, projectMemory.value));
+    }
+    Promise.all(writes).catch((e) => console.error('Failed to save memory:', e));
     if (searchProvider !== 'off' && searchKey.trim()) {
       tauriBridge.saveWebSearchKey(searchProvider, searchKey).catch((e) => console.error('Failed to save web search key:', e));
     }
@@ -110,6 +140,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
     { id: 'general', label: t.tabGeneral, icon: <SlidersHorizontal size={16} aria-hidden="true" /> },
     { id: 'keys', label: `${t.tabApiKeys} (${t.keysActive(activeKeys)})`, icon: <KeyRound size={16} aria-hidden="true" /> },
     { id: 'permissions', label: t.tabPermissions, icon: <ShieldCheck size={16} aria-hidden="true" /> },
+    { id: 'memory', label: t.tabMemory, icon: <Brain size={16} aria-hidden="true" /> },
     { id: 'extensions', label: t.tabExtensions, icon: <Puzzle size={16} aria-hidden="true" /> },
   ];
 
@@ -473,6 +504,44 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
                   </label>
                   <p className="field-hint">{t.claudeWebSearchHint}</p>
                 </fieldset>
+              </>
+            )}
+
+            {tab === 'memory' && (
+              <>
+                <p className="field-hint">{t.memoryIntro}</p>
+                {(
+                  [
+                    { id: 'user', label: t.memoryUserLabel, hint: t.memoryUserHint, draft: userMemory, set: setUserMemory },
+                    { id: 'project', label: t.memoryProjectLabel, hint: t.memoryProjectHint, draft: projectMemory, set: setProjectMemory },
+                  ] as const
+                ).map(({ id, label, hint, draft: mem, set }) => (
+                  <div key={id} className="field">
+                    <label htmlFor={`memory-${id}`} className="field-label">
+                      {label}
+                    </label>
+                    <p className="field-hint">{hint}</p>
+                    {id === 'project' && !settings.cwd ? (
+                      <p className="field-hint">{t.memoryNoWorkspace}</p>
+                    ) : (
+                      <>
+                        <textarea
+                          id={`memory-${id}`}
+                          className="input input-mono memory-input"
+                          spellCheck={false}
+                          rows={8}
+                          placeholder={t.memoryEmpty}
+                          value={mem.value}
+                          onChange={(e) => set({ ...mem, value: e.target.value })}
+                        />
+                        <p className={`field-hint ${mem.value.length > MEMORY_MAX_CHARS ? 'is-error' : ''}`}>
+                          {t.memoryCount(mem.value.length, MEMORY_MAX_CHARS)}
+                          {mem.path ? ` · ${mem.path}` : ''}
+                        </p>
+                      </>
+                    )}
+                  </div>
+                ))}
               </>
             )}
 

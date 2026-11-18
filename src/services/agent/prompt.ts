@@ -1,6 +1,7 @@
 import type { AppSettings } from '../../types/agent';
 import type { SkillInfo } from '../tauriBridge';
 import { skillsPromptSection } from './skills';
+import { memoryPromptSection, type LoadedMemory } from './memory';
 
 /** ไฟล์คำสั่งประจำโปรเจกต์ที่ราก workspace — ใช้ไฟล์แรกที่เจอ */
 export const PROJECT_INSTRUCTION_FILES = ['DEX.md', 'AGENTS.md', 'CLAUDE.md'] as const;
@@ -15,7 +16,8 @@ export interface ProjectInstructions {
 export function buildSystemPrompt(
   settings: AppSettings,
   project?: ProjectInstructions | null,
-  skills: readonly SkillInfo[] = []
+  skills: readonly SkillInfo[] = [],
+  memory?: LoadedMemory | null
 ): string {
   const languageRule =
     settings.language === 'en'
@@ -50,7 +52,7 @@ How to work:
 - To design or mock up something visual (a website, app screen, landing page, prototype or poster), use the design tool: create a project, follow the guidelines it returns, write the files, then check the page with the browser tool.
 - After changing code, verify when practical (run the build or tests). Raise timeout_secs for slow builds; start servers and watchers with run_in_background.
 - Keep explanations short and concrete; reference files as relative paths.
-- The user can undo your file edits from the app; if they tell you files were reverted, re-read before editing.${skillsPromptSection([...skills])}${projectSection}
+- The user can undo your file edits from the app; if they tell you files were reverted, re-read before editing.${skillsPromptSection([...skills])}${projectSection}${memoryPromptSection(memory)}
 
 ${languageRule}`;
 }

@@ -29,6 +29,7 @@ import {
   Palette,
   Play,
   Bot,
+  Brain,
 } from 'lucide-react';
 import { designCanvas } from '../services/design/canvas';
 import type { ApprovalDecision, ChatMessage, ToolCallRecord } from '../types/agent';
@@ -214,6 +215,7 @@ const TOOL_ICONS: Record<string, React.ComponentType<{ size?: number; 'aria-hidd
   design: Palette,
   subagent: Bot,
   web_search: Search,
+  memory: Brain,
 };
 
 /** action ของ tool design ที่มีหน้าให้เปิดดู */
@@ -254,6 +256,8 @@ const ToolCard: React.FC<{
               ? [tool.args.action, tool.args.project ?? tool.args.title, tool.args.path].filter(Boolean).join(' ').slice(0, 160)
             : tool.name === 'subagent'
               ? String(tool.args.description ?? '').slice(0, 160)
+            : tool.name === 'memory'
+              ? [tool.args.action, tool.args.scope, tool.args.new_text ?? tool.args.text].filter(Boolean).join(' ').slice(0, 160)
             : tool.args.command ||
           tool.args.path ||
           tool.args.url ||

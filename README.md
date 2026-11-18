@@ -38,6 +38,7 @@ Works with many providers (Claude · GPT · Gemini · DeepSeek · Qwen · Ollama
 | 🧭 **In-app browser** | A pane on the right (🗔 button, top right) lets the agent open your dev server and test it: read the page outline, click, type, press keys, check the console and errors, and take screenshots for models that can see images. You can use the URL bar yourself too. |
 | 🎨 **Dex Design** | Ask for a website, app screen or prototype in chat and see it on a canvas beside the conversation. Switch between desktop, tablet and mobile, click part of the page to comment on it, compare options side by side, go back to old versions and export as HTML. The agent can open the page to check its own work. |
 | 📄 **Word documents** | The `docx` tool reads and edits `.docx` files through the built-in G-docx editor, keeping the formatting it does not touch. |
+| 🧠 **Memory across chats** | The agent notes your preferences and lasting project facts with its `memory` tool, and every new chat starts with them. See and edit them in ⚙️ Settings → Memory. |
 | 📋 **Project instructions** | Put a `DEX.md` or `AGENTS.md` in the project root and the agent follows it every turn. |
 | 🖼️ **Image attachments** | Paste with `Ctrl+V`, drag a file in, or use the attach button. Large images are resized automatically. |
 | 🤖 **Subagents** | For broad research, the agent hands a brief to a read-only subagent that works in its own context and returns only a report, so the chat fills up more slowly. Several run in parallel. |
@@ -147,6 +148,15 @@ Open **Customizations** in the sidebar to browse the **Marketplace** and manage 
 - **Versions:** `npx` and `uvx` plugins run an exact package version, because servers start on their own each time Dex opens. When a newer Dex ships a new version, the plugin shows **Update** with the old and new command. Nothing updates until you choose it, and your enabled or disabled setting stays as it was. Pinning covers the plugin's own package; `npx` and `uvx` may still resolve its dependencies to newer versions.
 
 To add a plugin, add it to `src/services/marketplace/catalog.ts`. `marketplace.test.ts` checks that its config parses, that it declares the keys it uses and that it pins a version. Pass keys through `env` or `headers`, never `args`, because other programs on the computer can read process arguments. When you change a version, check flags and variable names in that release's package, since a repository's README can describe changes that are not released yet. Use `remoteOauth` only after checking the vendor's docs and its live metadata for `registration_endpoint` and `S256`.
+
+### Memory
+
+The agent keeps short notes that are loaded into every later chat, so you do not have to repeat yourself.
+
+- **Two scopes:** *yours* applies to every project (preferences, how you like it to work) and lives in `~/.dex/memory/MEMORY.md`. *This project* applies to one workspace (build and test commands, conventions, facts that are hard to find in the code) and lives in `~/.dex/projects/<folder>-<hash>/MEMORY.md`. Both are outside the repository, so personal notes are never committed by accident. For instructions the whole team should share, use `DEX.md`.
+- **How notes are made:** the agent uses the `memory` tool (view, add, replace, remove) when you state a lasting preference, correct how it works, or it learns a durable project fact. Each note is one line. It is told not to save secrets, details of a single task, or anything that came from a web page, document or tool output.
+- **You stay in control:** ⚙️ Settings → **Memory** shows both files as plain text that you can edit or clear. Each is capped at 8,000 characters because it is sent with every request. In Supervised mode the agent asks before every change, and Plan mode lets it read memory but not change it. Subagents neither see nor change memory.
+- Memory is given to the model as notes, not instructions: when a note conflicts with what you ask now, the agent follows you and updates the note.
 
 ### Project instructions (`DEX.md`)
 
@@ -280,6 +290,7 @@ src/
       planMode.ts           which tools Plan mode lets through + the notes sent to the agent
       subagent.ts           read-only subagent: its tools, system prompt and run loop
       webSearch.ts          web_search tool, which search the chat uses, Claude's built-in search tool
+      memory.ts             memory tool: edits one line at a time + the memory section of the system prompt
       mentions.ts           attaches the contents of files the user @-mentions
       retry.ts              retries on 429/5xx/529/network loss (exponential backoff + retry-after)
       skills.ts             finds/reads SKILL.md, use_skill tool, /skill-name
@@ -311,7 +322,7 @@ src/
     notify.ts               Windows notifications
     i18n.ts                 Thai and English strings
 src-tauri/src/lib.rs        Rust commands: shell (timeout/background), files (sandbox, paging, multi-edit),
-                            search (regex/glob), git snapshot, checkpoint files, web search (Brave/Tavily), keyring, skills, MCP transport, web_fetch,
+                            search (regex/glob), git snapshot, checkpoint files, web search (Brave/Tavily), memory files, keyring, skills, MCP transport, web_fetch,
                             browser pane (child webview + WebView2 DevTools protocol), design server (+ unit tests)
 ```
 

@@ -22,6 +22,12 @@ export interface SkillInfo {
   managed?: boolean;
 }
 
+/** ไฟล์ memory หนึ่งขอบเขต (ดู MemoryFile ใน lib.rs) — content ว่าง = ยังไม่มีไฟล์ */
+export interface MemoryFile {
+  path: string;
+  content: string;
+}
+
 /** ผลค้นเว็บหนึ่งรายการ (ดู SearchResult ใน lib.rs) */
 export interface SearchResult {
   title: string;
@@ -437,6 +443,16 @@ export const tauriBridge = {
   /** ค้นผ่าน Brave/Tavily — ฝั่ง Rust อ่าน key เอง (error ขึ้นต้น NO_SEARCH_KEY: = ยังไม่มี key) */
   async webSearch(provider: 'brave' | 'tavily', query: string, count?: number): Promise<SearchResult[]> {
     return await invoke('web_search', { provider, query, count });
+  },
+
+  /** memory ข้ามแชท: user = ทุกโปรเจกต์, project = เฉพาะ workspace (ไฟล์อยู่ใต้ ~/.dex/ ไม่อยู่ใน repo) */
+  async readMemory(scope: 'user' | 'project', workspace?: string): Promise<MemoryFile> {
+    return await invoke('read_memory', { scope, workspace });
+  },
+
+  /** เขียนทั้งไฟล์ (ค่าว่าง = ลบ) — error ขึ้นต้น MEMORY_FULL: = ยาวเกินเพดาน */
+  async writeMemory(scope: 'user' | 'project', workspace: string | undefined, content: string): Promise<MemoryFile> {
+    return await invoke('write_memory', { scope, workspace, content });
   },
 
   /** มี key ของ search provider ไหนแล้วบ้าง (ไม่คืนตัว key) */

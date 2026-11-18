@@ -869,6 +869,18 @@ pre,
   background: var(--accent-soft);
 }
 
+/* ช่องแก้ memory ในหน้าตั้งค่า */
+.memory-input {
+  width: 100%;
+  min-height: 140px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.field-hint.is-error {
+  color: var(--danger, #d64545);
+}
+
 /* checkbox พร้อมข้อความในฟอร์มตั้งค่า */
 .checkbox-row {
   display: flex;

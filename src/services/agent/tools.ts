@@ -22,6 +22,7 @@ import { supportsImages } from '../../types/agent';
 import type { AgentCallbacks, PermissionStore } from './types';
 import type { SubagentResult } from './subagent';
 import { WEB_SEARCH_DEFAULT_RESULTS, WEB_SEARCH_MAX_RESULTS, webSearchProviderOf } from './webSearch';
+import { MEMORY_ACTIONS, MEMORY_SCOPES, addEntry, removeEntry, replaceEntry, type MemoryAction, type MemoryScope } from './memory';
 
 const SHELL_DEFAULT_TIMEOUT_SECS = 120;
 /** ต้องตรงกับ MAX_TIMEOUT_SECS ฝั่ง Rust */
@@ -1452,6 +1453,51 @@ export async function runToolCalls<C, R>(
 
 /** tool ที่มีเฉพาะบางเทิร์น (ไม่อยู่ใน TOOL_DEFINITIONS): use_skill เมื่อมี skill, subagent ในแชทหลัก */
 const EXTRA_HANDLERS: Record<string, ToolHandler> = {
+  async memory(args, env) {
+    const action = str(args.action).trim() as MemoryAction;
+    if (!MEMORY_ACTIONS.includes(action)) return failTool(env, `Unknown memory action "${action}". Use one of: ${MEMORY_ACTIONS.join(', ')}`);
+    const cwd = env.settings.cwd || undefined;
+    if (action === 'view') {
+      markRunning(env);
+      const [user, project] = await Promise.all([
+        tauriBridge.readMemory('user'),
+        cwd ? tauriBridge.readMemory('project', cwd) : Promise.resolve({ path: '', content: '' }),
+      ]);
+      env.record.status = 'completed';
+      env.record.output = `user ${user.content.length} · project ${project.content.length} chars`;
+      return { user: user.content || '(empty)', project: project.content || '(empty)' };
+    }
+    const scope = str(args.scope).trim() as MemoryScope;
+    if (!MEMORY_SCOPES.includes(scope)) return failTool(env, 'memory needs scope "user" or "project"');
+    if (scope === 'project' && !cwd) return failTool(env, 'There is no workspace, so there is no project memory. Use scope "user" or skip saving.');
+    // Supervised: ถามก่อนทุกครั้ง — memory อยู่ข้ามแชทและโปรเจกต์ ผู้ใช้ควรเห็นก่อนว่าจดอะไร
+    if (!env.settings.autoPilot) {
+      const rejected = await requireApproval(env, 'User rejected changing memory', 'supervised');
+      if (rejected) return rejected;
+    }
+    markRunning(env);
+    const current = await tauriBridge.readMemory(scope, cwd);
+    const edit =
+      action === 'add'
+        ? addEntry(current.content, str(args.text))
+        : action === 'replace'
+          ? replaceEntry(current.content, str(args.old_text ?? args.text), str(args.new_text))
+          : removeEntry(current.content, str(args.text));
+    if (!edit.ok) return failTool(env, edit.error);
+    try {
+      await tauriBridge.writeMemory(scope, cwd, edit.content);
+    } catch (err: any) {
+      const message = String(err?.message ?? err);
+      return failTool(
+        env,
+        message.startsWith('MEMORY_FULL:') ? `${message.slice('MEMORY_FULL:'.length).trim()} Merge or remove older entries first.` : message
+      );
+    }
+    env.record.status = 'completed';
+    env.record.output = scope;
+    return { scope, memory: edit.content || '(empty)', note: 'Saved. It is part of your instructions from the next turn on.' };
+  },
+
   async web_search(args, env) {
     const query = str(args.query ?? args.q).trim();
     if (!query) return failTool(env, 'web_search needs a query');

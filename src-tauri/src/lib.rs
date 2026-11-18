@@ -1448,6 +1448,97 @@ fn user_home() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from)
 }
 
+// 6.3.1 Memory ข้ามแชท: MEMORY.md หนึ่งไฟล์ต่อขอบเขต อยู่นอก repo เสมอ (ไม่ถูก commit ไปโดยไม่ตั้งใจ)
+// - user:    ~/.dex/memory/MEMORY.md                      ใช้ทุกโปรเจกต์
+// - project: ~/.dex/projects/<ชื่อโฟลเดอร์>-<hash>/MEMORY.md  ใช้เฉพาะ workspace นั้น
+
+/// เพดานขนาดต่อไฟล์ — memory ถูกส่งไปกับทุกคำขอ ยาวเกินจะเปลือง token ทุกเทิร์น
+const MEMORY_MAX_CHARS: usize = 8_000;
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct MemoryFile {
+    pub path: String,
+    pub content: String,
+}
+
+/// ชื่อโฟลเดอร์ของ project memory: ชื่อ workspace (อ่านออก) + hash ของพาธเต็ม (กันชื่อซ้ำ)
+/// พาธเทียบแบบไม่สนตัวพิมพ์และ / กับ \ — Windows ถือว่าเป็นโฟลเดอร์เดียวกัน
+fn project_memory_key(workspace: &str) -> String {
+    let normalized = workspace.trim().trim_end_matches(['\\', '/']).replace('\\', "/").to_lowercase();
+    let mut hash: u32 = 0x811c9dc5;
+    for b in normalized.bytes() {
+        hash = (hash ^ b as u32).wrapping_mul(0x01000193);
+    }
+    let name: String = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .take(40)
+        .collect();
+    let name = name.trim_matches('-');
+    format!("{}-{:08x}", if name.is_empty() { "workspace" } else { name }, hash)
+}
+
+fn memory_path_in(home: &Path, scope: &str, workspace: Option<&str>) -> Result<PathBuf, String> {
+    match scope {
+        "user" => Ok(home.join(".dex").join("memory").join("MEMORY.md")),
+        "project" => {
+            let ws = workspace.map(str::trim).filter(|w| !w.is_empty()).ok_or("project memory ต้องมี workspace")?;
+            Ok(home.join(".dex").join("projects").join(project_memory_key(ws)).join("MEMORY.md"))
+        }
+        other => Err(format!("ไม่รู้จักขอบเขตของ memory: {}", other)),
+    }
+}
+
+fn read_memory_in(home: &Path, scope: &str, workspace: Option<&str>) -> Result<MemoryFile, String> {
+    let path = memory_path_in(home, scope, workspace)?;
+    let content = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("อ่าน memory ไม่สำเร็จ: {}", e)),
+    };
+    Ok(MemoryFile { path: path.to_string_lossy().to_string(), content })
+}
+
+fn write_memory_in(home: &Path, scope: &str, workspace: Option<&str>, content: &str) -> Result<MemoryFile, String> {
+    let path = memory_path_in(home, scope, workspace)?;
+    let count = content.chars().count();
+    if count > MEMORY_MAX_CHARS {
+        return Err(format!(
+            "MEMORY_FULL: memory ยาว {} ตัวอักษร เกินเพดาน {} — รวมหรือลบรายการเก่าก่อน",
+            count, MEMORY_MAX_CHARS
+        ));
+    }
+    if content.trim().is_empty() {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("ลบ memory ไม่สำเร็จ: {}", e)),
+        }
+        return Ok(MemoryFile { path: path.to_string_lossy().to_string(), content: String::new() });
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("สร้างโฟลเดอร์ไม่สำเร็จ: {}", e))?;
+    }
+    write_atomic(&path, content.as_bytes()).map_err(|e| format!("บันทึก memory ไม่สำเร็จ: {}", e))?;
+    Ok(MemoryFile { path: path.to_string_lossy().to_string(), content: content.to_string() })
+}
+
+#[tauri::command]
+fn read_memory(scope: String, workspace: Option<String>) -> Result<MemoryFile, String> {
+    let home = user_home().ok_or("หาโฟลเดอร์ผู้ใช้ไม่เจอ")?;
+    read_memory_in(&home, &scope, workspace.as_deref())
+}
+
+/// เขียนทั้งไฟล์ (ค่าว่าง = ลบไฟล์) — การเพิ่ม/แก้รายการทำฝั่ง TypeScript
+#[tauri::command]
+fn write_memory(scope: String, workspace: Option<String>, content: String) -> Result<MemoryFile, String> {
+    let home = user_home().ok_or("หาโฟลเดอร์ผู้ใช้ไม่เจอ")?;
+    write_memory_in(&home, &scope, workspace.as_deref(), &content)
+}
+
 fn skill_roots(workspace: Option<&str>) -> Vec<(PathBuf, &'static str)> {
     let mut roots = Vec::new();
     if let Some(ws) = workspace.map(str::trim).filter(|w| !w.is_empty()) {
@@ -4422,6 +4513,8 @@ pub fn run() {
             delete_chat_session,
             web_search,
             web_search_key_status,
+            read_memory,
+            write_memory,
             save_checkpoint,
             load_checkpoints,
             delete_checkpoint,
@@ -5032,6 +5125,35 @@ mod tests {
         assert!(snapshot_file(ws.join(".env").to_string_lossy().to_string(), ws_str, None).is_err());
 
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn memory_files_live_outside_the_workspace_per_scope() {
+        let home = std::env::temp_dir().join(format!("dex_mem_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let ws = r"D:\Projects\My App";
+
+        assert_eq!(read_memory_in(&home, "user", None).unwrap().content, "");
+        write_memory_in(&home, "user", None, "- prefers pnpm\n").unwrap();
+        write_memory_in(&home, "project", Some(ws), "- tests: npm test\n").unwrap();
+        assert_eq!(read_memory_in(&home, "user", Some(ws)).unwrap().content, "- prefers pnpm\n");
+        assert_eq!(read_memory_in(&home, "project", Some(ws)).unwrap().content, "- tests: npm test\n");
+
+        // workspace เดียวกันเขียนต่างกันแค่ตัวพิมพ์/ทับขวา → ไฟล์เดียวกัน, workspace อื่น → คนละไฟล์
+        assert_eq!(read_memory_in(&home, "project", Some("d:/projects/my app/")).unwrap().content, "- tests: npm test\n");
+        assert_eq!(read_memory_in(&home, "project", Some(r"D:\Projects\Other")).unwrap().content, "");
+        let path = memory_path_in(&home, "project", Some(ws)).unwrap();
+        assert!(path.starts_with(home.join(".dex").join("projects")));
+        assert!(path.parent().unwrap().file_name().unwrap().to_string_lossy().starts_with("my-app-"));
+
+        assert!(write_memory_in(&home, "user", None, &"x".repeat(MEMORY_MAX_CHARS + 1)).unwrap_err().starts_with("MEMORY_FULL"));
+        assert!(read_memory_in(&home, "project", None).is_err());
+        assert!(read_memory_in(&home, "../etc", None).is_err());
+
+        // เขียนค่าว่าง = ลบไฟล์
+        write_memory_in(&home, "user", None, "  ").unwrap();
+        assert!(!memory_path_in(&home, "user", None).unwrap().exists());
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

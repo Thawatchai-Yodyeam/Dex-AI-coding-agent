@@ -4,6 +4,7 @@ import { USE_SKILL_TOOL } from './skills';
 import type { SkillInfo } from '../tauriBridge';
 import { TOOL_DEFINITIONS, type McpToolRunner } from './tools';
 import { WEB_SEARCH_TOOL, usesClientWebSearch } from './webSearch';
+import { MEMORY_TOOL } from './memory';
 import { stepLimitNote, type AgentCallbacks, type ToolDefinition, type TurnContext, type TurnResult, type UserInput } from './types';
 
 /**
@@ -45,7 +46,8 @@ export const SUBAGENT_TOOL: ToolDefinition = {
 
 /** tool ในตัวที่แชทหลักส่งให้โมเดล (ก่อน use_skill และ MCP) — หน้า Customizations นับจากรายการเดียวกันนี้ */
 export function chatBuiltinTools(settings: Pick<AppSettings, 'provider' | 'claudeWebSearch' | 'webSearchProvider'>): ToolDefinition[] {
-  return [...TOOL_DEFINITIONS, SUBAGENT_TOOL, ...(usesClientWebSearch(settings) ? [WEB_SEARCH_TOOL] : [])];
+  // memory มีเฉพาะแชทหลัก — subagent ไม่อยู่ใน SUBAGENT_BUILTIN_TOOLS จึงไม่ได้รับ
+  return [...TOOL_DEFINITIONS, SUBAGENT_TOOL, MEMORY_TOOL, ...(usesClientWebSearch(settings) ? [WEB_SEARCH_TOOL] : [])];
 }
 
 /** tool ในตัวที่ subagent ได้ — เฉพาะตัวที่อ่านอย่างเดียว และไม่แตะของที่มีชิ้นเดียวในแอป (browser pane, เอกสาร Word, แผนงานในแชท) */

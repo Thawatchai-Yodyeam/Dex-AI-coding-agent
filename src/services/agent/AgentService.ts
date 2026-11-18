@@ -17,6 +17,7 @@ import { withToolLimitErrors } from './providers/toolLimits';
 import { loadSkills, skillsPromptSection, USE_SKILL_TOOL } from './skills';
 import { chatBuiltinTools, runSubagent, subagentSystemPrompt, subagentTools } from './subagent';
 import { usesNativeWebSearch } from './webSearch';
+import type { LoadedMemory } from './memory';
 import {
   compactToolResult,
   executeTool,
@@ -292,6 +293,20 @@ export class MultiProviderAgentService {
     return null;
   }
 
+  /** memory ของผู้ใช้และของ workspace — อ่านไม่ได้ก็แค่ไม่มี (ไม่ทำให้เทิร์นล้ม) */
+  async loadMemory(): Promise<LoadedMemory> {
+    const cwd = this.settings.cwd || undefined;
+    const read = async (scope: 'user' | 'project') => {
+      try {
+        return (await tauriBridge.readMemory(scope, cwd)).content;
+      } catch {
+        return '';
+      }
+    };
+    const [user, project] = await Promise.all([read('user'), cwd ? read('project') : Promise.resolve('')]);
+    return { user, project };
+  }
+
   async sendMessage(
     input: UserInput,
     callbacks: AgentCallbacks,
@@ -320,7 +335,7 @@ export class MultiProviderAgentService {
     }
 
     // อ่านก่อนแตะ history — ถ้าอ่านพลาดก็แค่ไม่มีคำสั่งประจำโปรเจกต์/skill
-    const [project, skills] = await Promise.all([this.loadProjectInstructions(), this.listSkills()]);
+    const [project, skills, memory] = await Promise.all([this.loadProjectInstructions(), this.listSkills(), this.loadMemory()]);
     throwIfAborted(signal);
     const mcp = this.mcp;
     const mcpTools = mcp?.toolDefinitions() ?? [];
@@ -404,7 +419,7 @@ export class MultiProviderAgentService {
       history: this.history,
       callbacks: trackedCallbacks,
       signal,
-      systemPrompt: buildSystemPrompt(settings, project, skills),
+      systemPrompt: buildSystemPrompt(settings, project, skills, memory),
       tools,
       // โหมดวางแผนอ่านค่าล่าสุดทุกครั้ง — ผู้ใช้เปิดกลางเทิร์นแล้ว tool ถัดไปต้องหยุดแก้ไฟล์ทันที
       runTool: async (name, args) =>

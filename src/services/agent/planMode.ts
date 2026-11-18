@@ -30,6 +30,7 @@ const READ_ONLY_ACTIONS: Readonly<Record<string, ReadonlySet<string>>> = {
   browser: new Set(['navigate', 'snapshot', 'screenshot', 'scroll', 'wait', 'console']),
   docx: new Set(['open', 'read']),
   design: new Set(['list', 'open', 'versions', 'comments']),
+  memory: new Set(['view']),
 };
 
 const MCP_TOOL_PREFIX = 'mcp__';
