@@ -213,6 +213,7 @@ const TOOL_ICONS: Record<string, React.ComponentType<{ size?: number; 'aria-hidd
   docx: FileText,
   design: Palette,
   subagent: Bot,
+  web_search: Search,
 };
 
 /** action ของ tool design ที่มีหน้าให้เปิดดู */
@@ -274,7 +275,12 @@ const ToolCard: React.FC<{
   const statusText: Record<ToolCallRecord['status'], string> = {
     running: t.toolRunning,
     completed:
-      tool.output && tool.name !== 'run_shell_command' && tool.name !== 'write_file' && tool.name !== 'subagent' && !isEdit
+      tool.output &&
+      tool.name !== 'run_shell_command' &&
+      tool.name !== 'write_file' &&
+      tool.name !== 'subagent' &&
+      tool.name !== 'web_search' &&
+      !isEdit
         ? tool.output
         : t.toolSuccess,
     failed: t.toolFailed,
@@ -361,7 +367,7 @@ const ToolCard: React.FC<{
               <pre className="tool-output">{tool.output}</pre>
             </>
           )}
-          {tool.output && (tool.name === 'run_shell_command' || tool.name === 'read_background_output' || isMcp) && (
+          {tool.output && (tool.name === 'run_shell_command' || tool.name === 'read_background_output' || tool.name === 'web_search' || isMcp) && (
             <pre className="tool-output">{tool.output}</pre>
           )}
           {tool.error && <div className="tool-error">{tool.error}</div>}

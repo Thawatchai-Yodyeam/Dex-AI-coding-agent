@@ -98,6 +98,8 @@ export interface TurnContext {
   runTool: (name: string, args: Record<string, any>) => Promise<unknown>;
   /** เรียกก่อนทุก step (เริ่ม 0) — false = ผู้ใช้ให้หยุดที่เพดาน step, driver ต้องปิดเทิร์นเอง */
   shouldContinue?: (step: number) => Promise<boolean>;
+  /** ใส่ search ในตัวของค่าย (ตอนนี้มีแค่ Claude) — driver ที่ไม่รองรับไม่ต้องสนใจ */
+  nativeWebSearch?: boolean;
 }
 
 /** ข้อความที่ driver ใส่ท้ายคำตอบเมื่อผู้ใช้ให้หยุดที่เพดาน step */

@@ -243,6 +243,10 @@ export interface AppSettings {
   autoPilot: boolean;
   /** โหมดวางแผน: agent อ่านและค้นได้ แต่ tool ที่แก้ไฟล์หรือสถานะถูกกันไว้จนกว่าผู้ใช้จะอนุมัติแผน */
   planMode?: boolean;
+  /** search API ของ tool web_search (key อยู่ใน Credential Manager ไม่อยู่ใน settings) — ไม่มี/off = ไม่มี tool นี้ */
+  webSearchProvider?: 'off' | 'brave' | 'tavily';
+  /** ใช้ search ในตัวของ Claude (server tool, คิดเงินผ่านบัญชี Anthropic) แทน web_search ของ Dex */
+  claudeWebSearch?: boolean;
   cwd: string;
   apiKeys: Record<AIProvider, string>;
   permissionRules: PermissionRule[];

@@ -28,6 +28,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
   const [tab, setTab] = useState<Tab>('general');
   const [saved, setSaved] = useState(false);
   const [wallpaperError, setWallpaperError] = useState(false);
+  // key ของ search API ไม่อยู่ใน settings — พิมพ์แล้วบันทึกลง Credential Manager ตรง ๆ ตอนกดบันทึก
+  const [searchKey, setSearchKey] = useState('');
+  const [searchKeyStatus, setSearchKeyStatus] = useState<Record<string, boolean>>({});
   const dialogRef = useRef<HTMLDivElement>(null);
   const wallpaperInputRef = useRef<HTMLInputElement>(null);
 
@@ -37,6 +40,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
       setDraft(settings);
       setSaved(false);
       setWallpaperError(false);
+      setSearchKey('');
+      tauriBridge
+        .webSearchKeyStatus()
+        .then(setSearchKeyStatus)
+        .catch(() => setSearchKeyStatus({}));
       if (initialTab) setTab(initialTab);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -59,7 +67,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
   const draftWallpaperUrl = resolveWallpaper(draft.wallpaper);
   const activeKeys = Object.values(draft.apiKeys).filter((k) => k.trim()).length;
 
+  const searchProvider = draft.webSearchProvider ?? 'off';
+  const removeSearchKey = () => {
+    if (searchProvider === 'off') return;
+    tauriBridge
+      .saveWebSearchKey(searchProvider, '')
+      .then(() => tauriBridge.webSearchKeyStatus().then(setSearchKeyStatus))
+      .catch((e) => console.error('Failed to remove web search key:', e));
+  };
+
   const handleSave = () => {
+    if (searchProvider !== 'off' && searchKey.trim()) {
+      tauriBridge.saveWebSearchKey(searchProvider, searchKey).catch((e) => console.error('Failed to save web search key:', e));
+    }
     // แก้รายชื่อโมเดลของ custom endpoint จนโมเดลที่เลือกอยู่หายไป → ใช้ตัวแรกของรายการใหม่
     const customIds = customModelIds(draft);
     const model = draft.provider === 'custom' && !customIds.includes(draft.model) ? (customIds[0] ?? '') : draft.model;
@@ -400,6 +420,58 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, s
                     value={draft.apiKeys.custom ?? ''}
                     onChange={(e) => setKey('custom', e.target.value)}
                   />
+                </fieldset>
+
+                <fieldset className="field custom-endpoint">
+                  <legend className="field-label">{t.webSearchTitle}</legend>
+                  <p className="field-hint">{t.webSearchHint}</p>
+                  <label htmlFor="search-provider" className="field-sublabel">
+                    {t.webSearchProviderLabel}
+                  </label>
+                  <select
+                    id="search-provider"
+                    className="input"
+                    value={searchProvider}
+                    onChange={(e) => {
+                      setSearchKey('');
+                      patch({ webSearchProvider: e.target.value as AppSettings['webSearchProvider'] });
+                    }}
+                  >
+                    <option value="off">{t.webSearchOff}</option>
+                    <option value="brave">Brave Search</option>
+                    <option value="tavily">Tavily</option>
+                  </select>
+                  {searchProvider !== 'off' && (
+                    <>
+                      <label htmlFor="search-key" className="field-sublabel">
+                        {t.webSearchKeyLabel(searchProvider === 'brave' ? 'Brave' : 'Tavily')}
+                      </label>
+                      <input
+                        id="search-key"
+                        type="password"
+                        autoComplete="off"
+                        spellCheck={false}
+                        className="input input-mono"
+                        placeholder={searchKeyStatus[searchProvider] ? t.webSearchKeySaved : t.webSearchKeyMissing}
+                        value={searchKey}
+                        onChange={(e) => setSearchKey(e.target.value)}
+                      />
+                      {searchKeyStatus[searchProvider] && !searchKey && (
+                        <button type="button" className="btn btn-secondary btn-sm" onClick={removeSearchKey}>
+                          {t.webSearchKeyRemove}
+                        </button>
+                      )}
+                    </>
+                  )}
+                  <label className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={draft.claudeWebSearch === true}
+                      onChange={(e) => patch({ claudeWebSearch: e.target.checked })}
+                    />
+                    <span>{t.claudeWebSearchLabel}</span>
+                  </label>
+                  <p className="field-hint">{t.claudeWebSearchHint}</p>
                 </fieldset>
               </>
             )}

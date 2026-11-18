@@ -869,6 +869,15 @@ pre,
   background: var(--accent-soft);
 }
 
+/* checkbox พร้อมข้อความในฟอร์มตั้งค่า */
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  cursor: pointer;
+}
+
 /* แถบอนุมัติแผนใต้คำตอบที่เกิดในโหมดวางแผน */
 .plan-approve {
   display: flex;

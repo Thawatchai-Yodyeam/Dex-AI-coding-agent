@@ -9,7 +9,7 @@ import { parseMcpConfig } from '../mcp/config';
 import { McpManager } from '../mcp/manager';
 import { summarizeToolUsage } from '../mcp/toolUsage';
 import { MultiProviderAgentService, STEPS_PER_CONFIRM } from './AgentService';
-import { CHAT_BUILTIN_TOOLS } from './subagent';
+import { chatBuiltinTools } from './subagent';
 import { AgentAbortError } from './types';
 import type { AgentCallbacks } from './types';
 
@@ -347,7 +347,7 @@ describe('disabled MCP tools reach no provider', () => {
     });
     const { agent, manager } = await agentWith(openai);
     await agent.sendMessage({ text: 'hi' }, noCallbacks());
-    const usage = summarizeToolUsage(manager.statuses(), CHAT_BUILTIN_TOOLS);
+    const usage = summarizeToolUsage(manager.statuses(), chatBuiltinTools({ provider: 'openai' }));
     expect(bodies[0].tools).toHaveLength(usage.totalTools);
     expect(usage.mcpTools).toBe(1);
     fetchSpy.mockRestore();

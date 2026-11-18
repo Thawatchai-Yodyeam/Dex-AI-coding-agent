@@ -3,6 +3,7 @@ import { blockedInPlanMode } from './planMode';
 import { USE_SKILL_TOOL } from './skills';
 import type { SkillInfo } from '../tauriBridge';
 import { TOOL_DEFINITIONS, type McpToolRunner } from './tools';
+import { WEB_SEARCH_TOOL, usesClientWebSearch } from './webSearch';
 import { stepLimitNote, type AgentCallbacks, type ToolDefinition, type TurnContext, type TurnResult, type UserInput } from './types';
 
 /**
@@ -42,8 +43,10 @@ export const SUBAGENT_TOOL: ToolDefinition = {
   },
 };
 
-/** tool ในตัวที่แชทหลักส่งให้โมเดลทุกเทิร์น (ก่อน use_skill และ MCP) — หน้า Customizations นับจากรายการเดียวกันนี้ */
-export const CHAT_BUILTIN_TOOLS: readonly ToolDefinition[] = [...TOOL_DEFINITIONS, SUBAGENT_TOOL];
+/** tool ในตัวที่แชทหลักส่งให้โมเดล (ก่อน use_skill และ MCP) — หน้า Customizations นับจากรายการเดียวกันนี้ */
+export function chatBuiltinTools(settings: Pick<AppSettings, 'provider' | 'claudeWebSearch' | 'webSearchProvider'>): ToolDefinition[] {
+  return [...TOOL_DEFINITIONS, SUBAGENT_TOOL, ...(usesClientWebSearch(settings) ? [WEB_SEARCH_TOOL] : [])];
+}
 
 /** tool ในตัวที่ subagent ได้ — เฉพาะตัวที่อ่านอย่างเดียว และไม่แตะของที่มีชิ้นเดียวในแอป (browser pane, เอกสาร Word, แผนงานในแชท) */
 const SUBAGENT_BUILTIN_TOOLS: ReadonlySet<string> = new Set([
@@ -52,6 +55,7 @@ const SUBAGENT_BUILTIN_TOOLS: ReadonlySet<string> = new Set([
   'grep_search',
   'find_files',
   'web_fetch',
+  'web_search',
   'run_shell_command',
 ]);
 
@@ -83,7 +87,7 @@ export function subagentSystemPrompt(settings: AppSettings, skillsSection: strin
 
 Environment:
 - Shell: PowerShell, read-only commands only. Workspace: ${settings.cwd}
-- You can read and search files, run read-only shell commands and fetch web pages. You cannot change files, start background commands, or ask anyone questions.
+- You can read and search files, run read-only shell commands, and search and fetch web pages when those tools are listed. You cannot change files, start background commands, or ask anyone questions.
 
 How to work:
 - Use tools to find facts; never guess file contents. Request several reads or searches in the same step — they run in parallel.
@@ -110,6 +114,8 @@ export interface SubagentDeps {
   /** ใช้ดูว่า MCP tool ประกาศ readOnlyHint ไหม */
   mcp?: Pick<McpToolRunner, 'isReadOnly'>;
   signal?: AbortSignal;
+  /** ใช้ search ในตัวของค่ายเหมือนแชทหลัก */
+  nativeWebSearch?: boolean;
 }
 
 export interface SubagentResult {
@@ -161,6 +167,7 @@ export async function runSubagent(
     },
     // ไม่ถามผู้ใช้ทุก 50 step เหมือนแชทหลัก — subagent หยุดเองที่เพดานแล้วรายงานเท่าที่ได้
     shouldContinue: async (step) => step < SUBAGENT_MAX_STEPS,
+    nativeWebSearch: deps.nativeWebSearch,
   };
 
   const result = await deps.driver(ctx, { text: prompt });

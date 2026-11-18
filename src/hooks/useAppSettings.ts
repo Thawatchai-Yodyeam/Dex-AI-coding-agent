@@ -101,6 +101,9 @@ function loadSettings(): AppSettings {
       reasoningEffort,
       language: parsed.language === 'en' ? 'en' : 'th',
       planMode: parsed.planMode === true,
+      webSearchProvider:
+        parsed.webSearchProvider === 'brave' || parsed.webSearchProvider === 'tavily' ? parsed.webSearchProvider : 'off',
+      claudeWebSearch: parsed.claudeWebSearch === true,
       cwd: typeof parsed.cwd === 'string' ? parsed.cwd : '',
       apiKeys,
       permissionRules: sanitizeRules(parsed.permissionRules),

@@ -33,6 +33,7 @@ Works with many providers (Claude · GPT · Gemini · DeepSeek · Qwen · Ollama
 | 🔁 **Regenerate and edit** | Regenerate an answer, or edit an earlier message and resend from there. The agent still remembers the tools it used in earlier turns. |
 | 💾 **Picks up where you left off** | Full history, including tool results, is saved per chat, so you can switch chats or reopen the app and keep working. |
 | 📎 **`@file`** | Type `@` in the chat box and pick a file. Its contents are attached right away, so the agent spends no step reading it. |
+| 🔎 **Web search** | The agent can search the web with a Brave or Tavily key you add, with any model. Claude can use its own built-in search instead. |
 | 🌐 **Reads web pages** | The `web_fetch` tool reads docs, changelogs and issues (HTML is converted to text and split into pages). It asks before each new domain. |
 | 🧭 **In-app browser** | A pane on the right (🗔 button, top right) lets the agent open your dev server and test it: read the page outline, click, type, press keys, check the console and errors, and take screenshots for models that can see images. You can use the URL bar yourself too. |
 | 🎨 **Dex Design** | Ask for a website, app screen or prototype in chat and see it on a canvas beside the conversation. Switch between desktop, tablet and mobile, click part of the page to comment on it, compare options side by side, go back to old versions and export as HTML. The agent can open the page to check its own work. |
@@ -160,6 +161,15 @@ Create this file in the workspace root. The app uses the first one it finds, in 
 
 The file is read again every turn, so edits apply immediately (up to 20,000 characters).
 
+### Web search
+
+Turn it on in ⚙️ Settings → API Keys → **Web search**.
+
+- **Search service (any model):** choose Brave Search or Tavily and paste your key. The agent gets a `web_search` tool that returns titles, links and short snippets, then reads the pages that matter with `web_fetch`. The key goes to Credential Manager as `search-brave` or `search-tavily` and never reaches the web page side of the app. You can set `BRAVE_API_KEY` or `TAVILY_API_KEY` instead. Each search is billed by that service under your plan.
+- **Claude's built-in search:** tick **Claude: use Claude's built-in search instead** and Claude runs its searches on Anthropic's side, billed to your Claude account at $10 per 1,000 searches, at most 5 per request. While it is on, Dex's `web_search` is not sent to Claude, so the two never clash; other providers keep using the search service. Searches appear in the chat as **Web search** cards with the links found.
+- **Gemini and OpenAI:** these use the search service above. Google's terms for Gemini's built-in search do not allow its results to be stored or reused except to show them to the user, which conflicts with how Dex saves chats, switches providers and summarizes with subagents. OpenAI offers its built-in search only through the Responses API, while Dex uses Chat Completions.
+- Search queries go only to the service you chose. In Supervised mode each search asks first, and a *deny* rule of type web for `api.search.brave.com` or `api.tavily.com` blocks it. Search is read-only, so it also works in Plan mode and in subagents. Results are treated as untrusted web content.
+
 ### Subagents
 
 When a question means reading many files, such as mapping how a feature works across the codebase, the agent can call the `subagent` tool with a written brief instead of reading everything itself.
@@ -269,6 +279,7 @@ src/
       compaction.ts         summarises old turns with the model when history is nearly full
       planMode.ts           which tools Plan mode lets through + the notes sent to the agent
       subagent.ts           read-only subagent: its tools, system prompt and run loop
+      webSearch.ts          web_search tool, which search the chat uses, Claude's built-in search tool
       mentions.ts           attaches the contents of files the user @-mentions
       retry.ts              retries on 429/5xx/529/network loss (exponential backoff + retry-after)
       skills.ts             finds/reads SKILL.md, use_skill tool, /skill-name
@@ -300,7 +311,7 @@ src/
     notify.ts               Windows notifications
     i18n.ts                 Thai and English strings
 src-tauri/src/lib.rs        Rust commands: shell (timeout/background), files (sandbox, paging, multi-edit),
-                            search (regex/glob), git snapshot, checkpoint files, keyring, skills, MCP transport, web_fetch,
+                            search (regex/glob), git snapshot, checkpoint files, web search (Brave/Tavily), keyring, skills, MCP transport, web_fetch,
                             browser pane (child webview + WebView2 DevTools protocol), design server (+ unit tests)
 ```
 

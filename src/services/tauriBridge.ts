@@ -22,6 +22,13 @@ export interface SkillInfo {
   managed?: boolean;
 }
 
+/** ผลค้นเว็บหนึ่งรายการ (ดู SearchResult ใน lib.rs) */
+export interface SearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
 export interface WebPage {
   /** URL สุดท้ายหลังตาม redirect ภายในโดเมนเดียวกัน */
   url: string;
@@ -425,6 +432,21 @@ export const tauriBridge = {
   /** GET หน้าเว็บผ่าน Rust (ไม่ติด CORS) — HTML ถูกแปลงเป็นข้อความ */
   async webFetch(url: string): Promise<WebPage> {
     return await invoke('web_fetch', { url });
+  },
+
+  /** ค้นผ่าน Brave/Tavily — ฝั่ง Rust อ่าน key เอง (error ขึ้นต้น NO_SEARCH_KEY: = ยังไม่มี key) */
+  async webSearch(provider: 'brave' | 'tavily', query: string, count?: number): Promise<SearchResult[]> {
+    return await invoke('web_search', { provider, query, count });
+  },
+
+  /** มี key ของ search provider ไหนแล้วบ้าง (ไม่คืนตัว key) */
+  async webSearchKeyStatus(): Promise<Record<string, boolean>> {
+    return await invoke('web_search_key_status');
+  },
+
+  /** บันทึก/ลบ key ของ search provider ใน Credential Manager (ค่าว่าง = ลบ) */
+  async saveWebSearchKey(provider: 'brave' | 'tavily', key: string): Promise<void> {
+    await invoke('save_api_key', { provider: `search-${provider}`, key });
   },
 
   /** สร้าง browser pane (ครั้งแรก) หรือแสดงที่ตำแหน่งใหม่ — initScript รันก่อนสคริปต์ของทุกหน้า (ใช้ตอนสร้างเท่านั้น) */

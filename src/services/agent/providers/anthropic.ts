@@ -3,6 +3,8 @@ import { dropOldToolImages, trimToolResults } from '../history';
 import { TransientApiError, httpError, withRetry } from '../retry';
 import { readSseData, tryParseJson } from '../sse';
 import { isToolError, runToolCalls, toolResultToString } from '../tools';
+import { claudeSearchOutcome, claudeWebSearchTool } from '../webSearch';
+import type { ToolCallRecord } from '../../../types/agent';
 import {
   addUsage,
   appendStepText,
@@ -17,6 +19,23 @@ import {
 } from '../types';
 
 const API_URL = 'https://api.anthropic.com/v1/messages';
+
+/** pause_turn ติดกันได้กี่ครั้งก่อนเลิก (server tool loop ของ API หยุดพักทุก ~10 รอบ) */
+const MAX_PAUSE_CONTINUATIONS = 5;
+
+/** การ์ดในแชทของการค้นที่ Claude ทำเองฝั่งเซิร์ฟเวอร์ — UI แสดงแบบเดียวกับ tool ของ Dex */
+function searchRecord(use: StreamBlock, result?: StreamBlock): ToolCallRecord {
+  const query = typeof use.input?.query === 'string' ? use.input.query : '';
+  const record: ToolCallRecord = { id: use.id, name: 'web_search', args: { query }, status: 'running' };
+  if (!result) return record;
+  const { hits, error } = claudeSearchOutcome(result);
+  if (error) return { ...record, status: 'failed', error: `Claude web search: ${error}` };
+  return {
+    ...record,
+    status: 'completed',
+    output: hits.length ? hits.map((h) => `${h.title} — ${h.url}`).join('\n') : 'No results',
+  };
+}
 const DEFAULT_MODEL = 'claude-opus-5-5';
 const MAX_TOKENS = 32_000;
 
@@ -84,6 +103,14 @@ export function withCacheBreakpoints(history: any[]): any[] {
 /** content block ระหว่างสตรีม — เก็บ field ดิบไว้ทั้งหมดเพื่อส่งคืน API แบบไม่แก้ไข */
 type StreamBlock = Record<string, any> & { type: string; _json?: string };
 
+/** server_tool_use ที่ input สตรีมมาเป็น JSON — แปลงเป็น object และเอา field ภายในออก */
+function withParsedInput(block: StreamBlock): StreamBlock {
+  if (block._json === undefined) return block;
+  const { _json, ...rest } = block;
+  const parsed = tryParseJson(_json || '{}');
+  return { ...rest, input: parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : (rest.input ?? {}) };
+}
+
 /** ข้อความผู้ใช้: string ล้วนถ้าไม่มีรูป (ประวัติเดิมเป็นแบบนี้) ไม่งั้นเป็น image block ตามด้วย text */
 export function anthropicUserContent(input: UserInput): string | any[] {
   const images = imagesWithData(input);
@@ -118,13 +145,16 @@ export async function runAnthropicTurn(ctx: TurnContext, input: UserInput): Prom
   const { settings, callbacks, signal, history } = ctx;
   const model = settings.model || DEFAULT_MODEL;
 
-  const tools = ctx.tools.map((t) => ({
+  const tools: Record<string, unknown>[] = ctx.tools.map((t) => ({
     name: t.name,
     description: t.description,
     input_schema: t.parameters,
     // สตรีม tool input ทันที (เนื้อหาไฟล์ยาวไม่ต้องรอ buffer) — input อาจไม่ครบ จึงต้อง validate เอง
     eager_input_streaming: true,
   }));
+  // search ในตัวของ Claude รันฝั่งเซิร์ฟเวอร์: ผลมาเป็น server_tool_use + web_search_tool_result ใน content เดียวกัน
+  // (ไม่ใส่ eager_input_streaming — ใช้กับ server tool ไม่ได้)
+  if (ctx.nativeWebSearch) tools.push(claudeWebSearchTool(model));
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -140,6 +170,7 @@ export async function runAnthropicTurn(ctx: TurnContext, input: UserInput): Prom
   let fullText = '';
   let fullThought = '';
   const usage = emptyUsage();
+  let pauses = 0;
 
   // วนจนโมเดลตอบจบเอง — ผู้ใช้หยุดได้ด้วยปุ่ม Stop (abort signal) และถูกถามทุก STEPS_PER_CONFIRM step
   for (let step = 0; ; step++) {
@@ -212,8 +243,20 @@ export async function runAnthropicTurn(ctx: TurnContext, input: UserInput): Prom
               break;
             case 'content_block_start': {
               const block: StreamBlock = { ...ev.content_block };
-              if (block.type === 'tool_use') block._json = '';
+              if (block.type === 'tool_use' || block.type === 'server_tool_use') block._json = '';
               blocks[ev.index] = block;
+              if (block.type === 'web_search_tool_result') {
+                // ผลมาครบใน block_start — จับคู่กับคำค้นที่สตรีมมาก่อนหน้า แล้วอัปเดตการ์ด
+                const use = blocks.find((b) => b?.type === 'server_tool_use' && b.id === block.tool_use_id);
+                if (use) callbacks.onToolUpdate(searchRecord(withParsedInput(use), block));
+              }
+              break;
+            }
+            case 'content_block_stop': {
+              const block = blocks[ev.index];
+              if (block?.type === 'server_tool_use' && block.name === 'web_search') {
+                callbacks.onToolStart(searchRecord(withParsedInput(block)));
+              }
               break;
             }
             case 'content_block_delta': {
@@ -253,6 +296,8 @@ export async function runAnthropicTurn(ctx: TurnContext, input: UserInput): Prom
     // แปลง tool_use input จาก JSON ที่สตรีมมา; JSON เสีย (โดนตัดเพราะ max_tokens) → ทำเครื่องหมายไว้ไม่รัน
     const invalidToolIds = new Set<string>();
     const content = blocks.filter(Boolean).map((b) => {
+      // server tool: API รันเองแล้ว แค่ต้องส่ง input กลับเป็น object
+      if (b.type === 'server_tool_use') return withParsedInput(b);
       if (b.type !== 'tool_use') return b;
       const { _json, ...rest } = b;
       const parsed = tryParseJson(_json || '{}');
@@ -265,6 +310,13 @@ export async function runAnthropicTurn(ctx: TurnContext, input: UserInput): Prom
 
     // ส่ง content ทุก block กลับไปแบบไม่แก้ไข (thinking + signature จำเป็นต่อ tool loop)
     if (content.length > 0) history.push({ role: 'assistant', content });
+
+    // server tool loop หยุดพัก: ส่งประวัติเดิมไปอีกรอบ API จะทำต่อเอง (ห้ามเติมข้อความ user)
+    if (stopReason === 'pause_turn' && content.length > 0 && pauses < MAX_PAUSE_CONTINUATIONS) {
+      pauses++;
+      continue;
+    }
+    pauses = 0;
 
     if (stopReason === 'refusal') {
       const note = settings.language === 'en'

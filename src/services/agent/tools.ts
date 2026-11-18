@@ -21,6 +21,7 @@ import { PLAN_MODE_BLOCKED, blockedInPlanMode } from './planMode';
 import { supportsImages } from '../../types/agent';
 import type { AgentCallbacks, PermissionStore } from './types';
 import type { SubagentResult } from './subagent';
+import { WEB_SEARCH_DEFAULT_RESULTS, WEB_SEARCH_MAX_RESULTS, webSearchProviderOf } from './webSearch';
 
 const SHELL_DEFAULT_TIMEOUT_SECS = 120;
 /** ต้องตรงกับ MAX_TIMEOUT_SECS ฝั่ง Rust */
@@ -1420,6 +1421,7 @@ const PARALLEL_SAFE_TOOLS: ReadonlySet<string> = new Set([
   'use_skill',
   'web_fetch',
   'subagent',
+  'web_search',
 ]);
 
 /**
@@ -1450,6 +1452,42 @@ export async function runToolCalls<C, R>(
 
 /** tool ที่มีเฉพาะบางเทิร์น (ไม่อยู่ใน TOOL_DEFINITIONS): use_skill เมื่อมี skill, subagent ในแชทหลัก */
 const EXTRA_HANDLERS: Record<string, ToolHandler> = {
+  async web_search(args, env) {
+    const query = str(args.query ?? args.q).trim();
+    if (!query) return failTool(env, 'web_search needs a query');
+    const provider = webSearchProviderOf(env.settings);
+    if (provider === 'off') return failTool(env, 'Web search is turned off in Settings. Ask the user to turn it on, or use web_fetch with a URL you know.');
+    // คำค้นออกไปที่ search API ที่ผู้ใช้เลือกเองเท่านั้น — กฎ web แบบ deny ของโดเมนนั้นยังมีผล, Supervised ถามทุกครั้ง
+    const host = provider === 'brave' ? 'api.search.brave.com' : 'api.tavily.com';
+    const verdict = evaluateRules(env.permissions.rules(), 'web', host);
+    if (verdict?.action === 'deny') return blockedByRule(env, verdict.rule);
+    if (verdict?.action !== 'allow' && !env.settings.autoPilot) {
+      const rejected = await requireApproval(env, 'User rejected the web search', 'supervised', { tool: 'web', pattern: host });
+      if (rejected) return rejected;
+    }
+    markRunning(env);
+    const count = Math.min(num(args.count ?? args.max_results, WEB_SEARCH_DEFAULT_RESULTS), WEB_SEARCH_MAX_RESULTS);
+    let results;
+    try {
+      results = await untilAborted(tauriBridge.webSearch(provider, query, count), env.context.signal);
+    } catch (err: any) {
+      const message = String(err?.message ?? err);
+      return failTool(
+        env,
+        message.startsWith('NO_SEARCH_KEY:')
+          ? `${message.slice('NO_SEARCH_KEY:'.length).trim()} Tell the user; do not retry.`
+          : message
+      );
+    }
+    env.record.status = 'completed';
+    env.record.output = results.length ? results.map((r) => `${r.title} — ${r.url}`).join('\n') : 'No results';
+    return {
+      query,
+      results,
+      note: `${results.length ? 'Read the pages that matter with web_fetch. ' : 'No results; try a different query. '}${UNTRUSTED_WEB_NOTE}`,
+    };
+  },
+
   async subagent(args, env) {
     const prompt = str(args.prompt ?? args.task).trim();
     if (!prompt) return failTool(env, 'subagent needs a prompt');

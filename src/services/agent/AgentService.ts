@@ -15,9 +15,9 @@ import { runGoogleTurn } from './providers/google';
 import { runOpenAITurn } from './providers/openai';
 import { withToolLimitErrors } from './providers/toolLimits';
 import { loadSkills, skillsPromptSection, USE_SKILL_TOOL } from './skills';
-import { CHAT_BUILTIN_TOOLS, runSubagent, subagentSystemPrompt, subagentTools } from './subagent';
+import { chatBuiltinTools, runSubagent, subagentSystemPrompt, subagentTools } from './subagent';
+import { usesNativeWebSearch } from './webSearch';
 import {
-  TOOL_DEFINITIONS,
   compactToolResult,
   executeTool,
   resolveWorkspacePath,
@@ -324,15 +324,17 @@ export class MultiProviderAgentService {
     throwIfAborted(signal);
     const mcp = this.mcp;
     const mcpTools = mcp?.toolDefinitions() ?? [];
+    const builtins = chatBuiltinTools(settings);
+    const nativeWebSearch = usesNativeWebSearch(settings);
     const tools: ToolDefinition[] = [
-      ...CHAT_BUILTIN_TOOLS,
+      ...builtins,
       ...(skills.length > 0 ? [USE_SKILL_TOOL] : []),
       ...mcpTools,
     ];
     const format = formatFor(provider);
     // token ที่ subagent ใช้ นับรวมกับของเทิร์นนี้ (คนจ่ายเงินคนเดียวกัน)
     const subagentUsage = emptyUsage();
-    const subTools = subagentTools(TOOL_DEFINITIONS, mcpTools, skills, (name) => mcp?.isReadOnly(name) ?? false);
+    const subTools = subagentTools(builtins, mcpTools, skills, (name) => mcp?.isReadOnly(name) ?? false);
     const subagentContext: ToolContext = { skills, signal, ...(mcp ? { mcp } : {}) };
     const toolContext: ToolContext = {
       ...subagentContext,
@@ -352,6 +354,7 @@ export class MultiProviderAgentService {
               ),
             mcp: mcp ?? undefined,
             signal,
+            nativeWebSearch,
           },
           prompt,
           record,
@@ -367,7 +370,8 @@ export class MultiProviderAgentService {
     this.history = pruneHistory(this.historyFor(format), format, MAX_HISTORY_MESSAGES);
     // Claude 5.1 ขึ้นไปผูก thinking block กับชุด tool ตอนที่สร้าง: เปิด/ปิด tool หรือ server กลางแชทแล้วส่ง block เดิมไป
     // API จะตอบ 400 ทุกคำขอ จึงถอดออกก่อน (โมเดลเสียแค่เหตุผลเก่า ส่วนข้อความกับผลของ tool ยังอยู่ครบ)
-    const toolSetId = toolSetIdOf(tools);
+    // search ในตัวของ Claude อยู่ในรายการ tool ของ request ด้วย — เปิด/ปิดแล้วต้องนับเป็นชุด tool ใหม่
+    const toolSetId = toolSetIdOf(nativeWebSearch ? [...tools, { name: 'native:web_search', description: '', parameters: {} }] : tools);
     if (format === 'anthropic' && this.toolSetId !== toolSetId) this.history = stripThinking(this.history);
     this.toolSetId = toolSetId;
     // ถูกแทนหลังสรุปบทสนทนา (ถ้ามี) — catch ใช้ย้อนประวัติของเทิร์นนี้
@@ -409,6 +413,7 @@ export class MultiProviderAgentService {
           name
         ),
       shouldContinue: (step) => confirmContinue(step, trackedCallbacks),
+      nativeWebSearch,
     };
 
     try {

@@ -19,6 +19,7 @@ const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   'read_background_output',
   'update_todos',
   'web_fetch',
+  'web_search',
   'use_skill',
   // subagent อ่านอย่างเดียวในตัวเอง (ดู subagent.ts)
   'subagent',

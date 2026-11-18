@@ -3227,6 +3227,181 @@ async fn web_fetch(url: String) -> Result<WebPage, String> {
         .map_err(|e| e.to_string())?
 }
 
+// 6.5 ค้นเว็บผ่าน search API ที่ผู้ใช้ใส่ key เอง (ใช้ได้กับทุกโมเดล)
+// key อ่านจาก Credential Manager (`search-<provider>`) หรือตัวแปรสภาพแวดล้อม — ฝั่ง webview ไม่ต้องถือ key เลย
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct SearchResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+const WEB_SEARCH_MAX_RESULTS: usize = 10;
+const WEB_SEARCH_MAX_QUERY_CHARS: usize = 400;
+const WEB_SEARCH_MAX_SNIPPET_CHARS: usize = 600;
+
+fn search_env_names(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "brave" => &["BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY"],
+        "tavily" => &["TAVILY_API_KEY"],
+        _ => &[],
+    }
+}
+
+/// key ของ search provider: Credential Manager ก่อน แล้วค่อยตัวแปรสภาพแวดล้อม
+fn search_api_key(provider: &str) -> Option<String> {
+    if let Ok(entry) = keyring_entry(&format!("search-{}", provider)) {
+        if let Ok(key) = entry.get_password() {
+            if !key.trim().is_empty() {
+                return Some(key.trim().to_string());
+            }
+        }
+    }
+    search_env_names(provider)
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    let t = text.trim();
+    if t.chars().count() <= max {
+        return t.to_string();
+    }
+    format!("{}…", t.chars().take(max).collect::<String>())
+}
+
+/// Brave ใส่ <strong> ในคำอธิบาย — เอาแท็กออกและถอด entity ที่พบบ่อย
+fn strip_search_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for c in text.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&").replace("&quot;", "\"").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">")
+}
+
+fn parse_brave_results(json: &serde_json::Value) -> Vec<SearchResult> {
+    json["web"]["results"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|r| {
+                    let url = r["url"].as_str()?.to_string();
+                    Some(SearchResult {
+                        title: strip_search_markup(r["title"].as_str().unwrap_or("")),
+                        url,
+                        snippet: clip_chars(&strip_search_markup(r["description"].as_str().unwrap_or("")), WEB_SEARCH_MAX_SNIPPET_CHARS),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_tavily_results(json: &serde_json::Value) -> Vec<SearchResult> {
+    json["results"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|r| {
+                    Some(SearchResult {
+                        title: r["title"].as_str().unwrap_or("").to_string(),
+                        url: r["url"].as_str()?.to_string(),
+                        snippet: clip_chars(r["content"].as_str().unwrap_or(""), WEB_SEARCH_MAX_SNIPPET_CHARS),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// ข้อความ error ของ search API — ตัดให้สั้นและไม่มีทางมี key อยู่ในนั้น (key ไปใน header เท่านั้น)
+fn search_http_error(provider: &str, status: u16, body: &str) -> String {
+    let hint = match status {
+        401 | 403 => " (key ไม่ถูกต้องหรือหมดอายุ)",
+        429 => " (เกินโควตาหรือ rate limit)",
+        _ => "",
+    };
+    format!("{} search: HTTP {}{} {}", provider, status, hint, clip_chars(body, 300))
+}
+
+fn run_web_search(provider: &str, query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+    use std::io::Read;
+    if !matches!(provider, "brave" | "tavily") {
+        return Err(format!("ไม่รู้จัก search provider: {}", provider));
+    }
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("query ว่าง".to_string());
+    }
+    let query = clip_chars(query, WEB_SEARCH_MAX_QUERY_CHARS);
+    let count = count.clamp(1, WEB_SEARCH_MAX_RESULTS);
+    let key = search_api_key(provider).ok_or_else(|| {
+        format!(
+            "NO_SEARCH_KEY: ยังไม่มี key ของ {} — ใส่ได้ที่ Settings → API Keys → Web search หรือตั้งตัวแปร {}",
+            provider,
+            search_env_names(provider).join(" / ")
+        )
+    })?;
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(20)).redirects(0).user_agent("dex-agent").build();
+    let result = match provider {
+        "brave" => {
+            let mut url = url::Url::parse("https://api.search.brave.com/res/v1/web/search").map_err(|e| e.to_string())?;
+            url.query_pairs_mut().append_pair("q", &query).append_pair("count", &count.to_string());
+            agent.get(url.as_str()).set("Accept", "application/json").set("X-Subscription-Token", &key).call()
+        }
+        "tavily" => {
+            let body = serde_json::json!({ "query": query, "max_results": count, "search_depth": "basic" });
+            agent
+                .post("https://api.tavily.com/search")
+                .set("Content-Type", "application/json")
+                .set("Authorization", &format!("Bearer {}", key))
+                .send_string(&body.to_string())
+        }
+        other => return Err(format!("ไม่รู้จัก search provider: {}", other)),
+    };
+    let resp = match result {
+        Ok(r) => r,
+        Err(ureq::Error::Status(status, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            return Err(search_http_error(provider, status, &body));
+        }
+        Err(e) => return Err(format!("{} search: เชื่อมต่อไม่สำเร็จ: {}", provider, e)),
+    };
+    let mut text = String::new();
+    resp.into_reader()
+        .take(2 * 1024 * 1024)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("{} search: อ่านผลไม่สำเร็จ: {}", provider, e))?;
+    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{} search: ผลไม่ใช่ JSON: {}", provider, e))?;
+    let mut results = if provider == "brave" { parse_brave_results(&json) } else { parse_tavily_results(&json) };
+    results.truncate(count);
+    Ok(results)
+}
+
+#[tauri::command]
+async fn web_search(provider: String, query: String, count: Option<usize>) -> Result<Vec<SearchResult>, String> {
+    tokio::task::spawn_blocking(move || run_web_search(&provider, &query, count.unwrap_or(5)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// มี key ของ search provider ไหนแล้วบ้าง (ไม่คืนตัว key)
+#[tauri::command]
+fn web_search_key_status() -> HashMap<String, bool> {
+    ["brave", "tavily"].iter().map(|p| (p.to_string(), search_api_key(p).is_some())).collect()
+}
+
 // 7.1 API key เก็บใน Windows Credential Manager (เข้ารหัสด้วยบัญชีผู้ใช้ของ Windows) แทน localStorage
 const KEYRING_SERVICE: &str = "com.thegrace.dex";
 
@@ -4245,6 +4420,8 @@ pub fn run() {
             save_chat_session,
             load_chat_sessions,
             delete_chat_session,
+            web_search,
+            web_search_key_status,
             save_checkpoint,
             load_checkpoints,
             delete_checkpoint,
@@ -4855,6 +5032,35 @@ mod tests {
         assert!(snapshot_file(ws.join(".env").to_string_lossy().to_string(), ws_str, None).is_err());
 
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn search_results_are_normalised_from_both_providers() {
+        let brave = serde_json::json!({ "web": { "results": [
+            { "title": "Rust <strong>book</strong>", "url": "https://doc.rust-lang.org/book/", "description": "The <strong>Rust</strong> &amp; you" },
+            { "title": "no url" }
+        ] } });
+        assert_eq!(
+            parse_brave_results(&brave),
+            vec![SearchResult { title: "Rust book".into(), url: "https://doc.rust-lang.org/book/".into(), snippet: "The Rust & you".into() }]
+        );
+        assert!(parse_brave_results(&serde_json::json!({})).is_empty());
+
+        let tavily = serde_json::json!({ "results": [
+            { "title": "T", "url": "https://t.example/a", "content": "x".repeat(2000) }
+        ] });
+        let parsed = parse_tavily_results(&tavily);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].snippet.chars().count() <= WEB_SEARCH_MAX_SNIPPET_CHARS + 1);
+        assert!(parse_tavily_results(&serde_json::json!({ "results": "nope" })).is_empty());
+    }
+
+    #[test]
+    fn web_search_rejects_bad_input_before_any_request() {
+        assert!(run_web_search("brave", "   ", 5).is_err());
+        assert!(run_web_search("bing", "rust", 5).unwrap_err().contains("bing"));
+        assert!(search_http_error("brave", 401, "denied").contains("401"));
+        assert_eq!(strip_search_markup("a <b>b</b> &lt;c&gt;"), "a b <c>");
     }
 
     #[test]
