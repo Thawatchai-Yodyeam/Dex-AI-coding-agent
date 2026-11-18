@@ -424,6 +424,61 @@ fn is_read_only_git(args: &[&str]) -> bool {
 /// timeout สูงสุดที่ agent ขอได้ (build ใหญ่ ๆ ครั้งแรกอาจนานหลายนาที)
 const MAX_TIMEOUT_SECS: u64 = 1800;
 
+/// เวลาที่รอให้ stdout/stderr ปิดหลัง PowerShell จบ — process ที่คำสั่งเปิดทิ้งไว้ (เช่น `Start-Process -NoNewWindow`)
+/// ได้ pipe ไปด้วยและถือไว้ตลอดอายุของมัน ถ้ารอจน pipe ปิด dev server จะทำให้เทิร์นค้างไม่มีกำหนดและกดหยุดไม่ได้
+/// (process ถูกเอาออกจาก running_processes ไปแล้ว)
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// ต่อท้าย stderr ให้โมเดลรู้ว่ามี process ค้างอยู่และควรใช้ run_in_background แทน
+const HELD_PIPE_NOTE: &str = "[Dex] PowerShell exited, but a process this command started is still running and holding the output open \
+(for example Start-Process -NoNewWindow), so Dex stopped waiting for more output. That process keeps running and Dex does not track it: \
+start servers and watchers with run_in_background instead.\n";
+
+/// อ่าน stream ทีละบรรทัด สะสมไว้ให้ execute_command และส่งแต่ละบรรทัดให้ `on_line` (สตรีมเข้า Terminal)
+struct LineCollector {
+    /// None = เอา output ไปแล้ว — reader ยังส่งบรรทัดให้ on_line ต่อแต่ไม่สะสม (กันหน่วยความจำโตตาม dev server)
+    sink: Arc<Mutex<Option<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl LineCollector {
+    fn spawn<R, F>(reader: R, on_line: F) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        F: Fn(String) + Send + 'static,
+    {
+        let sink = Arc::new(Mutex::new(Some(String::new())));
+        let collected = sink.clone();
+        let task = tokio::spawn(async move {
+            let mut lines = BufReader::new(reader).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(buf) = collected.lock().unwrap().as_mut() {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+                on_line(line);
+            }
+        });
+        Self { sink, task }
+    }
+
+    fn take(&self) -> String {
+        self.sink.lock().unwrap().take().unwrap_or_default()
+    }
+}
+
+/// รอ reader อ่านจนจบไม่เกิน `grace` — false = ยังมี process ถือ pipe อยู่
+/// ไม่ abort reader: ปิดฝั่งอ่านแล้ว process ที่ยังรันอยู่จะเขียน stdout ไม่ได้และอาจล้ม
+async fn readers_finished(tasks: [&mut tokio::task::JoinHandle<()>; 2], grace: Duration) -> bool {
+    tokio::time::timeout(grace, async move {
+        for task in tasks {
+            let _ = task.await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
 fn powershell_command(command: &str, cwd: Option<&str>) -> Command {
     let working_dir = match cwd {
         Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
@@ -487,42 +542,13 @@ async fn execute_command(
     let stdout = child.stdout.take().ok_or("ไม่สามารถจับ stdout ได้")?;
     let stderr = child.stderr.take().ok_or("ไม่สามารถจับ stderr ได้")?;
 
-    let mut stdout_reader = BufReader::new(stdout).lines();
-    let mut stderr_reader = BufReader::new(stderr).lines();
-
-    let app_handle_clone1 = app.clone();
-    let id_clone1 = id.clone();
-    let stdout_task = tokio::spawn(async move {
-        let mut full_stdout = String::new();
-        while let Ok(Some(line)) = stdout_reader.next_line().await {
-            full_stdout.push_str(&line);
-            full_stdout.push('\n');
-            let _ = app_handle_clone1.emit("shell-output", ShellOutputEvent {
-                id: id_clone1.clone(),
-                stream: "stdout".to_string(),
-                text: line,
-                exit_code: None,
-            });
-        }
-        full_stdout
-    });
-
-    let app_handle_clone2 = app.clone();
-    let id_clone2 = id.clone();
-    let stderr_task = tokio::spawn(async move {
-        let mut full_stderr = String::new();
-        while let Ok(Some(line)) = stderr_reader.next_line().await {
-            full_stderr.push_str(&line);
-            full_stderr.push('\n');
-            let _ = app_handle_clone2.emit("shell-output", ShellOutputEvent {
-                id: id_clone2.clone(),
-                stream: "stderr".to_string(),
-                text: line,
-                exit_code: None,
-            });
-        }
-        full_stderr
-    });
+    let to_terminal = |stream: &'static str| {
+        let app = app.clone();
+        let id = id.clone();
+        move |line: String| emit_line(&app, &id, stream, line)
+    };
+    let mut stdout_reader = LineCollector::spawn(stdout, to_terminal("stdout"));
+    let mut stderr_reader = LineCollector::spawn(stderr, to_terminal("stderr"));
 
     // Timeout ป้องกันคำสั่งประเภท Server หรือ Interactive Process แขวนค้าง
     let limit_secs = timeout_secs.unwrap_or(120).clamp(1, MAX_TIMEOUT_SECS);
@@ -551,8 +577,12 @@ async fn execute_command(
     };
 
     let exit_code = status.code().unwrap_or(-1);
-    let full_stdout = stdout_task.await.unwrap_or_default();
-    let full_stderr = stderr_task.await.unwrap_or_default();
+    let drained = readers_finished([&mut stdout_reader.task, &mut stderr_reader.task], PIPE_DRAIN_GRACE).await;
+    let full_stdout = stdout_reader.take();
+    let mut full_stderr = stderr_reader.take();
+    if !drained {
+        full_stderr.push_str(HELD_PIPE_NOTE);
+    }
 
     let _ = app.emit("shell-output", ShellOutputEvent {
         id: id.clone(),
@@ -5032,6 +5062,39 @@ mod tests {
             assert_eq!(line.as_deref(), Some("{\"jsonrpc\":\"2.0\"} ok"));
             let _ = child.kill().await;
         });
+    }
+
+    #[test]
+    fn shell_output_stops_waiting_for_a_held_pipe() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.block_on(async {
+            // คืน (stdout, อ่านจบไหม, เวลาที่รอหลัง PowerShell จบ)
+            async fn run(command: &str, grace: Duration) -> Option<(String, bool, Duration)> {
+                let mut child = powershell_command(command, None).spawn().ok()?;
+                let mut out = LineCollector::spawn(child.stdout.take().unwrap(), |_| {});
+                let mut err = LineCollector::spawn(child.stderr.take().unwrap(), |_| {});
+                child.wait().await.unwrap();
+                let exited = std::time::Instant::now();
+                let drained = readers_finished([&mut out.task, &mut err.task], grace).await;
+                Some((out.take(), drained, exited.elapsed()))
+            }
+
+            let Some((stdout, drained, _)) = run("'hello'", Duration::from_secs(10)).await else {
+                eprintln!("powershell not found — skipping");
+                return;
+            };
+            assert!(drained);
+            assert_eq!(stdout.trim(), "hello");
+
+            // ping ได้ pipe ของ PowerShell ไปด้วยและรันต่ออีก ~7 วินาทีหลัง PowerShell จบ
+            let held = "Start-Process -NoNewWindow ping -ArgumentList '-n','8','127.0.0.1'; 'started'";
+            let (stdout, drained, waited) = run(held, Duration::from_millis(500)).await.unwrap();
+            assert!(!drained, "the held pipe should not count as drained");
+            assert!(waited < Duration::from_secs(3), "waited {:?} for a pipe that stays open", waited);
+            assert!(stdout.contains("started"));
+        });
+        // pipe บน Windows อ่านใน blocking thread — drop ปกติจะรอจน ping จบ
+        rt.shutdown_background();
     }
 
     #[test]

@@ -5,7 +5,8 @@ import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
 export default defineConfig(
-  { ignores: ['dist', 'src-tauri', 'node_modules', 'plugins'] },
+  // .claude/worktrees มีสำเนาโปรเจกต์ทั้งชุด (รวม eslint.config.js) — ไม่ ignore = tsconfig สองชุดชนกันทุกไฟล์
+  { ignores: ['dist', 'src-tauri', 'node_modules', 'plugins', '.claude'] },
   {
     files: ['**/*.{ts,tsx}'],
     extends: [js.configs.recommended, ...tseslint.configs.recommended],

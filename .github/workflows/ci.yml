@@ -14,7 +14,13 @@ jobs:
     # แอปรองรับ Windows อย่างเดียว (PowerShell, Credential Manager, taskkill)
     runs-on: windows-latest
     steps:
+      # plugins/gdocx เป็น submodule ที่ include_dir! ฝังลงแอปตอนคอมไพล์ — ไม่ดึงมา = G-docx ว่างและเทสต์ของมันล้ม
+      # G-docx เป็น repo private ซึ่ง GITHUB_TOKEN อ่านไม่ได้: ตั้ง secret SUBMODULE_TOKEN เป็น fine-grained PAT
+      # ที่อ่าน (Contents: Read-only) ได้ทั้ง repo นี้และ G-docx — checkout ใช้ token ตัวเดียวกันกับทั้งสอง repo
       - uses: actions/checkout@v5
+        with:
+          submodules: true
+          token: ${{ secrets.SUBMODULE_TOKEN || github.token }}
 
       - uses: actions/setup-node@v5
         with:
