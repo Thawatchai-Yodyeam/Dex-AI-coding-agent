@@ -20,6 +20,7 @@ import type {
 import { PROVIDERS_CATALOG, effectiveEffort, requiresApiKey } from '../types/agent';
 import { SKILL_ROOTS_HINT, matchSkillCommand, readSkill, skillInvocationBlock } from '../services/agent/skills';
 import { attachMentionedFiles } from '../services/agent/mentions';
+import { planModeNote } from '../services/agent/planMode';
 import type { SkillInfo } from '../services/tauriBridge';
 import { translations } from '../utils/i18n';
 import { notificationBody, notifyIfAway } from '../utils/notify';
@@ -37,6 +38,14 @@ export interface UseAgentChatProps {
   onClearChat: () => void;
   /** ผู้ใช้กด "อนุญาตเสมอ" บนแถบอนุมัติ */
   onAddPermissionRule: (rule: PermissionRule) => void;
+  /** เปิด/ปิดโหมดวางแผน (คำสั่ง /plan และปุ่มอนุมัติแผน) */
+  onSetPlanMode: (on: boolean) => void;
+}
+
+/** ตัวเลือกของการส่งหนึ่งครั้ง */
+interface SendOptions {
+  /** ผู้ใช้กดอนุมัติแผน — เทิร์นนี้ไม่อยู่ในโหมดวางแผนแล้ว แม้ settings ของ render นี้ยังไม่ทันเปลี่ยน */
+  planApproved?: boolean;
 }
 
 export interface UseAgentChatReturn {
@@ -49,7 +58,9 @@ export interface UseAgentChatReturn {
   isRunningRef: React.MutableRefObject<boolean>;
   activeCommandId: string | null;
   setActiveCommandId: React.Dispatch<React.SetStateAction<string | null>>;
-  handleSendMessage: (textToSend?: string, images?: ImageAttachment[]) => Promise<void>;
+  handleSendMessage: (textToSend?: string, images?: ImageAttachment[], options?: SendOptions) => Promise<void>;
+  /** อนุมัติแผนที่ agent เสนอ: ปิดโหมดวางแผนแล้วสั่งให้ลงมือทำ */
+  handleApprovePlan: () => void;
   handleStopExecution: () => void;
   handleApproveTool: (toolId: string, decision?: Exclude<ApprovalDecision, 'reject'>) => void;
   handleRejectTool: (toolId: string) => void;
@@ -90,6 +101,7 @@ function helpMessage(settings: AppSettings, instructionsFile: string | undefined
     `- **${isEn ? 'Commands' : 'คำสั่ง'}:**`,
     `  - \`/clear\` — ${isEn ? 'clear this conversation' : 'ล้างการสนทนานี้'}`,
     `  - \`/undo\` — ${isEn ? 'revert files changed in the last turn' : 'ย้อนไฟล์ที่ agent แก้ในเทิร์นล่าสุด'}`,
+    `  - \`/plan\` — ${isEn ? 'turn Plan mode on or off (the agent reads and proposes a plan before changing anything)' : 'เปิดหรือปิดโหมดวางแผน (agent อ่านและเสนอแผนก่อน ยังไม่แก้อะไร)'}`,
     `  - \`/help\` — ${isEn ? 'show this help' : 'แสดงวิธีใช้'}`,
     `- **Skills:**`,
     ...skillLines,
@@ -107,6 +119,7 @@ export function useAgentChat({
   onOpenSettings,
   onClearChat,
   onAddPermissionRule,
+  onSetPlanMode,
 }: UseAgentChatProps): UseAgentChatReturn {
   const [inputPrompt, setInputPrompt] = useState('');
   const [attachedImages, setAttachedImages] = useState<ImageAttachment[]>([]);
@@ -257,7 +270,8 @@ export function useAgentChat({
   /** ไม่ส่ง textToSend = ส่งสิ่งที่อยู่ใน composer (รวมรูปที่แนบ); ส่ง textToSend = quick prompt ไม่มีรูป */
   const handleSendMessage = async (
     textToSend?: string,
-    images: ImageAttachment[] = textToSend === undefined ? attachedImages : []
+    images: ImageAttachment[] = textToSend === undefined ? attachedImages : [],
+    options: SendOptions = {}
   ) => {
     const prompt = (textToSend ?? inputPrompt).trim();
     if ((!prompt && images.length === 0) || isRunningRef.current) return;
@@ -275,6 +289,14 @@ export function useAgentChat({
         agentServiceRef.current?.listSkills() ?? [],
       ]);
       appendAssistantNote(helpMessage(settings, instructions?.file, skills));
+      return;
+    }
+    if (prompt === '/plan') {
+      setInputPrompt('');
+      const on = !settings.planMode;
+      onSetPlanMode(on);
+      const t = translations[settings.language];
+      appendAssistantNote(on ? t.planModeOnNote : t.planModeOffNote);
       return;
     }
     if (prompt === '/undo') {
@@ -327,10 +349,23 @@ export function useAgentChat({
     const now = Date.now();
     const userMsgId = `user-${now}`;
     const assistantMsgId = `asst-${now}`;
+    const planMode = !options.planApproved && settings.planMode === true;
+    // คำตอบล่าสุดของ agent (ไม่นับข้อความแจ้งของแอป) เกิดในโหมดวางแผนไหม — ใช้บอก agent เมื่อโหมดถูกปิดไปแล้ว
+    const previousTurnPlanned =
+      [...messagesRef.current].reverse().find((m) => m.role === 'assistant' && m.id.startsWith('asst-'))?.planned === true;
+    const planNote = planModeNote(planMode, previousTurnPlanned, options.planApproved);
     setMessages((prev) => [
       ...prev,
       { id: userMsgId, role: 'user', content: prompt, timestamp: now, ...(images.length ? { images } : {}) },
-      { id: assistantMsgId, role: 'assistant', content: '', thought: '', toolCalls: [], timestamp: now },
+      {
+        id: assistantMsgId,
+        role: 'assistant',
+        content: '',
+        thought: '',
+        toolCalls: [],
+        timestamp: now,
+        ...(planMode ? { planned: true } : {}),
+      },
     ]);
 
     const updateAssistant = (fn: (msg: ChatMessage) => ChatMessage) =>
@@ -378,7 +413,7 @@ export function useAgentChat({
     }
 
     const notes = pendingAgentNotesRef.current.splice(0);
-    const agentPrompt = [...notes, skillBlock, mentioned?.block, prompt].filter(Boolean).join('\n\n');
+    const agentPrompt = [...notes, planNote, skillBlock, mentioned?.block, prompt].filter(Boolean).join('\n\n');
 
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
@@ -566,6 +601,15 @@ export function useAgentChat({
     await handleSendMessage(text, original.images ?? []);
   };
 
+  const handleApprovePlan = () => {
+    const agent = agentServiceRef.current;
+    if (isRunningRef.current || !agent) return;
+    onSetPlanMode(false);
+    // agent ได้ settings ใหม่ผ่าน effect หลัง render — ตั้งตรงนี้ด้วย ไม่ให้ tool ตัวแรกของเทิร์นนี้ยังถูกกัน
+    agent.updateSettings({ ...settings, planMode: false });
+    void handleSendMessage(translations[settings.language].planApprovedMessage, [], { planApproved: true });
+  };
+
   const handleRegenerate = (assistantId: string) => {
     const list = messagesRef.current;
     const index = list.findIndex((m) => m.id === assistantId);
@@ -584,6 +628,9 @@ export function useAgentChat({
   const regenerateRef = useRef(handleRegenerate);
   regenerateRef.current = handleRegenerate;
   const stableRegenerate = useCallback((messageId: string) => regenerateRef.current(messageId), []);
+  const approvePlanRef = useRef(handleApprovePlan);
+  approvePlanRef.current = handleApprovePlan;
+  const stableApprovePlan = useCallback(() => approvePlanRef.current(), []);
   const editUserRef = useRef(handleEditUser);
   editUserRef.current = handleEditUser;
   const stableEditUser = useCallback((messageId: string, text: string) => editUserRef.current(messageId, text), []);
@@ -598,6 +645,7 @@ export function useAgentChat({
     activeCommandId,
     setActiveCommandId,
     handleSendMessage,
+    handleApprovePlan: stableApprovePlan,
     handleStopExecution,
     handleApproveTool,
     handleRejectTool,

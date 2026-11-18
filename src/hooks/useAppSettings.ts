@@ -100,6 +100,7 @@ function loadSettings(): AppSettings {
       model,
       reasoningEffort,
       language: parsed.language === 'en' ? 'en' : 'th',
+      planMode: parsed.planMode === true,
       cwd: typeof parsed.cwd === 'string' ? parsed.cwd : '',
       apiKeys,
       permissionRules: sanitizeRules(parsed.permissionRules),

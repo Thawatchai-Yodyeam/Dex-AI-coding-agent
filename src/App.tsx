@@ -88,6 +88,7 @@ function AppShell({ stored }: { stored: StoredSessions }) {
     onClearChat: sessions.handleClearChat,
     onAddPermissionRule: (rule) =>
       setSettings((prev) => ({ ...prev, permissionRules: [...(prev.permissionRules ?? []), rule] })),
+    onSetPlanMode: (on) => setSettings((prev) => ({ ...prev, planMode: on })),
   });
   chatRef.current = chat;
 
@@ -241,6 +242,7 @@ function AppShell({ stored }: { stored: StoredSessions }) {
           title={currentSession?.title || t.untitledChat}
           cwd={settings.cwd}
           autoPilot={settings.autoPilot}
+          planMode={settings.planMode === true}
           terminalOpen={terminalOpen}
           browserOpen={browser.visible && !design.active}
           designOpen={browser.visible && design.active}
@@ -249,6 +251,7 @@ function AppShell({ stored }: { stored: StoredSessions }) {
           t={t}
           onSelectWorkspace={handleSelectWorkspace}
           onToggleAutoPilot={() => updateSettings({ autoPilot: !settings.autoPilot })}
+          onTogglePlanMode={() => updateSettings({ planMode: !settings.planMode })}
           onToggleTerminal={() => setTerminalOpen((v) => !v)}
           onToggleBrowser={() => {
             // canvas เปิดอยู่ = pane โผล่แล้ว ปุ่มนี้แค่สลับเป็นเบราว์เซอร์
@@ -310,6 +313,12 @@ function AppShell({ stored }: { stored: StoredSessions }) {
                     onUndo={chat.handleUndoTurn}
                     onRegenerate={message.id === regenerableId ? chat.handleRegenerate : undefined}
                     onEditUser={chat.isRunning ? undefined : chat.handleEditUser}
+                    // เฉพาะแผนล่าสุด ตอนที่ยังอยู่ในโหมดวางแผน — ปิดโหมดเองแล้วก็พิมพ์สั่งต่อได้เลย
+                    onApprovePlan={
+                      settings.planMode && !chat.isRunning && message.id === lastMessageId && message.planned && !message.isError
+                        ? chat.handleApprovePlan
+                        : undefined
+                    }
                   />
                 ))}
               </div>

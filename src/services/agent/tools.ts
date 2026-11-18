@@ -17,6 +17,7 @@ import { loadComments, saveComments } from '../design/comments';
 import { DESIGN_GUIDELINES } from '../design/guidelines';
 import { readSkill } from './skills';
 import { evaluateRules, isSensitiveFileError, relativeToWorkspace, suggestShellPattern } from './permissions';
+import { PLAN_MODE_BLOCKED, blockedInPlanMode } from './planMode';
 import { supportsImages } from '../../types/agent';
 import type { AgentCallbacks, PermissionStore } from './types';
 
@@ -496,6 +497,13 @@ async function requireApproval(
 function markRunning(env: ToolEnv) {
   env.record.status = 'running';
   env.callbacks.onToolUpdate({ ...env.record });
+}
+
+/** โหมดวางแผนกัน tool นี้ไว้ — สถานะ rejected (ไม่ใช่ failed) เพราะไม่ได้พังอะไร แค่ยังไม่ถึงเวลาทำ */
+function blockedByPlanMode(env: ToolEnv): { error: string } {
+  env.record.status = 'rejected';
+  env.record.error = PLAN_MODE_BLOCKED;
+  return { error: PLAN_MODE_BLOCKED };
 }
 
 function blockedByRule(env: ToolEnv, rule: PermissionRule): { error: string } {
@@ -1042,6 +1050,8 @@ const HANDLERS: Record<ToolName, ToolHandler> = {
     }
     const verdict = evaluateRules(env.permissions.rules(), 'shell', cmd);
     if (verdict?.action === 'deny') return blockedByRule(env, verdict.rule);
+    // โหมดวางแผน: รันได้เฉพาะคำสั่งที่ฝั่ง Rust ยืนยันว่าอ่านอย่างเดียว — กฎ allow ของผู้ใช้ก็ข้ามไม่ได้
+    if (env.settings.planMode && !sec.is_read_only) return blockedByPlanMode(env);
     // กฎ allow ใช้ไม่ได้กับคำสั่งที่ต่อกันหลายท่อน — `npm test*` ต้องไม่ปล่อย `npm test; rm -rf x`
     const allowedByRule = verdict?.action === 'allow' && !sec.has_chaining;
     const needsApproval = !allowedByRule && (!env.settings.autoPilot || !sec.is_read_only || sec.high_risk);
@@ -1515,6 +1525,8 @@ export async function executeTool(
       record.status = 'failed';
       record.error = `Unknown tool: ${name}`;
       result = { error: record.error };
+    } else if (settings.planMode && blockedInPlanMode(name, args, context.mcp)) {
+      result = blockedByPlanMode(env);
     } else {
       result = await handler(args, env);
     }

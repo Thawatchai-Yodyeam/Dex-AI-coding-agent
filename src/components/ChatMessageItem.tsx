@@ -27,6 +27,7 @@ import {
   Globe,
   AppWindow,
   Palette,
+  Play,
 } from 'lucide-react';
 import { designCanvas } from '../services/design/canvas';
 import type { ApprovalDecision, ChatMessage, ToolCallRecord } from '../types/agent';
@@ -48,6 +49,8 @@ interface ChatMessageItemProps {
   onRegenerate?: (messageId: string) => void;
   /** แก้ข้อความผู้ใช้แล้วส่งใหม่ (ไม่มี = แก้ไม่ได้ เช่น ระหว่างรัน) */
   onEditUser?: (messageId: string, text: string) => void;
+  /** มีเฉพาะแผนล่าสุดที่ยังรออนุมัติ (ยังอยู่ในโหมดวางแผน และไม่ได้รันอยู่) */
+  onApprovePlan?: () => void;
 }
 
 /** ข้อความผู้ใช้ที่กำลังแก้ — Enter ส่ง, Shift+Enter ขึ้นบรรทัด, Esc ยกเลิก */
@@ -473,6 +476,7 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
   onUndo,
   onRegenerate,
   onEditUser,
+  onApprovePlan,
 }) => {
   const [copied, copy] = useCopy();
   const [editing, setEditing] = useState(false);
@@ -599,6 +603,16 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
 
       {working && <WorkingIndicator label={working.label} paused={working.paused} startedAt={message.timestamp} />}
 
+      {!isStreaming && onApprovePlan && message.content && (
+        <div className="plan-approve">
+          <span className="plan-approve-hint">{t.planReadyHint}</span>
+          <button type="button" className="btn btn-primary btn-sm" onClick={onApprovePlan}>
+            <Play size={14} aria-hidden="true" />
+            {t.approvePlan}
+          </button>
+        </div>
+      )}
+
       {!isStreaming && (message.content || checkpoint || onRegenerate) && (
         <div className="msg-footer">
           {message.content && (
@@ -637,6 +651,12 @@ const ChatMessageItemImpl: React.FC<ChatMessageItemProps> = ({
           )}
           {canUndo && !checkpoint?.revertedAt && onUndo && (
             <UndoButton count={checkpoint?.files.length ?? 0} t={t} onConfirm={() => onUndo(message.id)} />
+          )}
+          {message.planned && (
+            <span className="checkpoint-chip" title={t.plannedHint}>
+              <ListChecks size={13} aria-hidden="true" />
+              {t.modePlan}
+            </span>
           )}
           {message.compaction === 'done' && (
             <span className="checkpoint-chip" title={t.compactedHint}>

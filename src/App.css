@@ -862,10 +862,35 @@ pre,
   text-overflow: ellipsis;
 }
 
-.mode-chip.is-auto {
+.mode-chip.is-auto,
+.mode-chip.is-plan {
   color: var(--accent);
   border-color: var(--accent-border);
   background: var(--accent-soft);
+}
+
+/* แถบอนุมัติแผนใต้คำตอบที่เกิดในโหมดวางแผน */
+.plan-approve {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: 10px;
+  background: var(--accent-soft);
+}
+
+.plan-approve-hint {
+  font-size: 13px;
+}
+
+.plan-approve .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .main-scroll {

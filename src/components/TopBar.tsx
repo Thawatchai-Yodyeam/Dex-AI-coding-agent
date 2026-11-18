@@ -1,11 +1,12 @@
 import React, { useState } from 'react';
-import { Folder, TerminalSquare, Eraser, Zap, ShieldCheck, AppWindow, Palette } from 'lucide-react';
+import { Folder, TerminalSquare, Eraser, Zap, ShieldCheck, AppWindow, Palette, ListChecks } from 'lucide-react';
 import type { Translation } from '../utils/i18n';
 
 interface TopBarProps {
   title: string;
   cwd: string;
   autoPilot: boolean;
+  planMode: boolean;
   terminalOpen: boolean;
   browserOpen: boolean;
   designOpen: boolean;
@@ -13,6 +14,7 @@ interface TopBarProps {
   t: Translation;
   onSelectWorkspace: () => void;
   onToggleAutoPilot: () => void;
+  onTogglePlanMode: () => void;
   onToggleTerminal: () => void;
   onToggleBrowser: () => void;
   onToggleDesign: () => void;
@@ -23,6 +25,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   title,
   cwd,
   autoPilot,
+  planMode,
   terminalOpen,
   browserOpen,
   designOpen,
@@ -30,6 +33,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   t,
   onSelectWorkspace,
   onToggleAutoPilot,
+  onTogglePlanMode,
   onToggleTerminal,
   onToggleBrowser,
   onToggleDesign,
@@ -66,6 +70,16 @@ export const TopBar: React.FC<TopBarProps> = ({
         >
           {autoPilot ? <Zap size={14} aria-hidden="true" /> : <ShieldCheck size={14} aria-hidden="true" />}
           <span className="mode-chip-text">{autoPilot ? t.modeAutoPilot : t.modeSupervised}</span>
+        </button>
+        <button
+          type="button"
+          className={`chip-btn chip-outline mode-chip ${planMode ? 'is-plan' : ''}`}
+          onClick={onTogglePlanMode}
+          aria-pressed={planMode}
+          title={planMode ? t.modePlanOnTooltip : t.modePlanOffTooltip}
+        >
+          <ListChecks size={14} aria-hidden="true" />
+          <span className="mode-chip-text">{t.modePlan}</span>
         </button>
         {hasMessages && (
           <button

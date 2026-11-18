@@ -188,6 +188,8 @@ export interface ChatMessage {
   images?: ImageAttachment[];
   /** ไฟล์ที่ผู้ใช้ `@` ถึงและแนบเนื้อหาไปให้ agent แล้ว (พาธใน workspace) */
   attachedFiles?: string[];
+  /** คำตอบนี้เกิดในโหมดวางแผน (agent เสนอแผน ยังไม่ได้แก้อะไร) */
+  planned?: boolean;
   /** เทิร์นนี้ให้โมเดลสรุปบทสนทนาเก่าก่อนตอบ ('running' = กำลังสรุป) */
   compaction?: 'running' | 'done';
   /** API ล้มชั่วคราวและกำลังรอลองใหม่ (มีเฉพาะระหว่างสตรีม) */
@@ -237,6 +239,8 @@ export interface AppSettings {
   language: 'th' | 'en';
   theme?: ThemePreference;
   autoPilot: boolean;
+  /** โหมดวางแผน: agent อ่านและค้นได้ แต่ tool ที่แก้ไฟล์หรือสถานะถูกกันไว้จนกว่าผู้ใช้จะอนุมัติแผน */
+  planMode?: boolean;
   cwd: string;
   apiKeys: Record<AIProvider, string>;
   permissionRules: PermissionRule[];

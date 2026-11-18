@@ -369,8 +369,12 @@ export class MultiProviderAgentService {
       signal,
       systemPrompt: buildSystemPrompt(settings, project, skills),
       tools,
+      // โหมดวางแผนอ่านค่าล่าสุดทุกครั้ง — ผู้ใช้เปิดกลางเทิร์นแล้ว tool ถัดไปต้องหยุดแก้ไฟล์ทันที
       runTool: async (name, args) =>
-        compactToolResult(await executeTool(name, args, settings, trackedCallbacks, permissions, toolContext), name),
+        compactToolResult(
+          await executeTool(name, args, { ...settings, planMode: this.settings.planMode }, trackedCallbacks, permissions, toolContext),
+          name
+        ),
       shouldContinue: (step) => confirmContinue(step, trackedCallbacks),
     };
 

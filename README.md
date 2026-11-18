@@ -39,6 +39,7 @@ Works with many providers (Claude · GPT · Gemini · DeepSeek · Qwen · Ollama
 | 📄 **Word documents** | The `docx` tool reads and edits `.docx` files through the built-in G-docx editor, keeping the formatting it does not touch. |
 | 📋 **Project instructions** | Put a `DEX.md` or `AGENTS.md` in the project root and the agent follows it every turn. |
 | 🖼️ **Image attachments** | Paste with `Ctrl+V`, drag a file in, or use the attach button. Large images are resized automatically. |
+| 📋 **Plan mode** | Press **Plan** (top right) or type `/plan`, and the agent reads the code and proposes a plan without changing anything. Approve it with one click to start. |
 | 🔐 **Asks before anything risky** | Auto-Pilot and Supervised modes, your own allow/deny rules, protection for secret files like `.env`, and API keys stored in Windows Credential Manager. |
 | 💰 **Economical and resilient** | Claude prompt caching, automatic retries when an API is briefly down, summaries of old conversation when context runs low (recent turns stay whole), and a check-in every 50 steps. |
 | 🔔 **Notifications** | Windows notifications when work finishes or needs approval while you are in another window. |
@@ -90,6 +91,7 @@ DASHSCOPE_API_KEY=...       # Qwen (or QWEN_API_KEY)
 |---|---|
 | `/help` | Shows the model, thinking level, workspace, project instructions file and available skills |
 | `/undo` | Reverts the files the agent changed in the latest turn |
+| `/plan` | Turns Plan mode on or off |
 | `/clear` | Clears this conversation |
 | `/skill-name message` | Uses that skill for this request right away |
 | `@path` | Attaches a workspace file's contents to your message (type `@` and pick from the list; secret files and files under a deny rule are not attached) |
@@ -157,6 +159,16 @@ Create this file in the workspace root. The app uses the first one it finds, in 
 
 The file is read again every turn, so edits apply immediately (up to 20,000 characters).
 
+### Plan mode
+
+Turn it on with the **Plan** button at the top right or by typing `/plan`. The setting is remembered until you turn it off.
+
+- The agent can read files, search, fetch web pages, look at pages in the browser pane and run read-only shell commands such as `git status`. Everything that would change something is refused before it runs and the agent is told why: writing or editing files, shell commands that are not read-only (even with an allow rule), background commands, clicking or typing in the browser, saving Word documents, writing designs, and MCP tools that do not declare `readOnlyHint`.
+- Each turn reminds the agent to reply with a plan: what it will change and where, in what order, how it will check the result, and what it is unsure about.
+- Under the latest plan, press **Approve plan and start**. This turns Plan mode off and tells the agent to carry out the plan. To change the plan instead, just type what you want; the agent stays in Plan mode.
+- Turning Plan mode on in the middle of a turn takes effect from the next tool the agent calls. Answers written in Plan mode are marked **Plan**.
+- Plan mode works together with Auto-Pilot and Supervised: tools that it lets through still follow your permission rules and approvals.
+
 ### Undoing file edits
 
 - Answers that changed files show an **N files changed** label and an **Undo file changes** button (press twice to confirm).
@@ -196,6 +208,7 @@ Dex edits real files on your machine, so it has several layers of protection:
 - **Shell commands:** read-only commands run straight away in Auto-Pilot. Commands that write or delete files, or chain several commands, ask first. Dangerous commands such as shutdown are always blocked.
 - **Permission rules:** set your own allow and deny rules in ⚙️ Settings (shell, read file, edit file, MCP tool, web). Deny always wins. The *For this chat* and *Always allow* buttons create rules for you.
 - **Supervised:** turn off Auto-Pilot (⚡ button, top right) and the agent asks before every file edit and command.
+- **Plan mode:** blocks every tool that would change files or state until you approve the agent's plan, whatever your allow rules say.
 - **MCP:** servers start only from the config on the settings page (a project's `.mcp.json` is not read, so an unfamiliar project cannot make the app run programs), and MCP tools ask before running.
 - **Web:** `web_fetch` asks before each new domain, even in Auto-Pilot, because a URL can be used to send data out. You can set allow rules such as `docs.rs` or `*.github.com`. Redirects are followed only within the same domain, and the agent is told that web content is data and that it must not follow instructions in it.
 - **In-app browser:** pages in the pane cannot call Dex's commands (Tauri blocks external origins), and the pane cannot open Dex's own pages or `file://`. localhost opens straight away in Auto-Pilot, other sites ask first under the same domain rules as `web_fetch`, and running JavaScript on pages other than localhost needs approval every time.
@@ -243,6 +256,7 @@ src/
       tools.ts              tool schemas + handlers + approval policy + runs read-only tools in parallel
       history.ts            converts/trims history + clears old tool results to fit the context budget
       compaction.ts         summarises old turns with the model when history is nearly full
+      planMode.ts           which tools Plan mode lets through + the notes sent to the agent
       mentions.ts           attaches the contents of files the user @-mentions
       retry.ts              retries on 429/5xx/529/network loss (exponential backoff + retry-after)
       skills.ts             finds/reads SKILL.md, use_skill tool, /skill-name
